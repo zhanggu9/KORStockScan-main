@@ -1,0 +1,88 @@
+name: Sync GitHub Project To Google Calendar
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - "docs/plan-korStockScanPerformanceOptimization.prompt.md"
+      - "docs/*-stage2-todo-checklist.md"
+      - "docs/*-scalping-ai-coding-instructions.md"
+      - "docs/*-scalping-ai-prompt-coding-instructions.md"
+      - "docs/*-ai-prompt-track-audit.md"
+      - "docs/*-observation-*-report.md"
+      - "src/engine/sync_github_project_calendar.py"
+      - "src/engine/sync_docs_backlog_to_project.py"
+      - ".github/workflows/sync_project_to_google_calendar.yml"
+  schedule:
+    - cron: "*/10 * * * *"
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Validate required config
+        env:
+          GH_PROJECT_TOKEN: ${{ secrets.GH_PROJECT_TOKEN }}
+          GH_PROJECT_OWNER: ${{ vars.GH_PROJECT_OWNER }}
+          GH_PROJECT_NUMBER: ${{ vars.GH_PROJECT_NUMBER }}
+          GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for key in GH_PROJECT_TOKEN GH_PROJECT_OWNER GH_PROJECT_NUMBER GOOGLE_CALENDAR_ID GOOGLE_SERVICE_ACCOUNT_JSON; do
+            if [ -z "${!key:-}" ]; then
+              echo "::error::Missing required secret/variable: $key"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install google-auth google-api-python-client
+
+      - name: Sync project to calendar
+        env:
+          GH_PROJECT_TOKEN: ${{ secrets.GH_PROJECT_TOKEN }}
+          GH_PROJECT_OWNER: ${{ vars.GH_PROJECT_OWNER }}
+          GH_PROJECT_NUMBER: ${{ vars.GH_PROJECT_NUMBER }}
+          GH_PROJECT_DUE_FIELD_NAME: ${{ vars.GH_PROJECT_DUE_FIELD_NAME }}
+          GH_PROJECT_STATUS_FIELD_NAME: ${{ vars.GH_PROJECT_STATUS_FIELD_NAME }}
+          GH_PROJECT_TRACK_FIELD_NAME: ${{ vars.GH_PROJECT_TRACK_FIELD_NAME }}
+          GH_PROJECT_SLOT_FIELD_NAME: ${{ vars.GH_PROJECT_SLOT_FIELD_NAME }}
+          GH_PROJECT_TIME_WINDOW_FIELD_NAME: ${{ vars.GH_PROJECT_TIME_WINDOW_FIELD_NAME }}
+          GH_SYNC_ONLY_STATUSES: ${{ vars.GH_SYNC_ONLY_STATUSES }}
+          GCAL_EVENT_PREFIX: ${{ vars.GCAL_EVENT_PREFIX }}
+          GCAL_EVENT_TIMEZONE: ${{ vars.GCAL_EVENT_TIMEZONE }}
+          GCAL_USE_SLOT_TIME: ${{ vars.GCAL_USE_SLOT_TIME }}
+          GCAL_SLOT_PREOPEN_TIME: ${{ vars.GCAL_SLOT_PREOPEN_TIME }}
+          GCAL_SLOT_INTRADAY_TIME: ${{ vars.GCAL_SLOT_INTRADAY_TIME }}
+          GCAL_SLOT_POSTCLOSE_TIME: ${{ vars.GCAL_SLOT_POSTCLOSE_TIME }}
+          GCAL_SLOT_DURATION_MINUTES: ${{ vars.GCAL_SLOT_DURATION_MINUTES }}
+          GCAL_SLOT_REMINDER_MINUTES: ${{ vars.GCAL_SLOT_REMINDER_MINUTES }}
+          GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SYNC_DRY_RUN: ${{ vars.SYNC_DRY_RUN }}
+        run: |
+          PYTHONPATH=. python -m src.engine.sync_github_project_calendar

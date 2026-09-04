@@ -1,0 +1,2049 @@
+import time
+from datetime import datetime
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
+
+import pytest
+
+import src.engine.sniper_state_handlers as state_handlers
+from src.engine.scalping.entry_reprice_after_submit import (
+    evaluate_entry_reprice_after_submit,
+)
+
+
+@pytest.fixture(autouse=True)
+def _reset_state_handler_trading_rules(monkeypatch):
+    # This unit contract exercises the fallback configuration used before the
+    # runtime dependency injector binds globals. A preceding large test module
+    # must not make the result collection-order dependent or trigger real REST.
+    monkeypatch.setattr(state_handlers, "TRADING_RULES", None)
+    monkeypatch.setattr(state_handlers, "KIWOOM_TOKEN", None)
+    monkeypatch.setattr(state_handlers, "DB", None)
+    monkeypatch.setattr(state_handlers, "EVENT_BUS", None)
+    monkeypatch.setattr(state_handlers, "ACTIVE_TARGETS", None)
+    monkeypatch.setattr(state_handlers, "COOLDOWNS", None)
+    monkeypatch.setattr(state_handlers, "ALERTED_STOCKS", None)
+    monkeypatch.setattr(state_handlers, "HIGHEST_PRICES", None)
+    monkeypatch.setattr(state_handlers, "LAST_AI_CALL_TIMES", None)
+    monkeypatch.setattr(state_handlers, "LAST_LOG_TIMES", None)
+    monkeypatch.setattr(state_handlers, "datetime", datetime)
+    monkeypatch.setattr(
+        state_handlers,
+        "_order_terminal_inventory_reconciliation",
+        lambda *_args, expected_runtime_qty, **_kwargs: (
+            True,
+            "test_terminal_absence_and_inventory_exact",
+            expected_runtime_qty,
+        ),
+    )
+
+
+def _base_order(**overrides):
+    order = {
+        "ord_no": "0033470",
+        "qty": 49,
+        "filled_qty": 0,
+        "price": 39750,
+        "status": "OPEN",
+        "order_type": "00",
+        "entry_reprice_attempt_count": 0,
+        "ai_score": 81.0,
+        "entry_reprice_action": "BUY_DEFENSIVE",
+        "entry_adm_recommended_action": "BUY_DEFENSIVE",
+        "entry_adm_ev_pct": 0.12,
+        "lifecycle_matrix_selected_action": "BUY_DEFENSIVE",
+        "buy_pressure_10t": 91.0,
+        "tick_aggressor_pressure_usable": True,
+        "tick_aggressor_trusted_count": 3,
+        "latency_state": "SAFE",
+        "mark_price_at_submit": 39885,
+    }
+    order.update(overrides)
+    return order
+
+
+def test_pending_reprice_config_reads_score_and_pressure_env(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_ENTRY_REPRICE_AFTER_SUBMIT_STRONG_SCORE_FLOOR", "60"
+    )
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_ENTRY_REPRICE_AFTER_SUBMIT_STRONG_BUY_PRESSURE", "50"
+    )
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_ENTRY_REPRICE_AFTER_SUBMIT_TIGHT_SPREAD_TICKS", "3"
+    )
+
+    config = handlers._entry_reprice_config()
+
+    assert config["strong_score_floor"] == 60.0
+    assert config["strong_buy_pressure"] == 50.0
+    assert config["tight_spread_ticks"] == 3
+
+
+def test_helper_allows_tight_spread_continuation_without_negative_adm():
+    decision = evaluate_entry_reprice_after_submit(
+        order=_base_order(),
+        strategy="SCALPING",
+        elapsed_sec=16.0,
+        best_bid=39855,
+        best_ask=39915,
+        current_price=39900,
+        quote_age_ms=120.0,
+        orderbook_micro_state="neutral",
+    )
+
+    assert decision.allowed is True
+    assert decision.target_price > 39750
+    assert decision.target_price <= 39915
+    assert decision.fields["reprice_price_mode"] == "tight_spread_best_ask_minus_1tick"
+
+
+def test_helper_blocks_negative_adm_even_when_continuation_report_candidate():
+    decision = evaluate_entry_reprice_after_submit(
+        order=_base_order(
+            entry_adm_recommended_action="NO_BUY_AI", entry_adm_ev_pct=-0.37
+        ),
+        strategy="SCALPING",
+        elapsed_sec=16.0,
+        best_bid=39855,
+        best_ask=39915,
+        current_price=39900,
+        quote_age_ms=120.0,
+        orderbook_micro_state="neutral",
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "continuation_override_candidate_report_only"
+    assert decision.fields["reprice_candidate"] == "continuation_override_candidate"
+
+
+def test_helper_does_not_use_untrusted_pressure_for_continuation_candidate():
+    decision = evaluate_entry_reprice_after_submit(
+        order=_base_order(
+            entry_adm_recommended_action="NO_BUY_AI",
+            entry_adm_ev_pct=-0.37,
+            tick_aggressor_pressure_usable=False,
+            tick_aggressor_trusted_count=0,
+        ),
+        strategy="SCALPING",
+        elapsed_sec=16.0,
+        best_bid=39855,
+        best_ask=39915,
+        current_price=39900,
+        quote_age_ms=120.0,
+        orderbook_micro_state="neutral",
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "adm_negative_prior"
+    assert decision.fields["tick_aggressor_pressure_usable"] is False
+    assert decision.fields["tick_aggressor_trusted_count"] == 0
+
+
+def test_helper_blocks_weak_462900_like_negative_adm():
+    decision = evaluate_entry_reprice_after_submit(
+        order=_base_order(
+            price=16830,
+            ai_score=78.0,
+            entry_adm_recommended_action="NO_BUY_AI",
+            entry_adm_ev_pct=-0.37,
+            buy_pressure_10t=56.0,
+            mark_price_at_submit=16875,
+        ),
+        strategy="SCALPING",
+        elapsed_sec=16.0,
+        best_bid=16845,
+        best_ask=16895,
+        current_price=16880,
+        quote_age_ms=100.0,
+        max_spread_bps=40,
+        orderbook_micro_state="neutral",
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "adm_negative_prior"
+
+
+def test_helper_blocks_safety_and_scope_cases():
+    stale = evaluate_entry_reprice_after_submit(
+        order=_base_order(),
+        strategy="SCALPING",
+        elapsed_sec=16.0,
+        best_bid=39855,
+        best_ask=39915,
+        current_price=39900,
+        quote_age_ms=1000.0,
+    )
+    partial = evaluate_entry_reprice_after_submit(
+        order=_base_order(filled_qty=1),
+        strategy="SCALPING",
+        elapsed_sec=16.0,
+        best_bid=39855,
+        best_ask=39915,
+        current_price=39900,
+        quote_age_ms=100.0,
+    )
+    attempt_limit = evaluate_entry_reprice_after_submit(
+        order=_base_order(entry_reprice_attempt_count=1),
+        strategy="SCALPING",
+        elapsed_sec=16.0,
+        best_bid=39855,
+        best_ask=39915,
+        current_price=39900,
+        quote_age_ms=100.0,
+    )
+    non_scalping = evaluate_entry_reprice_after_submit(
+        order=_base_order(),
+        strategy="KOSPI_ML",
+        elapsed_sec=16.0,
+        best_bid=39855,
+        best_ask=39915,
+        current_price=39900,
+        quote_age_ms=100.0,
+    )
+
+    assert stale.reason == "quote_stale"
+    assert partial.reason == "partial_fill"
+    assert attempt_limit.reason == "attempt_limit"
+    assert non_scalping.reason == "non_scalping"
+
+
+def test_helper_blocks_latency_danger():
+    decision = evaluate_entry_reprice_after_submit(
+        order=_base_order(latency_state="DANGER"),
+        strategy="SCALPING",
+        elapsed_sec=16.0,
+        best_bid=39855,
+        best_ask=39915,
+        current_price=39900,
+        quote_age_ms=100.0,
+        orderbook_micro_state="neutral",
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "latency_state_not_safe"
+
+
+def test_helper_enforces_best_ask_and_upward_cap():
+    decision = evaluate_entry_reprice_after_submit(
+        order=_base_order(price=10000, mark_price_at_submit=10000),
+        strategy="SCALPING",
+        elapsed_sec=16.0,
+        best_bid=10070,
+        best_ask=10120,
+        current_price=10100,
+        quote_age_ms=100.0,
+        max_upward_bps=40,
+        max_spread_bps=60,
+        orderbook_micro_state="neutral",
+    )
+
+    assert decision.allowed is True
+    assert decision.target_price <= 10040
+    assert decision.target_price <= 10120
+
+
+def test_pending_order_reprices_once(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = 1000.0
+    stock = {
+        "id": 1,
+        "name": "테스트",
+        "strategy": "SCALPING",
+        "order_time": now - 16.0,
+        "pending_entry_orders": [
+            {
+                **_base_order(sent_at=now - 16.0),
+                "tag": "normal",
+                "tif": "DAY",
+                "best_bid_at_submit": 39700,
+                "best_ask_at_submit": 39915,
+            }
+        ],
+    }
+    events = []
+    calls = {"cancel": 0, "buy": 0}
+    cancel_calls = []
+
+    monkeypatch.setattr(handlers.time, "time", lambda: now)
+    monkeypatch.setattr(
+        handlers.ORDERBOOK_STABILITY_OBSERVER,
+        "snapshot",
+        lambda code, now=None: {
+            "best_bid": 39855,
+            "best_ask": 39915,
+            "observer_healthy": True,
+            "unstable_quote_observed": False,
+            "observer_last_quote_age_ms": 120.0,
+            "orderbook_micro": {"micro_state": "neutral"},
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_log_entry_pipeline",
+        lambda stock, code, stage, **fields: events.append((stage, fields)),
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_cancel_order",
+        lambda **kwargs: (
+            cancel_calls.append(kwargs)
+            or calls.__setitem__("cancel", calls["cancel"] + 1)
+            or {"return_code": "0", "ord_no": "0033622"}
+        ),
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_buy_order",
+        lambda *args, **kwargs: calls.__setitem__("buy", calls["buy"] + 1)
+        or {"return_code": "0", "ord_no": "0034000"},
+    )
+
+    result = handlers._maybe_reprice_pending_entry_order(
+        stock, "466920", "SCALPING", timeout_sec=60
+    )
+
+    assert result == "submitted"
+    assert calls == {"cancel": 1, "buy": 1}
+    assert cancel_calls[-1]["dmst_stex_tp"] == "SOR"
+    assert stock["pending_entry_orders"][0]["ord_no"] == "0034000"
+    assert stock["pending_entry_orders"][0]["dmst_stex_tp"] == "SOR"
+    assert stock["pending_entry_orders"][0]["entry_reprice_parent_ord_no"] == "0033470"
+    assert stock["entry_reprice_child_ord_no"] == "0034000"
+    assert "entry_reprice_resubmit_submitted" in [stage for stage, _ in events]
+
+
+def test_pending_order_does_not_resubmit_without_terminal_cancel_proof(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = 1000.0
+    stock = {
+        "id": 1,
+        "name": "테스트",
+        "strategy": "SCALPING",
+        "order_time": now - 16.0,
+        "pending_entry_orders": [
+            {
+                **_base_order(sent_at=now - 16.0),
+                "tag": "normal",
+                "tif": "DAY",
+            }
+        ],
+    }
+    events = []
+    calls = {"cancel": 0, "buy": 0, "refresh": 0}
+
+    monkeypatch.setattr(handlers.time, "time", lambda: now)
+    monkeypatch.setattr(
+        handlers.ORDERBOOK_STABILITY_OBSERVER,
+        "snapshot",
+        lambda code, now=None: {
+            "best_bid": 39855,
+            "best_ask": 39915,
+            "observer_healthy": True,
+            "unstable_quote_observed": False,
+            "observer_last_quote_age_ms": 120.0,
+            "orderbook_micro": {"micro_state": "neutral"},
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_log_entry_pipeline",
+        lambda stock, code, stage, **fields: events.append((stage, fields)),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_order_terminal_inventory_reconciliation",
+        lambda *_args, **_kwargs: (False, "order_still_open", None),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_request_broker_snapshot_refresh",
+        lambda *args, **kwargs: calls.__setitem__("refresh", calls["refresh"] + 1),
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_cancel_order",
+        lambda **kwargs: calls.__setitem__("cancel", calls["cancel"] + 1)
+        or {"return_code": "0", "ord_no": "0033622"},
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_buy_order",
+        lambda *args, **kwargs: calls.__setitem__("buy", calls["buy"] + 1),
+    )
+
+    result = handlers._maybe_reprice_pending_entry_order(
+        stock, "466920", "SCALPING", timeout_sec=60
+    )
+
+    assert result == "pending_terminal"
+    assert calls == {"cancel": 1, "buy": 0, "refresh": 1}
+    assert stock["entry_reprice_cancel_terminal_pending"] is True
+    assert stock["entry_reprice_cancel_terminal_reason"] == "order_still_open"
+    assert stock["pending_entry_orders"][0]["status"] == "OPEN"
+    assert (
+        stock["pending_entry_orders"][0]["entry_reprice_cancel_terminal_pending"]
+        is True
+    )
+
+
+def test_rising_missed_initial_reprice_blocks_stale_tp1_direction_context(
+    monkeypatch,
+):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = 1000.0
+    stock = {
+        "id": 24887,
+        "name": "펩트론",
+        "strategy": "SCALPING",
+        "rising_missed_entry_lineage": True,
+        "rising_missed_one_share_entry_forced": True,
+        "rising_missed_one_share_scout": True,
+        "rising_missed_effective_venue": "NXT",
+        "rising_missed_tp1_submit_context_at": now - 16.0,
+        "rising_missed_tp1_submit_context_candidate_allowed": True,
+        "order_time": now - 16.0,
+        "pending_entry_orders": [
+            {
+                **_base_order(
+                    sent_at=now - 16.0,
+                    ord_no="0059188",
+                    qty=1,
+                    price=146200,
+                    mark_price_at_submit=146350,
+                    ai_score=58.0,
+                    buy_pressure_10t=59.82,
+                ),
+                "tag": "normal",
+                "tif": "DAY",
+                "dmst_stex_tp": "NXT",
+            }
+        ],
+    }
+    events = []
+    monkeypatch.setattr(handlers.time, "time", lambda: now)
+    monkeypatch.setattr(
+        handlers.ORDERBOOK_STABILITY_OBSERVER,
+        "snapshot",
+        lambda code, now=None: {
+            "best_bid": 146300,
+            "best_ask": 146400,
+            "last_trade_price": 146350,
+            "observer_healthy": True,
+            "unstable_quote_observed": False,
+            "observer_last_quote_age_ms": 0.2,
+            "orderbook_micro": {"micro_state": "neutral"},
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_log_entry_pipeline",
+        lambda stock, code, stage, **fields: events.append((stage, fields)),
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_cancel_order",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError),
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_buy_order",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError),
+    )
+
+    result = handlers._maybe_reprice_pending_entry_order(
+        stock, "087010", "SCALPING", timeout_sec=60
+    )
+
+    assert result == "blocked"
+    assert (
+        stock["entry_reprice_block_reason"]
+        == "rising_missed_reprice_direction_context_stale"
+    )
+    blocked = [
+        fields
+        for stage, fields in events
+        if stage == "entry_reprice_after_submit_blocked"
+    ][-1]
+    assert blocked["rising_missed_initial_reprice_direction_guard_applicable"] is True
+    assert blocked["rising_missed_initial_reprice_direction_guard_allowed"] is False
+    assert blocked["rising_missed_initial_reprice_direction_context_age_sec"] == 16.0
+
+
+def test_rising_missed_initial_reprice_direction_guard_is_nxt_only():
+    import src.engine.sniper_state_handlers as handlers
+
+    result = handlers._rising_missed_initial_reprice_direction_guard(
+        {
+            "rising_missed_one_share_entry_forced": True,
+            "rising_missed_one_share_scout": True,
+            "rising_missed_effective_venue": "KRX",
+            "rising_missed_tp1_submit_context_at": 900.0,
+            "rising_missed_tp1_submit_context_candidate_allowed": True,
+        },
+        now_ts=1000.0,
+    )
+
+    assert result["rising_missed_initial_reprice_direction_guard_applicable"] is False
+    assert result["rising_missed_initial_reprice_direction_guard_allowed"] is True
+    assert (
+        result["rising_missed_initial_reprice_direction_guard_effective_venue"] == "KRX"
+    )
+
+
+def test_pending_order_before_eval_window_does_not_call_broker(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = 1000.0
+    stock = {
+        "name": "테스트",
+        "strategy": "SCALPING",
+        "pending_entry_orders": [{**_base_order(sent_at=now - 14.0), "tif": "DAY"}],
+    }
+    monkeypatch.setattr(handlers.time, "time", lambda: now)
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_cancel_order",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError),
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_buy_order",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError),
+    )
+
+    assert (
+        handlers._maybe_reprice_pending_entry_order(
+            stock, "466920", "SCALPING", timeout_sec=60
+        )
+        == "not_due"
+    )
+
+
+def test_pending_order_cancel_failure_does_not_resubmit(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = 1000.0
+    stock = {
+        "name": "테스트",
+        "strategy": "SCALPING",
+        "pending_entry_orders": [{**_base_order(sent_at=now - 16.0), "tif": "DAY"}],
+    }
+    monkeypatch.setattr(handlers.time, "time", lambda: now)
+    monkeypatch.setattr(
+        handlers.ORDERBOOK_STABILITY_OBSERVER,
+        "snapshot",
+        lambda code, now=None: {
+            "best_bid": 39855,
+            "best_ask": 39915,
+            "observer_healthy": True,
+            "unstable_quote_observed": False,
+            "observer_last_quote_age_ms": 120.0,
+            "orderbook_micro": {"micro_state": "neutral"},
+        },
+    )
+    monkeypatch.setattr(handlers, "_log_entry_pipeline", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_cancel_order",
+        lambda **kwargs: {"return_code": "1", "return_msg": "fail"},
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_buy_order",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError),
+    )
+
+    assert (
+        handlers._maybe_reprice_pending_entry_order(
+            stock, "466920", "SCALPING", timeout_sec=60
+        )
+        == "failed"
+    )
+    assert (
+        stock["pending_entry_orders"][0]["entry_reprice_block_reason"]
+        == "cancel_failed"
+    )
+
+
+def test_pending_order_uses_current_observer_latency_not_submit_latency(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = 1000.0
+    stock = {
+        "name": "테스트",
+        "strategy": "SCALPING",
+        "pending_entry_orders": [
+            {**_base_order(sent_at=now - 16.0, latency_state="SAFE"), "tif": "DAY"}
+        ],
+    }
+    events = []
+    monkeypatch.setattr(handlers.time, "time", lambda: now)
+    monkeypatch.setattr(
+        handlers.ORDERBOOK_STABILITY_OBSERVER,
+        "snapshot",
+        lambda code, now=None: {
+            "best_bid": 39855,
+            "best_ask": 39915,
+            "observer_healthy": False,
+            "observer_missing_reason": "stale_quote",
+            "unstable_quote_observed": False,
+            "observer_last_quote_age_ms": 120.0,
+            "orderbook_micro": {"micro_state": "neutral"},
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_log_entry_pipeline",
+        lambda stock, code, stage, **fields: events.append((stage, fields)),
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_cancel_order",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError),
+    )
+
+    assert (
+        handlers._maybe_reprice_pending_entry_order(
+            stock, "466920", "SCALPING", timeout_sec=60
+        )
+        == "blocked"
+    )
+    assert stock["entry_reprice_block_reason"] == "latency_state_not_safe"
+    evaluated = [
+        fields
+        for stage, fields in events
+        if stage == "entry_reprice_after_submit_evaluated"
+    ][0]
+    assert evaluated["latency_state"] == "DANGER"
+
+
+def test_pending_order_intraday_discovery_relieves_reprice_latency_danger(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = 1000.0
+    stock = {
+        "name": "이수페타시스",
+        "strategy": "SCALPING",
+        "current_price_observed": 104900,
+        "pending_entry_orders": [
+            {
+                **_base_order(
+                    sent_at=now - 26.0,
+                    ord_no="0036283",
+                    qty=1,
+                    price=104500,
+                    ai_score=70.0,
+                    buy_pressure_10t=98.26,
+                    tick_aggressor_trusted_count=10,
+                    mark_price_at_submit=104600,
+                ),
+                "tag": "normal",
+                "tif": "DAY",
+            }
+        ],
+    }
+    events = []
+    cancel_calls = []
+    buy_calls = []
+    snapshot = {
+        "best_bid": 104800,
+        "best_ask": 105200,
+        "last_trade_price": 104600,
+        "observer_healthy": False,
+        "observer_missing_reason": "stale_quote",
+        "unstable_quote_observed": False,
+        "observer_last_quote_age_ms": 462.5,
+        "orderbook_micro": {"micro_state": "neutral"},
+    }
+    quote_fields = {
+        "entry_reprice_quote_refresh_enabled": True,
+        "entry_reprice_quote_refresh_applied": False,
+        "entry_reprice_quote_refresh_source": "none",
+        "entry_reprice_quote_refresh_reason": "rest_best_levels_invalid",
+        "quote_consistency_family": "quote_consistency_normalization",
+        "quote_consistency_state": "ok",
+        "quote_consistency_runtime_action": "allow",
+        "quote_consistency_age_ms": 0.114,
+        "quote_consistency_ws_age_ms": 522.179,
+        "quote_consistency_rest_age_ms": 0.114,
+        "quote_consistency_entry_blocked": False,
+    }
+
+    monkeypatch.setenv("KORSTOCKSCAN_INTRADAY_ENTRY_PRICE_DISCOVERY_ENABLED", "true")
+    monkeypatch.setattr(handlers.time, "time", lambda: now)
+    monkeypatch.setattr(
+        handlers.ORDERBOOK_STABILITY_OBSERVER,
+        "snapshot",
+        lambda code, now=None: dict(snapshot),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_entry_reprice_refresh_snapshot",
+        lambda code, snapshot_arg, stock_arg, order_arg, strategy_arg, now_ts: (
+            dict(snapshot),
+            dict(quote_fields),
+        ),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_log_entry_pipeline",
+        lambda stock, code, stage, **fields: events.append((stage, fields)),
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_cancel_order",
+        lambda **kwargs: cancel_calls.append(kwargs)
+        or {"return_code": "0", "ord_no": "0036413"},
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_buy_order",
+        lambda *args, **kwargs: buy_calls.append((args, kwargs))
+        or {"return_code": "0", "ord_no": "0037000"},
+    )
+
+    assert (
+        handlers._maybe_reprice_pending_entry_order(
+            stock, "007660", "SCALPING", timeout_sec=60
+        )
+        == "submitted"
+    )
+    assert cancel_calls[-1]["orig_ord_no"] == "0036283"
+    assert buy_calls[-1][0][2] == 104800
+    evaluated = [
+        fields
+        for stage, fields in events
+        if stage == "entry_reprice_after_submit_evaluated"
+    ][0]
+    assert evaluated["entry_reprice_operator_latency_relief_applied"] is True
+    assert evaluated["entry_reprice_latency_state_original"] == "DANGER"
+    assert evaluated["entry_reprice_latency_state_effective"] == "CAUTION"
+    assert evaluated["latency_state"] == "CAUTION"
+    assert evaluated["reprice_order_price"] == 104800
+    cancel_event = [
+        fields for stage, fields in events if stage == "entry_reprice_cancel_requested"
+    ][0]
+    assert cancel_event["entry_reprice_operator_latency_relief_applied"] is True
+    assert cancel_event["entry_reprice_latency_state_original"] == "DANGER"
+    assert cancel_event["entry_reprice_latency_state_effective"] == "CAUTION"
+    submitted_event = [
+        fields
+        for stage, fields in events
+        if stage == "entry_reprice_resubmit_submitted"
+    ][0]
+    assert submitted_event["entry_reprice_operator_latency_relief_applied"] is True
+    assert submitted_event["entry_reprice_latency_state_original"] == "DANGER"
+    assert submitted_event["entry_reprice_latency_state_effective"] == "CAUTION"
+    child_order = stock["pending_entry_orders"][0]
+    assert child_order["entry_reprice_operator_latency_relief_applied"] is True
+    assert child_order["entry_reprice_latency_state_original"] == "DANGER"
+    assert child_order["entry_reprice_latency_state_effective"] == "CAUTION"
+
+
+def test_pending_order_missing_trade_with_fresh_quote_is_caution(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = 1000.0
+    stock = {
+        "name": "테스트",
+        "strategy": "SCALPING",
+        "pending_entry_orders": [
+            {**_base_order(sent_at=now - 16.0, latency_state="SAFE"), "tif": "DAY"}
+        ],
+    }
+    calls = {"cancel": 0, "buy": 0}
+    events = []
+    monkeypatch.setattr(handlers.time, "time", lambda: now)
+    monkeypatch.setattr(
+        handlers.ORDERBOOK_STABILITY_OBSERVER,
+        "snapshot",
+        lambda code, now=None: {
+            "best_bid": 39855,
+            "best_ask": 39915,
+            "observer_healthy": False,
+            "observer_missing_reason": "missing_trade",
+            "unstable_quote_observed": False,
+            "observer_last_quote_age_ms": 120.0,
+            "orderbook_micro": {"micro_state": "neutral"},
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_log_entry_pipeline",
+        lambda stock, code, stage, **fields: events.append((stage, fields)),
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_cancel_order",
+        lambda **kwargs: calls.__setitem__("cancel", calls["cancel"] + 1)
+        or {"return_code": "0", "ord_no": "0033622"},
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_buy_order",
+        lambda *args, **kwargs: calls.__setitem__("buy", calls["buy"] + 1)
+        or {"return_code": "0", "ord_no": "0034000"},
+    )
+
+    assert (
+        handlers._maybe_reprice_pending_entry_order(
+            stock, "466920", "SCALPING", timeout_sec=60
+        )
+        == "submitted"
+    )
+    evaluated = [
+        fields
+        for stage, fields in events
+        if stage == "entry_reprice_after_submit_evaluated"
+    ][0]
+    assert evaluated["latency_state"] == "CAUTION"
+    assert calls == {"cancel": 1, "buy": 1}
+
+
+def test_pending_order_missing_quote_blocks_as_danger(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = 1000.0
+    stock = {
+        "name": "테스트",
+        "strategy": "SCALPING",
+        "pending_entry_orders": [
+            {**_base_order(sent_at=now - 16.0, latency_state="SAFE"), "tif": "DAY"}
+        ],
+    }
+    events = []
+    monkeypatch.setattr(handlers.time, "time", lambda: now)
+    monkeypatch.setattr(
+        handlers.ORDERBOOK_STABILITY_OBSERVER,
+        "snapshot",
+        lambda code, now=None: {
+            "best_bid": 0,
+            "best_ask": 0,
+            "observer_healthy": False,
+            "observer_missing_reason": "missing_quote",
+            "unstable_quote_observed": False,
+            "observer_last_quote_age_ms": None,
+            "orderbook_micro": {"micro_state": "neutral"},
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_log_entry_pipeline",
+        lambda stock, code, stage, **fields: events.append((stage, fields)),
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_cancel_order",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError),
+    )
+
+    assert (
+        handlers._maybe_reprice_pending_entry_order(
+            stock, "466920", "SCALPING", timeout_sec=60
+        )
+        == "blocked"
+    )
+    assert stock["entry_reprice_block_reason"] == "invalid_quote"
+    evaluated = [
+        fields
+        for stage, fields in events
+        if stage == "entry_reprice_after_submit_evaluated"
+    ][0]
+    assert evaluated["latency_state"] == "DANGER"
+
+
+def test_pending_order_quote_stale_remains_retryable(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = 1000.0
+    stock = {
+        "name": "테스트",
+        "strategy": "SCALPING",
+        "pending_entry_orders": [
+            {**_base_order(sent_at=now - 16.0, latency_state="SAFE"), "tif": "DAY"}
+        ],
+    }
+    monkeypatch.setattr(handlers.time, "time", lambda: now)
+    monkeypatch.setattr(
+        handlers.ORDERBOOK_STABILITY_OBSERVER,
+        "snapshot",
+        lambda code, now=None: {
+            "best_bid": 39855,
+            "best_ask": 39915,
+            "observer_healthy": True,
+            "observer_missing_reason": "ok",
+            "unstable_quote_observed": False,
+            "observer_last_quote_age_ms": 1000.0,
+            "orderbook_micro": {"micro_state": "neutral"},
+        },
+    )
+    monkeypatch.setattr(handlers, "_log_entry_pipeline", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_cancel_order",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError),
+    )
+
+    assert (
+        handlers._maybe_reprice_pending_entry_order(
+            stock, "466920", "SCALPING", timeout_sec=60
+        )
+        == "blocked"
+    )
+    assert "entry_reprice_evaluated" not in stock
+    assert "entry_reprice_evaluated" not in stock["pending_entry_orders"][0]
+
+
+def test_pending_order_refreshes_stale_observer_quote_from_ws(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = 1000.0
+    stock = {
+        "name": "테스트",
+        "strategy": "SCALPING",
+        "latest_price": 39900,
+        "pending_entry_orders": [{**_base_order(sent_at=now - 16.0), "tif": "DAY"}],
+    }
+    events = []
+    calls = {"cancel": 0, "buy": 0}
+
+    class FakeWsManager:
+        @staticmethod
+        def get_latest_data(code):
+            return {
+                "curr": 39900,
+                "best_bid": 39855,
+                "best_ask": 39915,
+                "last_ws_update_ts": now - 0.12,
+                "orderbook": {
+                    "asks": [{"price": 39915}],
+                    "bids": [{"price": 39855}],
+                },
+            }
+
+    monkeypatch.setattr(handlers.time, "time", lambda: now)
+    monkeypatch.setattr(handlers, "WS_MANAGER", FakeWsManager())
+    monkeypatch.setattr(
+        handlers.ORDERBOOK_STABILITY_OBSERVER,
+        "snapshot",
+        lambda code, now=None: {
+            "best_bid": 39855,
+            "best_ask": 39915,
+            "observer_healthy": True,
+            "observer_missing_reason": "ok",
+            "unstable_quote_observed": False,
+            "observer_last_quote_age_ms": 4300.0,
+            "orderbook_micro": {"micro_state": "neutral"},
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_log_entry_pipeline",
+        lambda stock, code, stage, **fields: events.append((stage, fields)),
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_cancel_order",
+        lambda **kwargs: calls.__setitem__("cancel", calls["cancel"] + 1)
+        or {"return_code": "0", "ord_no": "0033622"},
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_buy_order",
+        lambda *args, **kwargs: calls.__setitem__("buy", calls["buy"] + 1)
+        or {"return_code": "0", "ord_no": "0034000"},
+    )
+
+    assert (
+        handlers._maybe_reprice_pending_entry_order(
+            stock, "466920", "SCALPING", timeout_sec=60
+        )
+        == "submitted"
+    )
+    assert calls == {"cancel": 1, "buy": 1}
+    evaluated = [
+        fields
+        for stage, fields in events
+        if stage == "entry_reprice_after_submit_evaluated"
+    ][0]
+    assert evaluated["entry_reprice_quote_refresh_applied"] is True
+    assert evaluated["entry_reprice_quote_refresh_source"] == "ws_manager_latest_data"
+    assert float(evaluated["quote_age_ms"]) == 120.0
+
+
+def test_pending_order_multi_leg_compresses_to_single_child(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = 1000.0
+    stock = {
+        "name": "테스트",
+        "strategy": "SCALPING",
+        "pending_entry_orders": [
+            {
+                **_base_order(sent_at=now - 16.0, ord_no="0033470", qty=3, price=39750),
+                "tag": "entry_split_primary",
+                "tif": "DAY",
+            },
+            {
+                **_base_order(
+                    sent_at=now - 16.0, ord_no="0033471", qty=11, price=39700
+                ),
+                "tag": "entry_split_passive_1",
+                "tif": "DAY",
+            },
+        ],
+    }
+    events = []
+    cancel_calls = []
+    buy_calls = []
+    monkeypatch.setattr(handlers.time, "time", lambda: now)
+    monkeypatch.setattr(
+        handlers.ORDERBOOK_STABILITY_OBSERVER,
+        "snapshot",
+        lambda code, now=None: {
+            "best_bid": 39855,
+            "best_ask": 39915,
+            "observer_healthy": True,
+            "unstable_quote_observed": False,
+            "observer_last_quote_age_ms": 120.0,
+            "orderbook_micro": {"micro_state": "neutral"},
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_log_entry_pipeline",
+        lambda stock, code, stage, **fields: events.append((stage, fields)),
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_cancel_order",
+        lambda **kwargs: cancel_calls.append(kwargs)
+        or {"return_code": "0", "ord_no": f"C{len(cancel_calls)}"},
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_buy_order",
+        lambda *args, **kwargs: buy_calls.append((args, kwargs))
+        or {"return_code": "0", "ord_no": "0034000"},
+    )
+
+    assert (
+        handlers._maybe_reprice_pending_entry_order(
+            stock, "466920", "SCALPING", timeout_sec=60
+        )
+        == "submitted"
+    )
+    assert [call["orig_ord_no"] for call in cancel_calls] == ["0033470", "0033471"]
+    assert buy_calls[0][0][1] == 14
+    assert len(stock["pending_entry_orders"]) == 1
+    child = stock["pending_entry_orders"][0]
+    assert child["ord_no"] == "0034000"
+    assert child["qty"] == 14
+    assert child["entry_reprice_parent_ord_no"] == "0033470,0033471"
+    assert child["entry_reprice_bundle_compression"] is True
+    assert child["entry_reprice_bundle_leg_count"] == 2
+    stages = [stage for stage, _ in events]
+    assert stages.count("entry_reprice_cancel_requested") == 2
+    assert stages.count("entry_reprice_cancel_confirmed") == 2
+    submitted = [
+        fields
+        for stage, fields in events
+        if stage == "entry_reprice_resubmit_submitted"
+    ][-1]
+    assert submitted["entry_reprice_bundle_compression"] is True
+    assert submitted["entry_reprice_parent_order_nos"] == "0033470,0033471"
+
+
+def test_entry_reprice_multi_leg_observed_mark_gap_unresolved_blocks_child(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = 1000.0
+    stock = {
+        "name": "금호건설",
+        "strategy": "SCALPING",
+        "current_price_observed": 16780,
+        "pending_entry_orders": [
+            {
+                **_base_order(
+                    sent_at=now - 16.0,
+                    ord_no="0051571",
+                    qty=2,
+                    price=16460,
+                    mark_price_at_submit=16510,
+                ),
+                "tag": "entry_split_primary",
+                "tif": "DAY",
+            },
+            {
+                **_base_order(
+                    sent_at=now - 16.0,
+                    ord_no="0051572",
+                    qty=10,
+                    price=16410,
+                    mark_price_at_submit=16510,
+                ),
+                "tag": "entry_split_passive_1",
+                "tif": "DAY",
+            },
+        ],
+    }
+    events = []
+    monkeypatch.setattr(handlers.time, "time", lambda: now)
+    monkeypatch.setattr(
+        handlers.ORDERBOOK_STABILITY_OBSERVER,
+        "snapshot",
+        lambda code, now=None: {
+            "best_bid": 0,
+            "best_ask": 0,
+            "observer_healthy": False,
+            "observer_missing_reason": "missing_quote",
+            "unstable_quote_observed": False,
+            "observer_last_quote_age_ms": None,
+            "orderbook_micro": {"micro_state": "neutral"},
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_entry_reprice_refresh_snapshot",
+        lambda code, snapshot, stock, order, strategy, now_ts: (snapshot, {}),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_log_entry_pipeline",
+        lambda stock, code, stage, **fields: events.append((stage, fields)),
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_cancel_order",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError),
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_buy_order",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError),
+    )
+
+    assert (
+        handlers._maybe_reprice_pending_entry_order(
+            stock, "002990", "SCALPING", timeout_sec=60
+        )
+        == "blocked"
+    )
+    assert stock["entry_reprice_block_reason"] == "observed_mark_gap_unresolved"
+    evaluated = [
+        fields
+        for stage, fields in events
+        if stage == "entry_reprice_after_submit_evaluated"
+    ][0]
+    blocked = [
+        fields
+        for stage, fields in events
+        if stage == "entry_reprice_after_submit_blocked"
+    ][0]
+    assert evaluated["observed_mark_gap_action"] == "block_submit"
+    assert evaluated["entry_reprice_bundle_compression"] is True
+    assert blocked["broker_order_forbidden"] is True
+
+
+def test_entry_reprice_observed_side_rebases_stale_parent_cap(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = 1000.0
+    stock = {
+        "name": "금호건설",
+        "strategy": "SCALPING",
+        "current_price_observed": 16780,
+        "pending_entry_orders": [
+            {
+                **_base_order(
+                    sent_at=now - 16.0,
+                    ord_no="0051571",
+                    qty=2,
+                    price=16460,
+                    mark_price_at_submit=16510,
+                ),
+                "tag": "entry_split_primary",
+                "tif": "DAY",
+            },
+            {
+                **_base_order(
+                    sent_at=now - 16.0,
+                    ord_no="0051572",
+                    qty=10,
+                    price=16410,
+                    mark_price_at_submit=16510,
+                ),
+                "tag": "entry_split_passive_1",
+                "tif": "DAY",
+            },
+        ],
+    }
+    events = []
+    cancel_calls = []
+    buy_calls = []
+    monkeypatch.setattr(handlers.time, "time", lambda: now)
+    monkeypatch.setattr(
+        handlers.ORDERBOOK_STABILITY_OBSERVER,
+        "snapshot",
+        lambda code, now=None: {
+            "best_bid": 16730,
+            "best_ask": 16750,
+            "last_trade_price": 16780,
+            "observer_healthy": True,
+            "observer_missing_reason": "ok",
+            "unstable_quote_observed": False,
+            "observer_last_quote_age_ms": 120.0,
+            "orderbook_micro": {"micro_state": "neutral"},
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_log_entry_pipeline",
+        lambda stock, code, stage, **fields: events.append((stage, fields)),
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_cancel_order",
+        lambda **kwargs: cancel_calls.append(kwargs)
+        or {"return_code": "0", "ord_no": f"C{len(cancel_calls)}"},
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_buy_order",
+        lambda *args, **kwargs: buy_calls.append((args, kwargs))
+        or {"return_code": "0", "ord_no": "0052000"},
+    )
+
+    assert (
+        handlers._maybe_reprice_pending_entry_order(
+            stock, "002990", "SCALPING", timeout_sec=60
+        )
+        == "submitted"
+    )
+    assert [call["orig_ord_no"] for call in cancel_calls] == ["0051571", "0051572"]
+    assert buy_calls[0][0][2] >= 16700
+    evaluated = [
+        fields
+        for stage, fields in events
+        if stage == "entry_reprice_after_submit_evaluated"
+    ][0]
+    assert evaluated["observed_mark_gap_action"] == "recompute_from_observed_side"
+    assert evaluated["observed_mark_gap_recompute_applied"] is True
+    assert evaluated["mark_price_at_submit"] == 16780
+    submitted = [
+        fields
+        for stage, fields in events
+        if stage == "entry_reprice_resubmit_submitted"
+    ][-1]
+    assert submitted["reprice_order_price"] >= 16700
+    assert stock["pending_entry_orders"][0]["price"] >= 16700
+    assert stock["pending_entry_orders"][0]["mark_price_at_submit"] == 16780
+
+
+def test_pending_order_multi_leg_partial_fill_blocks_without_cancel(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = 1000.0
+    stock = {
+        "name": "테스트",
+        "strategy": "SCALPING",
+        "pending_entry_orders": [
+            {
+                **_base_order(
+                    sent_at=now - 16.0,
+                    ord_no="0033470",
+                    qty=3,
+                    filled_qty=1,
+                    status="PARTIAL",
+                ),
+                "tif": "DAY",
+            },
+            {**_base_order(sent_at=now - 16.0, ord_no="0033471", qty=11), "tif": "DAY"},
+        ],
+    }
+    events = []
+    monkeypatch.setattr(handlers.time, "time", lambda: now)
+    monkeypatch.setattr(
+        handlers,
+        "_log_entry_pipeline",
+        lambda stock, code, stage, **fields: events.append((stage, fields)),
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_cancel_order",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError),
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_buy_order",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError),
+    )
+
+    assert (
+        handlers._maybe_reprice_pending_entry_order(
+            stock, "466920", "SCALPING", timeout_sec=60
+        )
+        == "blocked"
+    )
+    assert stock["entry_reprice_block_reason"] == "bundle_partial_fill_not_supported"
+    assert events[0][1]["block_reason"] == "bundle_partial_fill_not_supported"
+
+
+def test_nxt_rising_missed_holding_reprices_open_residual_bundle(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = 1000.0
+    stock = {
+        "name": "현대힘스",
+        "strategy": "SCALPING",
+        "status": "HOLDING",
+        "buy_qty": 14,
+        "entry_filled_qty": 14,
+        "rising_missed_class": "LOW_REBOUND_RISING_MISSED",
+        "pending_entry_orders": [
+            {
+                **_base_order(
+                    sent_at=now - 152.0,
+                    ord_no="NXT-R2",
+                    qty=7,
+                    price=13690,
+                ),
+                "tag": "entry_split_passive_1",
+                "tif": "DAY",
+                "dmst_stex_tp": "SOR",
+            },
+            {
+                **_base_order(
+                    sent_at=now - 152.0,
+                    ord_no="NXT-R3",
+                    qty=7,
+                    price=13630,
+                ),
+                "tag": "entry_split_passive_2",
+                "tif": "DAY",
+                "dmst_stex_tp": "SOR",
+            },
+        ],
+    }
+    events = []
+    cancel_calls = []
+    buy_calls = []
+    monkeypatch.setattr(handlers.time, "time", lambda: now)
+    monkeypatch.setattr(handlers, "WS_MANAGER", None)
+    monkeypatch.setattr(
+        handlers,
+        "_entry_reprice_refresh_snapshot",
+        lambda code, snapshot, stock, order, strategy, now_ts: (snapshot, {}),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_nxt_rising_missed_partial_fill_reprice_enabled",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        handlers.ORDERBOOK_STABILITY_OBSERVER,
+        "snapshot",
+        lambda code, now=None: {
+            "best_bid": 13780,
+            "best_ask": 13790,
+            "last_trade_price": 13790,
+            "observer_healthy": True,
+            "observer_missing_reason": "ok",
+            "unstable_quote_observed": False,
+            "observer_last_quote_age_ms": 120.0,
+            "orderbook_micro": {"micro_state": "neutral"},
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_log_entry_pipeline",
+        lambda stock, code, stage, **fields: events.append((stage, fields)),
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_cancel_order",
+        lambda **kwargs: cancel_calls.append(kwargs)
+        or {"return_code": "0", "ord_no": f"C{len(cancel_calls)}"},
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_buy_order",
+        lambda *args, **kwargs: buy_calls.append((args, kwargs))
+        or {"return_code": "0", "ord_no": "NXT-R4"},
+    )
+
+    result = handlers._maybe_reprice_pending_entry_order(
+        stock, "460930", "SCALPING", timeout_sec=None
+    )
+
+    assert result == "submitted"
+    assert [call["orig_ord_no"] for call in cancel_calls] == ["NXT-R2", "NXT-R3"]
+    assert buy_calls[0][0][1] == 14
+    assert buy_calls[0][1]["dmst_stex_tp"] == "SOR"
+    assert stock["status"] == "HOLDING"
+    assert stock["buy_qty"] == 14
+    assert stock["pending_entry_orders"][0]["ord_no"] == "NXT-R4"
+    submitted = [
+        fields
+        for stage, fields in events
+        if stage == "entry_reprice_resubmit_submitted"
+    ][-1]
+    assert submitted["nxt_partial_fill_reprice_applied"] is True
+    assert submitted["nxt_partial_fill_reprice_decision_authority"] == (
+        "nxt_rising_missed_open_residual_only"
+    )
+
+
+def test_nxt_partial_fill_reprice_resubmit_failure_preserves_holding(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    stock = {
+        "status": "HOLDING",
+        "buy_qty": 14,
+        "entry_filled_qty": 14,
+        "entry_requested_qty": 28,
+        "requested_buy_qty": 28,
+        "pending_entry_orders": [{"ord_no": "NXT-R2", "status": "CANCELLED"}],
+    }
+
+    handlers._reset_entry_reprice_after_failed_resubmit(
+        stock, "460930", preserve_holding=True
+    )
+
+    assert stock["status"] == "HOLDING"
+    assert stock["buy_qty"] == 14
+    assert stock["entry_filled_qty"] == 14
+    assert stock["entry_requested_qty"] == 14
+    assert stock["requested_buy_qty"] == 14
+    assert stock["entry_reprice_residual_aborted"] is True
+    assert "pending_entry_orders" not in stock
+
+
+def test_nxt_single_residual_fill_during_cancel_blocks_duplicate_resubmit(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = 1000.0
+    stock = {
+        "name": "현대힘스",
+        "strategy": "SCALPING",
+        "status": "HOLDING",
+        "buy_qty": 14,
+        "entry_filled_qty": 14,
+        "rising_missed_class": "LOW_REBOUND_RISING_MISSED",
+        "pending_entry_orders": [
+            {
+                **_base_order(
+                    sent_at=now - 20.0,
+                    ord_no="NXT-R2",
+                    qty=7,
+                    price=13690,
+                    mark_price_at_submit=13780,
+                ),
+                "dmst_stex_tp": "SOR",
+            }
+        ],
+    }
+    monkeypatch.setattr(handlers.time, "time", lambda: now)
+    monkeypatch.setattr(handlers, "WS_MANAGER", None)
+    monkeypatch.setattr(
+        handlers,
+        "_entry_reprice_refresh_snapshot",
+        lambda code, snapshot, stock, order, strategy, now_ts: (snapshot, {}),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_nxt_rising_missed_partial_fill_reprice_enabled",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        handlers.ORDERBOOK_STABILITY_OBSERVER,
+        "snapshot",
+        lambda code, now=None: {
+            "best_bid": 13780,
+            "best_ask": 13790,
+            "last_trade_price": 13790,
+            "observer_healthy": True,
+            "observer_missing_reason": "ok",
+            "unstable_quote_observed": False,
+            "observer_last_quote_age_ms": 100.0,
+            "orderbook_micro": {"micro_state": "neutral"},
+        },
+    )
+    monkeypatch.setattr(handlers, "_log_entry_pipeline", lambda *args, **kwargs: None)
+
+    def fill_while_cancelling(**kwargs):
+        stock["entry_filled_qty"] = 15
+        return {"return_code": "0", "ord_no": "C-NXT-R2"}
+
+    monkeypatch.setattr(
+        handlers.kiwoom_orders, "send_cancel_order", fill_while_cancelling
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_buy_order",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError),
+    )
+
+    result = handlers._maybe_reprice_pending_entry_order(
+        stock, "460930", "SCALPING", timeout_sec=None
+    )
+
+    assert result == "failed"
+    assert stock["entry_reprice_block_reason"] == "bundle_fill_after_cancel_detected"
+
+
+def test_probe_residual_reprice_uses_p1_and_preserves_quantity_and_ttl(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = datetime(2026, 7, 22, 10, 0, tzinfo=ZoneInfo("Asia/Seoul")).timestamp()
+    stock = {
+        "name": "probe-residual",
+        "strategy": "SCALPING",
+        "status": "HOLDING",
+        "buy_qty": 1,
+        "buy_price": 10000,
+        "entry_filled_qty": 1,
+        "entry_split_probe_phase": "residual_submitted",
+        "entry_split_probe_bundle_id": "probe-bundle-1",
+        "entry_split_probe_requested_qty": 5,
+        "entry_split_probe_fill_price": 10000,
+        "current_price_observed": 10000,
+        "pending_entry_orders": [
+            {
+                **_base_order(
+                    sent_at=now - 16.0,
+                    ord_no="P1-R1",
+                    qty=2,
+                    price=9970,
+                    mark_price_at_submit=10000,
+                ),
+                "tag": "entry_split_probe_residual_1",
+                "entry_split_order_leg_index": 1,
+                "split_leg_ttl_sec": 30,
+                "split_bundle_hard_ttl_sec": 60,
+                "dmst_stex_tp": "SOR",
+            },
+            {
+                **_base_order(
+                    sent_at=now - 16.0,
+                    ord_no="P1-R2",
+                    qty=2,
+                    price=9920,
+                    mark_price_at_submit=10000,
+                ),
+                "tag": "entry_split_probe_residual_2",
+                "entry_split_order_leg_index": 2,
+                "split_leg_ttl_sec": 60,
+                "split_bundle_hard_ttl_sec": 60,
+                "dmst_stex_tp": "SOR",
+            },
+        ],
+    }
+    events = []
+    cancel_calls = []
+    buy_calls = []
+    resolver_calls = []
+    runtime_updates = []
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_DYNAMIC_ENTRY_PRICE_RESOLVER_POST_PROBE_ENABLED", "true"
+    )
+    monkeypatch.setenv("KORSTOCKSCAN_ENTRY_SPLIT_PROBE_FIRST_ENABLED", "true")
+    monkeypatch.setattr(handlers.time, "time", lambda: now)
+    monkeypatch.setattr(handlers, "COOLDOWNS", {})
+    monkeypatch.setattr(handlers, "WS_MANAGER", None)
+    monkeypatch.setattr(handlers, "is_scalping_buy_time_allowed", lambda now_dt: True)
+    monkeypatch.setattr(handlers, "is_buy_side_paused", lambda: False)
+    monkeypatch.setattr(
+        handlers.ORDERBOOK_STABILITY_OBSERVER,
+        "snapshot",
+        lambda code, now=None: {
+            "best_bid": 10000,
+            "best_ask": 10010,
+            "last_trade_price": 10000,
+            "observer_healthy": True,
+            "observer_missing_reason": "ok",
+            "unstable_quote_observed": False,
+            "observer_last_quote_age_ms": 100.0,
+            "orderbook_micro": {"micro_state": "bullish"},
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_post_probe_direction_fields",
+        lambda *args, **kwargs: {
+            "post_probe_direction_state": "STRONG",
+            "post_probe_continuation_action": "ALLOW_NARROW",
+            "post_probe_direction_reason": "test_strong",
+        },
+    )
+
+    def fake_resolver(**kwargs):
+        resolver_calls.append(kwargs)
+        return {
+            "allowed": True,
+            "action": kwargs["continuation_action"],
+            "anchor_price": 10000,
+            "min_price": 9980,
+            "max_price": 10000,
+            "offset_profile": "narrow",
+            "resolved_order_price": 10000,
+            "reason": "post_probe_narrow",
+            "entry_price_resolver_phase": kwargs["phase"],
+        }
+
+    monkeypatch.setattr(handlers, "resolve_scalping_entry_price", fake_resolver)
+    monkeypatch.setattr(
+        handlers,
+        "_post_probe_chase_guard_fields",
+        lambda *args, **kwargs: {
+            "post_probe_chase_guard_blocked": False,
+            "post_probe_chase_guard_reason": "post_probe_chase_guard_passed",
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_probe_residual_account_guard_fields",
+        lambda code, **kwargs: {
+            "account_guard_allowed": True,
+            "account_guard_reason": "probe_residual_account_guard_passed",
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "update_probe_runtime_bundle",
+        lambda bundle_id, **kwargs: runtime_updates.append((bundle_id, kwargs)),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_log_entry_pipeline",
+        lambda stock, code, stage, **fields: events.append((stage, fields)),
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_cancel_order",
+        lambda **kwargs: cancel_calls.append(kwargs)
+        or {"return_code": "0", "ord_no": f"C{len(cancel_calls)}"},
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_buy_order",
+        lambda *args, **kwargs: buy_calls.append((args, kwargs))
+        or {"return_code": "0", "ord_no": "P1-R3"},
+    )
+
+    result = handlers._maybe_reprice_pending_entry_order(
+        stock, "123456", "SCALPING", timeout_sec=None
+    )
+
+    assert result == "submitted"
+    assert resolver_calls[0]["phase"] == "leg_reprice"
+    assert resolver_calls[0]["continuation_action"] == "ALLOW_NARROW"
+    assert [call["orig_ord_no"] for call in cancel_calls] == ["P1-R1", "P1-R2"]
+    assert buy_calls[0][0][1:] == (4, 10000, "00")
+    child = stock["pending_entry_orders"][0]
+    assert child["qty"] == 4
+    assert child["probe_residual_reprice_applied"] is True
+    assert child["entry_price_resolver_phase"] == "leg_reprice"
+    assert child["entry_price_resolver_offset_profile"] == "narrow"
+    assert 1 <= child["split_bundle_hard_ttl_sec"] <= 44
+    assert stock["buy_qty"] == 1
+    assert runtime_updates[-1][0] == "probe-bundle-1"
+    submitted = [
+        fields
+        for stage, fields in events
+        if stage == "entry_reprice_resubmit_submitted"
+    ][-1]
+    assert submitted["probe_residual_reprice_applied"] is True
+    assert submitted["probe_residual_reprice_decision_authority"] == (
+        "dynamic_entry_price_resolver_p1_leg_reprice"
+    )
+
+
+def test_probe_residual_reprice_weak_direction_keeps_orders_open(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = datetime(2026, 7, 22, 10, 0, tzinfo=ZoneInfo("Asia/Seoul")).timestamp()
+    order = {
+        **_base_order(
+            sent_at=now - 16.0,
+            ord_no="P1-W1",
+            qty=4,
+            price=9970,
+            mark_price_at_submit=10000,
+        ),
+        "tag": "entry_split_probe_residual_1",
+        "entry_split_order_leg_index": 1,
+    }
+    stock = {
+        "name": "probe-weak",
+        "strategy": "SCALPING",
+        "status": "HOLDING",
+        "buy_qty": 1,
+        "buy_price": 10000,
+        "entry_filled_qty": 1,
+        "entry_split_probe_phase": "residual_submitted",
+        "entry_split_probe_bundle_id": "probe-bundle-weak",
+        "entry_split_probe_requested_qty": 5,
+        "entry_split_probe_fill_price": 10000,
+        "current_price_observed": 9990,
+        "pending_entry_orders": [order],
+    }
+    events = []
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_DYNAMIC_ENTRY_PRICE_RESOLVER_POST_PROBE_ENABLED", "true"
+    )
+    monkeypatch.setenv("KORSTOCKSCAN_ENTRY_SPLIT_PROBE_FIRST_ENABLED", "true")
+    monkeypatch.setattr(handlers.time, "time", lambda: now)
+    monkeypatch.setattr(handlers, "WS_MANAGER", None)
+    monkeypatch.setattr(
+        handlers.ORDERBOOK_STABILITY_OBSERVER,
+        "snapshot",
+        lambda code, now=None: {
+            "best_bid": 9990,
+            "best_ask": 10000,
+            "last_trade_price": 9990,
+            "observer_healthy": True,
+            "observer_missing_reason": "ok",
+            "unstable_quote_observed": False,
+            "observer_last_quote_age_ms": 100.0,
+            "orderbook_micro": {"micro_state": "bearish"},
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_post_probe_direction_fields",
+        lambda *args, **kwargs: {
+            "post_probe_direction_state": "WEAK",
+            "post_probe_continuation_action": "DEFER",
+            "post_probe_direction_reason": "test_weak",
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_log_entry_pipeline",
+        lambda stock, code, stage, **fields: events.append((stage, fields)),
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_cancel_order",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError),
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_buy_order",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError),
+    )
+
+    result = handlers._maybe_reprice_pending_entry_order(
+        stock, "123456", "SCALPING", timeout_sec=None
+    )
+
+    assert result == "blocked"
+    assert stock["pending_entry_orders"][0]["status"] == "OPEN"
+    assert stock.get("entry_reprice_evaluated") is not True
+    blocked = [
+        fields
+        for stage, fields in events
+        if stage == "entry_reprice_after_submit_blocked"
+    ][-1]
+    assert blocked["block_reason"] == "post_probe_direction_deferred"
+    assert blocked["probe_residual_reprice_nonterminal_block"] is True
+
+
+def test_nxt_tp1_context_refresh_requires_current_actual_ws_micro(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = datetime(2026, 7, 21, 16, 20, tzinfo=ZoneInfo("Asia/Seoul")).timestamp()
+    raw_ws = {
+        "curr": 13790,
+        "last_realtime_type_ts": {"0B": now - 0.4, "0D": now - 0.2},
+        "last_realtime_type_market_route": {
+            "0B": "krx_nxt_integrated",
+            "0D": "krx_nxt_integrated",
+        },
+        "last_trade_tick": {
+            "ts": now - 0.4,
+            "values": {"15": "+120"},
+            "aggressor_source": "kiwoom_0b_signed_trade_volume",
+            "strength": 110.0,
+        },
+        "orderbook": {
+            "bids": [{"price": 13780, "volume": 1000}],
+            "asks": [{"price": 13790, "volume": 900}],
+        },
+    }
+    stock = {
+        "name": "현대힘스",
+        "is_nxt": True,
+        "rising_missed_class": "LOW_REBOUND_RISING_MISSED",
+        "rising_missed_tp1_submit_context_at": now - 60.0,
+        "rising_missed_tp1_submit_context_candidate_allowed": True,
+        "rising_missed_tp1_submit_context_evaluation_id": "eval-nxt-1",
+    }
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_NXT_RISING_MISSED_TP1_CONTEXT_REFRESH_ENABLED", "true"
+    )
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_NXT_RISING_MISSED_TP1_CONTEXT_REFRESH_ACTIVE_DATE",
+        "2026-07-21",
+    )
+    monkeypatch.setattr(
+        handlers,
+        "WS_MANAGER",
+        SimpleNamespace(get_latest_data=lambda code: dict(raw_ws)),
+    )
+    monkeypatch.setattr(
+        handlers._SCALPING_MICRO_ESTIMATOR_STORE,
+        "snapshot",
+        lambda code, now_ts: {
+            "source_state": "fresh_ws_order_flow_delta",
+            "age_sec": 0.5,
+            "confidence": 0.8,
+            "true_ofi_ewma": 0.2,
+            "pressure_ewma": 65.0,
+            "top_depth_ratio": 1.2,
+            "true_ofi_sample_count": 4,
+        },
+    )
+
+    fields = handlers._refresh_nxt_rising_missed_tp1_submit_context(
+        stock, "460930", raw_ws, now_ts=now
+    )
+
+    assert fields["nxt_tp1_context_refresh_applied"] is True
+    assert stock["rising_missed_tp1_submit_context_at"] == now
+    assert stock["rising_missed_tp1_submit_context_original_at"] == now - 60.0
+    assert stock["nxt_tp1_context_refresh_count"] == 1
+
+    stock["nxt_tp1_context_refresh_count"] = 0
+    stock["rising_missed_tp1_submit_context_at"] = now - 60.0
+    monkeypatch.setattr(
+        handlers._SCALPING_MICRO_ESTIMATOR_STORE,
+        "snapshot",
+        lambda code, now_ts: {
+            "source_state": "rest_orderbook_delta_estimate",
+            "age_sec": 0.1,
+            "confidence": 0.9,
+            "true_ofi_ewma": 0.5,
+            "pressure_ewma": 80.0,
+            "top_depth_ratio": 2.0,
+            "true_ofi_sample_count": 10,
+        },
+    )
+
+    blocked = handlers._refresh_nxt_rising_missed_tp1_submit_context(
+        stock, "460930", raw_ws, now_ts=now
+    )
+
+    assert blocked["nxt_tp1_context_refresh_applied"] is False
+    assert blocked["nxt_tp1_context_refresh_reason"] == (
+        "trusted_ws_micro_not_continuing"
+    )
+
+
+def test_pending_order_multi_leg_cancel_failure_does_not_resubmit(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = 1000.0
+    stock = {
+        "name": "테스트",
+        "strategy": "SCALPING",
+        "pending_entry_orders": [
+            {**_base_order(sent_at=now - 16.0, ord_no="0033470", qty=3), "tif": "DAY"},
+            {**_base_order(sent_at=now - 16.0, ord_no="0033471", qty=11), "tif": "DAY"},
+        ],
+    }
+    events = []
+    cancel_calls = []
+    monkeypatch.setattr(handlers.time, "time", lambda: now)
+    monkeypatch.setattr(
+        handlers.ORDERBOOK_STABILITY_OBSERVER,
+        "snapshot",
+        lambda code, now=None: {
+            "best_bid": 39855,
+            "best_ask": 39915,
+            "observer_healthy": True,
+            "unstable_quote_observed": False,
+            "observer_last_quote_age_ms": 120.0,
+            "orderbook_micro": {"micro_state": "neutral"},
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_log_entry_pipeline",
+        lambda stock, code, stage, **fields: events.append((stage, fields)),
+    )
+
+    def fake_cancel(**kwargs):
+        cancel_calls.append(kwargs)
+        if len(cancel_calls) == 1:
+            return {"return_code": "0", "ord_no": "C1"}
+        return {"return_code": "1", "return_msg": "cancel failed"}
+
+    monkeypatch.setattr(handlers.kiwoom_orders, "send_cancel_order", fake_cancel)
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_buy_order",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError),
+    )
+
+    assert (
+        handlers._maybe_reprice_pending_entry_order(
+            stock, "466920", "SCALPING", timeout_sec=60
+        )
+        == "failed"
+    )
+    assert [call["orig_ord_no"] for call in cancel_calls] == ["0033470", "0033471"]
+    assert stock["entry_reprice_block_reason"] == "bundle_cancel_partial_failure"
+    failed = [
+        fields
+        for stage, fields in events
+        if stage == "entry_reprice_after_submit_failed"
+    ][-1]
+    assert failed["failure_reason"] == "bundle_cancel_partial_failure"
+
+
+def test_pending_order_multi_leg_post_cancel_fill_blocks_child(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = 1000.0
+    stock = {
+        "name": "테스트",
+        "strategy": "SCALPING",
+        "pending_entry_orders": [
+            {**_base_order(sent_at=now - 16.0, ord_no="0033470", qty=3), "tif": "DAY"},
+            {**_base_order(sent_at=now - 16.0, ord_no="0033471", qty=11), "tif": "DAY"},
+        ],
+    }
+    events = []
+    monkeypatch.setattr(handlers.time, "time", lambda: now)
+    monkeypatch.setattr(
+        handlers.ORDERBOOK_STABILITY_OBSERVER,
+        "snapshot",
+        lambda code, now=None: {
+            "best_bid": 39855,
+            "best_ask": 39915,
+            "observer_healthy": True,
+            "unstable_quote_observed": False,
+            "observer_last_quote_age_ms": 120.0,
+            "orderbook_micro": {"micro_state": "neutral"},
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_log_entry_pipeline",
+        lambda stock, code, stage, **fields: events.append((stage, fields)),
+    )
+
+    def fake_cancel(**kwargs):
+        if kwargs["orig_ord_no"] == "0033471":
+            stock["entry_filled_qty"] = 1
+        return {"return_code": "0", "ord_no": f"C{kwargs['orig_ord_no']}"}
+
+    monkeypatch.setattr(handlers.kiwoom_orders, "send_cancel_order", fake_cancel)
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_buy_order",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError),
+    )
+
+    assert (
+        handlers._maybe_reprice_pending_entry_order(
+            stock, "466920", "SCALPING", timeout_sec=60
+        )
+        == "failed"
+    )
+    assert stock["entry_reprice_block_reason"] == "bundle_fill_after_cancel_detected"
+    failed = [
+        fields
+        for stage, fields in events
+        if stage == "entry_reprice_after_submit_failed"
+    ][-1]
+    assert failed["failure_stage"] == "post_cancel_fill_check"
+    assert failed["entry_reprice_filled_qty"] == 1
+
+
+def test_pending_order_resubmit_missing_order_no_clears_pending(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = 1000.0
+    stock = {
+        "name": "테스트",
+        "strategy": "SCALPING",
+        "pending_entry_orders": [{**_base_order(sent_at=now - 16.0), "tif": "DAY"}],
+    }
+    monkeypatch.setattr(handlers.time, "time", lambda: now)
+    monkeypatch.setattr(
+        handlers.ORDERBOOK_STABILITY_OBSERVER,
+        "snapshot",
+        lambda code, now=None: {
+            "best_bid": 39855,
+            "best_ask": 39915,
+            "observer_healthy": True,
+            "unstable_quote_observed": False,
+            "observer_last_quote_age_ms": 120.0,
+            "orderbook_micro": {"micro_state": "neutral"},
+        },
+    )
+    monkeypatch.setattr(handlers, "_log_entry_pipeline", lambda *args, **kwargs: None)
+    monkeypatch.setattr(handlers, "_clear_entry_arm", lambda stock: None)
+    monkeypatch.setattr(handlers, "ALERTED_STOCKS", {"466920"})
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_cancel_order",
+        lambda **kwargs: {"return_code": "0", "ord_no": "0033622"},
+    )
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_buy_order",
+        lambda *args, **kwargs: {"return_code": "0", "ord_no": ""},
+    )
+
+    assert (
+        handlers._maybe_reprice_pending_entry_order(
+            stock, "466920", "SCALPING", timeout_sec=60
+        )
+        == "failed"
+    )
+    assert "pending_entry_orders" not in stock
+    assert stock["status"] == "WATCHING"
+    assert "466920" not in handlers.ALERTED_STOCKS
+
+
+def test_child_order_does_not_reprice_again(monkeypatch):
+    import src.engine.sniper_state_handlers as handlers
+
+    now = time.time()
+    stock = {
+        "name": "테스트",
+        "strategy": "SCALPING",
+        "pending_entry_orders": [
+            {
+                **_base_order(
+                    sent_at=now - 20.0, ord_no="0034000", entry_reprice_attempt_count=1
+                ),
+                "entry_order_lifecycle": "repriced_after_submit",
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        handlers.kiwoom_orders,
+        "send_cancel_order",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError),
+    )
+    assert (
+        handlers._maybe_reprice_pending_entry_order(
+            stock, "466920", "SCALPING", timeout_sec=60
+        )
+        == "blocked"
+    )
+    assert (
+        stock["pending_entry_orders"][0]["entry_reprice_block_reason"]
+        == "attempt_limit"
+    )

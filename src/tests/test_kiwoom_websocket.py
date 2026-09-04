@@ -1,0 +1,3196 @@
+import asyncio
+import json
+import os
+from datetime import datetime, tzinfo
+from types import SimpleNamespace
+
+import pytest
+
+import src.engine.kiwoom_websocket as kiwoom_websocket
+from src.engine.kiwoom_websocket import KiwoomWSManager
+
+
+class _FakeWS:
+    def __init__(self, messages):
+        self._messages = list(messages)
+        self.sent = []
+
+    async def recv(self):
+        if not self._messages:
+            raise asyncio.TimeoutError
+        return self._messages.pop(0)
+
+    async def send(self, payload):
+        self.sent.append(payload)
+
+
+class _RecordingTransportEpochCollector:
+    def __init__(self, order=None):
+        self.epochs = []
+        self.order = order
+
+    def begin_transport_epoch(self):
+        epoch = 1_000 + len(self.epochs)
+        self.epochs.append(epoch)
+        if self.order is not None:
+            self.order.append("transport_epoch")
+        return epoch
+
+
+class _OffsetlessTZ(tzinfo):
+    def utcoffset(self, _dt):
+        return None
+
+    def dst(self, _dt):
+        return None
+
+
+def _reset_ws_hot_override_cache():
+    with kiwoom_websocket._WS_HOT_RUNTIME_OVERRIDES_LOCK:
+        kiwoom_websocket._WS_HOT_RUNTIME_OVERRIDES.update(
+            {"mtime_ns": None, "values": {}, "next_check_ts": 0.0}
+        )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ws_hot_runtime_override(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        kiwoom_websocket,
+        "_WS_OPERATOR_RUNTIME_OVERRIDE_PATH",
+        tmp_path / "missing_operator_runtime_overrides.env",
+    )
+    _reset_ws_hot_override_cache()
+    yield
+    _reset_ws_hot_override_cache()
+
+
+def test_login_success_message_helpers():
+    success = {"trnm": "LOGIN", "return_code": 0}
+    failure = {"trnm": "LOGIN", "return_code": 100}
+
+    assert KiwoomWSManager._is_login_success_message(success) is True
+    assert KiwoomWSManager._is_login_failure_message(success) is False
+    assert KiwoomWSManager._is_login_success_message(failure) is False
+    assert KiwoomWSManager._is_login_failure_message(failure) is True
+
+
+def test_widget_dashboard_snapshot_interval_defaults_to_one_second(monkeypatch):
+    monkeypatch.delenv(
+        kiwoom_websocket.WS_DASHBOARD_SNAPSHOT_INTERVAL_SEC_ENV, raising=False
+    )
+    assert kiwoom_websocket._ws_dashboard_snapshot_interval_sec() == 1.0
+
+    monkeypatch.setenv(kiwoom_websocket.WS_DASHBOARD_SNAPSHOT_INTERVAL_SEC_ENV, "0.01")
+    assert kiwoom_websocket._ws_dashboard_snapshot_interval_sec() == 0.25
+
+
+def test_pinned_widget_observation_is_limited_to_one_samsung_item(monkeypatch):
+    monkeypatch.setenv(
+        kiwoom_websocket.WS_PINNED_OBSERVATION_ITEMS_ENV,
+        "000001_AL,005930_NX,005930_AL",
+    )
+
+    assert kiwoom_websocket.pinned_ws_observation_items() == ("005930_NX",)
+    assert kiwoom_websocket.pinned_ws_observation_codes() == frozenset({"005930"})
+
+
+def test_await_login_ack_handles_ping_then_success():
+    manager = KiwoomWSManager("test-token")
+    ping_payload = json.dumps({"trnm": "PING", "ping_id": "abc123"})
+    fake_ws = _FakeWS(
+        [
+            json.dumps(["PING"]),
+            ping_payload,
+            json.dumps({"trnm": "LOGIN", "return_code": 0, "return_msg": "OK"}),
+        ]
+    )
+
+    asyncio.run(manager._await_login_ack(fake_ws, timeout_sec=1.0))
+
+    assert fake_ws.sent == [ping_payload]
+
+
+def test_handle_message_echoes_ping_payload():
+    manager = KiwoomWSManager("test-token")
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+    ping_payload = json.dumps({"trnm": "PING", "seq": "keepalive-1"})
+
+    asyncio.run(manager._handle_message(ping_payload))
+
+    assert fake_ws.sent == [ping_payload]
+
+
+def test_handle_message_ignores_non_dict_payload():
+    manager = KiwoomWSManager("test-token")
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+
+    asyncio.run(manager._handle_message(json.dumps(["PING"])))
+
+    assert fake_ws.sent == []
+
+
+def test_order_execution_carries_websocket_packet_ingress_timestamp():
+    manager = KiwoomWSManager("test-token")
+    packet_received_at = datetime(
+        2026, 8, 25, 9, 0, 3, 456789, tzinfo=kiwoom_websocket.KST
+    )
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "00",
+                            "name": "주문체결",
+                            "values": {
+                                "9203": "1000001",
+                                "9001": "A005930",
+                                "913": "체결",
+                                "900": "1",
+                                "902": "0",
+                                "903": "70000",
+                                "905": "+매수",
+                                "907": "2",
+                                "908": "090003",
+                                "909": "2000001",
+                                "910": "70000",
+                                "911": "1",
+                                "914": "70000",
+                                "915": "1",
+                                "2134": "1",
+                                "2135": "KRX",
+                                "2136": "N",
+                            },
+                        }
+                    ],
+                }
+            ),
+            received_at=packet_received_at,
+        )
+    )
+
+    queued = []
+    while not manager._state_event_queue.empty():
+        queued.append(manager._state_event_queue.get_nowait())
+    execution_payload = next(
+        payload for event_type, payload in queued if event_type == "ORDER_EXECUTED"
+    )
+    assert execution_payload["broker_execution_received_at"] == (
+        packet_received_at.isoformat(timespec="microseconds")
+    )
+    assert execution_payload["broker_execution_receive_time_source"] == (
+        "websocket_packet_ingress"
+    )
+
+
+@pytest.mark.parametrize(
+    "received_at",
+    [
+        None,
+        datetime(2026, 8, 25, 9, 0, 3, 456789),
+        datetime(2026, 8, 25, 9, 0, 3, 456789, tzinfo=_OffsetlessTZ()),
+    ],
+    ids=["missing", "timezone_naive", "offsetless_tzinfo"],
+)
+def test_order_execution_without_aware_ingress_timestamp_is_never_trusted(
+    received_at,
+):
+    manager = KiwoomWSManager("test-token")
+    message = json.dumps(
+        {
+            "trnm": "REAL",
+            "data": [
+                {
+                    "type": "00",
+                    "name": "주문체결",
+                    "values": {
+                        "9203": "1000001",
+                        "9001": "A005930",
+                        "913": "체결",
+                        "900": "1",
+                        "902": "0",
+                        "903": "70000",
+                        "905": "+매수",
+                        "907": "2",
+                        "908": "090003",
+                        "909": "2000001",
+                        "910": "70000",
+                        "911": "1",
+                        "914": "70000",
+                        "915": "1",
+                        "2134": "1",
+                        "2135": "KRX",
+                        "2136": "N",
+                    },
+                }
+            ],
+        }
+    )
+
+    if received_at is None:
+        asyncio.run(manager._handle_message(message))
+    else:
+        asyncio.run(manager._handle_message(message, received_at=received_at))
+
+    queued = []
+    while not manager._state_event_queue.empty():
+        queued.append(manager._state_event_queue.get_nowait())
+    execution_payload = next(
+        payload for event_type, payload in queued if event_type == "ORDER_EXECUTED"
+    )
+    assert execution_payload["broker_execution_receive_time_source"] == (
+        "handler_dispatch_fallback_not_packet_ingress"
+    )
+    assert execution_payload["broker_execution_receive_time_source"] != (
+        "websocket_packet_ingress"
+    )
+
+
+def _epoch_at_090010():
+    return datetime(2026, 7, 3, 9, 0, 10).timestamp()
+
+
+def test_realtime_0b_stores_signed_trade_volume_primary_with_touch_provenance(
+    monkeypatch,
+):
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: _epoch_at_090010())
+    manager = KiwoomWSManager("test-token")
+    manager.subscribed_codes = {"005930"}
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "0B",
+                            "item": "005930",
+                            "values": {
+                                "10": "10110",
+                                "15": "+120",
+                                "20": "090010",
+                                "9081": "1",
+                                "27": "10110",
+                                "28": "10100",
+                                "228": "135.5",
+                            },
+                        }
+                    ],
+                }
+            )
+        )
+    )
+
+    latest = manager.get_latest_data("005930")
+    tick = latest["recent_trade_ticks"][0]
+    assert tick["dir"] == "BUY"
+    assert tick["aggressor_source"] == "kiwoom_0b_signed_trade_volume"
+    assert tick["aggressor_quality"] == "signed_trade_volume_positive"
+    assert tick["aggressor_quote_source"] == "0B_inline_best_quote"
+    assert tick["aggressor_tick_sync"] is True
+    assert tick["aggressor_cache_used"] is False
+    assert tick["aggressor_tob_miss_count"] == 0
+    assert tick["aggressor_backoff_active"] is False
+    assert tick["aggressor_touch_side"] == "BUY"
+    assert tick["aggressor_touch_source"] == "orderbook_touch"
+    assert tick["aggressor_touch_quality"] == "touch_or_crossed_ask"
+    assert tick["aggressor_touch_confirms_signed"] is True
+    assert tick["aggressor_aux_side"] == "BUY"
+    assert tick["aggressor_aux_source"] == "weighted_auxiliary_observation"
+    assert tick["aggressor_aux_pressure_usable"] is False
+    assert tick["aggressor_aux_raw_15"] == "+120"
+    assert tick["signed_trade_volume"] == "+120"
+    assert tick["best_ask"] == 10110
+    assert tick["best_bid"] == 10100
+    assert latest["last_trade_tick"]["price"] == 10110
+    assert latest["last_trade_tick"]["exchange_time_raw"] == "090010"
+    assert latest["last_trade_tick"]["exchange_code_9081"] == "1"
+
+
+def test_signed_trade_volume_primary_classifies_without_orderbook_touch(monkeypatch):
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: _epoch_at_090010())
+    manager = KiwoomWSManager("test-token")
+    manager.subscribed_codes = {"005930"}
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "0B",
+                            "item": "005930",
+                            "values": {
+                                "10": "10110",
+                                "15": "+80",
+                                "20": "090010",
+                                "27": "",
+                                "28": "",
+                            },
+                        },
+                    ],
+                }
+            )
+        )
+    )
+
+    tick = manager.get_latest_data("005930")["recent_trade_ticks"][0]
+    assert tick["dir"] == "BUY"
+    assert tick["aggressor_side"] == "BUY"
+    assert tick["aggressor_source"] == "kiwoom_0b_signed_trade_volume"
+    assert tick["aggressor_quality"] == "signed_trade_volume_positive"
+    assert tick["aggressor_touch_side"] == "UNKNOWN"
+    assert tick["aggressor_touch_source"] == "missing_best_quote"
+    assert tick["aggressor_touch_quality"] == "missing_best_quote"
+    assert tick["aggressor_touch_confirms_signed"] is None
+    assert tick["aggressor_aux_side"] == "BUY"
+    assert tick["aggressor_aux_source"] == "weighted_auxiliary_observation"
+    assert tick["aggressor_aux_quality"] == "signed_trade_volume_positive_auxiliary"
+    assert tick["aggressor_aux_score"] == 3.0
+    assert tick["aggressor_aux_pressure_usable"] is False
+
+
+def test_recent_trade_ticks_are_partitioned_by_subscription_route(monkeypatch):
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: _epoch_at_090010())
+    manager = KiwoomWSManager("test-token")
+    manager.subscribed_codes = {"005930"}
+
+    for item, signed_volume in (("005930", "+10"), ("005930_AL", "+20")):
+        asyncio.run(
+            manager._handle_message(
+                json.dumps(
+                    {
+                        "trnm": "REAL",
+                        "data": [
+                            {
+                                "type": "0B",
+                                "item": item,
+                                "values": {
+                                    "10": "10110",
+                                    "15": signed_volume,
+                                    "20": "090010",
+                                    "27": "10110",
+                                    "28": "10100",
+                                },
+                            }
+                        ],
+                    }
+                )
+            )
+        )
+
+    latest = manager.get_latest_data("005930")
+    partitions = latest["recent_trade_ticks_by_route"]
+    assert set(partitions) == {
+        "KRX|krx_regular",
+        "_AL|krx_nxt_integrated",
+    }
+    assert partitions["KRX|krx_regular"][0]["market_suffix"] == ""
+    assert (
+        partitions["_AL|krx_nxt_integrated"][0]["market_route"] == "krx_nxt_integrated"
+    )
+
+
+def test_signed_trade_volume_primary_records_orderbook_touch_conflict(monkeypatch):
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: _epoch_at_090010())
+    manager = KiwoomWSManager("test-token")
+    manager.subscribed_codes = {"005930"}
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "0B",
+                            "item": "005930",
+                            "values": {
+                                "10": "10100",
+                                "15": "+80",
+                                "20": "090010",
+                                "27": "10110",
+                                "28": "10100",
+                            },
+                        },
+                    ],
+                }
+            )
+        )
+    )
+
+    tick = manager.get_latest_data("005930")["recent_trade_ticks"][0]
+    assert tick["dir"] == "BUY"
+    assert tick["aggressor_source"] == "kiwoom_0b_signed_trade_volume"
+    assert tick["aggressor_quality"] == "signed_trade_volume_positive"
+    assert tick["aggressor_touch_side"] == "SELL"
+    assert tick["aggressor_touch_source"] == "orderbook_touch"
+    assert tick["aggressor_touch_quality"] == "touch_or_crossed_bid"
+    assert tick["aggressor_touch_confirms_signed"] is False
+
+
+def test_0b_auxiliary_fields_prefer_1313_and_use_trusted_tick_volume():
+    parsed = KiwoomWSManager._parse_0b_auxiliary_fields(
+        {"10": "+1000", "15": "+40", "1030": "20", "1031": "30", "1032": "60.0"},
+        trade_price=1000,
+    )
+    assert parsed["buy_qty"] == 30
+    assert parsed["sell_qty"] == 20
+    assert parsed["trade_volume"] == 40
+    assert parsed["trade_volume_source"] == "15_abs"
+    assert parsed["trade_value"] == 40000
+    assert parsed["trade_value_source"] == "calc_price_x_15_abs"
+    assert parsed["trade_value_fallback_volume_source"] == "15_abs"
+    assert parsed["split_qty_advisory_only"] is True
+    assert parsed["split_qty_vs_15_mismatch"] is True
+    assert parsed["split_qty_vs_15_delta"] == 10
+
+    with_1313 = KiwoomWSManager._parse_0b_auxiliary_fields(
+        {"10": "1000", "15": "+40", "1030": "20", "1031": "30", "1313": "123456"},
+        trade_price=1000,
+    )
+    assert with_1313["trade_value"] == 123456
+    assert with_1313["trade_value_source"] == "1313"
+    assert with_1313["trade_value_fallback_volume_source"] == "none"
+
+
+def test_0b_auxiliary_fields_fall_back_to_positive_cumulative_volume_delta():
+    parsed = KiwoomWSManager._parse_0b_auxiliary_fields(
+        {"10": "1000", "13": "107", "15": ""},
+        trade_price=1000,
+        previous_tick={"cum_volume": 100},
+    )
+    assert parsed["trade_volume"] == 7
+    assert parsed["trade_volume_source"] == "13_delta"
+    assert parsed["cum_volume_delta"] == 7
+    assert parsed["trade_value"] == 7000
+    assert parsed["trade_value_source"] == "calc_price_x_13_delta"
+
+    unavailable = KiwoomWSManager._parse_0b_auxiliary_fields(
+        {"10": "1000", "13": "107", "15": "", "1030": "20", "1031": "30"},
+        trade_price=1000,
+    )
+    assert unavailable["trade_volume"] == 0
+    assert unavailable["trade_volume_source"] == "unknown"
+    assert unavailable["trade_value"] == 0
+    assert unavailable["trade_value_source"] == "unknown"
+
+
+def test_realtime_0b_logs_trade_value_fallback_and_volume_mismatch(monkeypatch):
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: _epoch_at_090010())
+    manager = KiwoomWSManager("test-token")
+    manager.subscribed_codes = {"005930"}
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "0B",
+                            "item": "005930",
+                            "values": {
+                                "10": "1000",
+                                "15": "+40",
+                                "20": "090010",
+                                "27": "1000",
+                                "28": "990",
+                                "1030": "20",
+                                "1031": "30",
+                                "1032": "60.0",
+                            },
+                        },
+                    ],
+                }
+            )
+        )
+    )
+
+    latest = manager.get_latest_data("005930")
+    tick = latest["recent_trade_ticks"][0]
+    momentum = latest["strength_momentum_history"][0]
+    assert tick["volume"] == 40
+    assert tick["volume_source"] == "15_abs"
+    assert tick["buyer_vol"] == 40
+    assert tick["seller_vol"] == 0
+    assert tick["buy_exec_cum_1031"] == 30
+    assert tick["sell_exec_cum_1030"] == 20
+    assert tick["tick_trade_value"] == 40000
+    assert tick["tick_trade_value_source"] == "calc_price_x_15_abs"
+    assert tick["tick_trade_value_fallback_volume_source"] == "15_abs"
+    assert tick["trade_volume_1030_1031_vs_15_mismatch"] is True
+    assert tick["trade_volume_1030_1031_vs_15_delta"] == 10
+    assert latest["tick_trade_value"] == 40000
+    assert latest["tick_trade_value_source"] == "calc_price_x_15_abs"
+    assert latest["trade_volume_1030_1031_vs_15_mismatch"] is True
+    assert latest["kiwoom_0b_aux_observed_count"] == 1
+    assert latest["kiwoom_0b_1313_present_count"] == 0
+    assert latest["kiwoom_0b_1313_missing_count"] == 1
+    assert latest["kiwoom_0b_trade_value_source_counts"] == {"calc_price_x_15_abs": 1}
+    assert latest["kiwoom_0b_trade_volume_source_counts"] == {"15_abs": 1}
+    assert latest["kiwoom_0b_1030_1031_vs_15_evaluable_count"] == 1
+    assert latest["kiwoom_0b_1030_1031_vs_15_mismatch_count"] == 1
+    assert momentum["tick_value"] == 40000
+    assert momentum["tick_value_source"] == "calc_price_x_15_abs"
+
+
+def test_trade_auxiliary_score_uses_exec_imbalance_cum_volume_and_prev_price(
+    monkeypatch,
+):
+    now = _epoch_at_090010()
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: now)
+    manager = KiwoomWSManager("test-token")
+    manager.subscribed_codes = {"005930"}
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "0B",
+                            "item": "005930",
+                            "values": {
+                                "10": "10000",
+                                "15": "+10",
+                                "20": "090009",
+                                "27": "",
+                                "28": "",
+                                "13": "1000",
+                                "1031": "10",
+                                "228": "100",
+                            },
+                        },
+                        {
+                            "type": "0B",
+                            "item": "005930",
+                            "values": {
+                                "10": "10005",
+                                "15": "+40",
+                                "20": "090010",
+                                "27": "",
+                                "28": "",
+                                "13": "1040",
+                                "1030": "5",
+                                "1031": "35",
+                                "228": "120",
+                            },
+                        },
+                    ],
+                }
+            )
+        )
+    )
+
+    tick = manager.get_latest_data("005930")["recent_trade_ticks"][0]
+    assert tick["dir"] == "BUY"
+    assert tick["aggressor_source"] == "kiwoom_0b_signed_trade_volume"
+    assert tick["aggressor_quality"] == "signed_trade_volume_positive"
+    assert tick["aggressor_touch_source"] == "missing_best_quote"
+    assert tick["aggressor_aux_side"] == "BUY"
+    assert tick["aggressor_aux_quality"] == "weighted_auxiliary_observation"
+    assert tick["aggressor_aux_pressure_usable"] is False
+    assert tick["aggressor_aux_score"] > 1.5
+    assert "exec_qty_imbalance" in tick["aggressor_aux_reason"]
+    assert tick["aggressor_aux_components"]["cum_volume_delta"] == 40
+    assert tick["aggressor_aux_components"]["prev_trade_price"] == 10000
+
+
+def test_realtime_0b_uses_fresh_synced_top_of_book_cache(monkeypatch):
+    now = _epoch_at_090010()
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: now)
+    manager = KiwoomWSManager("test-token")
+    manager.subscribed_codes = {"005930"}
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "0D",
+                            "item": "005930",
+                            "values": {
+                                "41": "10110",
+                                "61": "100",
+                                "51": "10100",
+                                "71": "200",
+                            },
+                        },
+                        {
+                            "type": "0B",
+                            "item": "005930",
+                            "values": {
+                                "10": "10100",
+                                "15": "-80",
+                                "20": "090010",
+                                "27": "0",
+                                "28": "",
+                            },
+                        },
+                    ],
+                }
+            )
+        )
+    )
+
+    tick = manager.get_latest_data("005930")["recent_trade_ticks"][0]
+    assert tick["dir"] == "SELL"
+    assert tick["aggressor_source"] == "kiwoom_0b_signed_trade_volume"
+    assert tick["aggressor_quality"] == "signed_trade_volume_negative"
+    assert tick["aggressor_cache_used"] is True
+    assert tick["aggressor_quote_source"] == "cached_top_of_book_ttl"
+    assert tick["aggressor_quote_age_ms"] == 0
+    assert tick["aggressor_tick_sync"] is True
+    assert tick["aggressor_touch_side"] == "SELL"
+    assert tick["aggressor_touch_source"] == "cached_orderbook_touch"
+    assert tick["aggressor_touch_quality"] == "cached_quote_touch_or_crossed_bid"
+    assert tick["aggressor_touch_confirms_signed"] is True
+    assert tick["best_ask"] == 10110
+    assert tick["best_bid"] == 10100
+
+
+def test_realtime_0d_updates_micro_estimator_store(monkeypatch):
+    now = _epoch_at_090010()
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: now)
+    store = kiwoom_websocket.MICRO_ESTIMATOR_STORE.__class__()
+    monkeypatch.setattr(kiwoom_websocket, "MICRO_ESTIMATOR_STORE", store)
+    manager = KiwoomWSManager("test-token")
+    manager.subscribed_codes = {"005930"}
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "0D",
+                            "item": "005930",
+                            "values": {
+                                "41": "10110",
+                                "61": "100",
+                                "51": "10100",
+                                "71": "100",
+                            },
+                        },
+                        {
+                            "type": "0D",
+                            "item": "005930",
+                            "values": {
+                                "41": "10110",
+                                "61": "1",
+                                "51": "10101",
+                                "71": "1000",
+                            },
+                        },
+                    ],
+                }
+            )
+        )
+    )
+
+    snapshot = store.snapshot("005930", now_ts=now)
+    latest = manager.get_latest_data("005930")
+    assert snapshot["source_state"] == "fresh_ws_order_flow_delta"
+    assert snapshot["true_ofi_sample_count"] == 1
+    assert snapshot["sample_count"] == 2
+    assert snapshot["confidence"] >= 0.80
+    assert latest["micro_estimator_ws_observation_source"] == "0D_orderbook"
+    assert latest["micro_estimator_ws_observation_true_ofi_sample_count"] == 1
+
+
+def test_0b_cached_top_of_book_age_is_not_refreshed_by_cache_use():
+    now = _epoch_at_090010()
+    manager = KiwoomWSManager("test-token")
+    cache_ts_ms = int(now * 1000)
+    manager._update_tob_cache(
+        "005930", best_ask=10110, best_bid=10100, now_ms=cache_ts_ms
+    )
+
+    first = manager._resolve_0b_touch_quote(
+        "005930",
+        inline_best_ask=0,
+        inline_best_bid=0,
+        tick_time="090010",
+        received_ts=now + 0.1,
+    )
+    second = manager._resolve_0b_touch_quote(
+        "005930",
+        inline_best_ask=0,
+        inline_best_bid=0,
+        tick_time="090010",
+        received_ts=now + 0.35,
+    )
+
+    assert first["cache_used"] is True
+    assert first["quote_age_ms"] == 100
+    assert second["cache_used"] is False
+    assert second["quote_age_ms"] == 350
+    assert second["quote_source"] == "missing_best_quote"
+    assert second["tob_miss_count"] == 1
+    assert second["backoff_active"] is True
+    assert manager._get_tob_cache("005930")["ts_ms"] == cache_ts_ms
+
+
+def test_realtime_0b_rejects_stale_or_unsynced_top_of_book_cache(monkeypatch):
+    now = _epoch_at_090010() + 0.1
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: now)
+    manager = KiwoomWSManager("test-token")
+    manager.subscribed_codes = {"005930"}
+    manager._update_tob_cache(
+        "005930",
+        best_ask=10110,
+        best_bid=10100,
+        now_ms=int((now - 0.1) * 1000),
+    )
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "0B",
+                            "item": "005930",
+                            "values": {
+                                "10": "10110",
+                                "15": "+80",
+                                "20": "090008",
+                                "27": "",
+                                "28": "",
+                            },
+                        },
+                    ],
+                }
+            )
+        )
+    )
+
+    tick = manager.get_latest_data("005930")["recent_trade_ticks"][0]
+    assert tick["dir"] == "BUY"
+    assert tick["aggressor_source"] == "kiwoom_0b_signed_trade_volume"
+    assert tick["aggressor_quality"] == "signed_trade_volume_positive"
+    assert tick["aggressor_cache_used"] is False
+    assert tick["aggressor_tick_sync"] is False
+    assert tick["aggressor_tob_miss_count"] == 1
+    assert tick["aggressor_backoff_active"] is True
+    assert tick["aggressor_touch_side"] == "UNKNOWN"
+    assert tick["aggressor_touch_source"] == "missing_best_quote"
+
+
+def test_realtime_0b_partial_inline_quote_keeps_signed_primary_without_cache(
+    monkeypatch,
+):
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: _epoch_at_090010())
+    manager = KiwoomWSManager("test-token")
+    manager.subscribed_codes = {"005930"}
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "0B",
+                            "item": "005930",
+                            "values": {
+                                "10": "10110",
+                                "15": "+80",
+                                "20": "090010",
+                                "27": "10110",
+                                "28": "",
+                            },
+                        },
+                    ],
+                }
+            )
+        )
+    )
+
+    tick = manager.get_latest_data("005930")["recent_trade_ticks"][0]
+    assert tick["dir"] == "BUY"
+    assert tick["aggressor_source"] == "kiwoom_0b_signed_trade_volume"
+    assert tick["aggressor_quality"] == "signed_trade_volume_positive"
+    assert tick["aggressor_quote_source"] == "partial_inline_best_quote"
+    assert tick["aggressor_cache_used"] is False
+    assert tick["aggressor_tick_sync"] is True
+    assert tick["aggressor_tob_miss_count"] == 1
+    assert tick["aggressor_backoff_active"] is True
+    assert tick["aggressor_touch_side"] == "UNKNOWN"
+    assert tick["aggressor_touch_source"] == "missing_best_quote"
+    assert tick["aggressor_touch_quality"] == "missing_best_quote"
+    assert tick["best_ask"] == 10110
+    assert tick["best_bid"] == 0
+
+
+def test_realtime_0b_partial_inline_quote_uses_fresh_missing_side_cache(monkeypatch):
+    now = _epoch_at_090010()
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: now)
+    manager = KiwoomWSManager("test-token")
+    manager.subscribed_codes = {"005930"}
+    manager._update_tob_cache(
+        "005930",
+        best_ask=10120,
+        best_bid=10100,
+        now_ms=int((now - 0.1) * 1000),
+    )
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "0B",
+                            "item": "005930",
+                            "values": {
+                                "10": "10110",
+                                "15": "+80",
+                                "20": "090010",
+                                "27": "10110",
+                                "28": "",
+                            },
+                        },
+                    ],
+                }
+            )
+        )
+    )
+
+    tick = manager.get_latest_data("005930")["recent_trade_ticks"][0]
+    assert tick["dir"] == "BUY"
+    assert tick["aggressor_source"] == "kiwoom_0b_signed_trade_volume"
+    assert tick["aggressor_quality"] == "signed_trade_volume_positive"
+    assert tick["aggressor_quote_source"] == "cached_top_of_book_ttl"
+    assert tick["aggressor_cache_used"] is True
+    assert tick["aggressor_tick_sync"] is True
+    assert tick["aggressor_tob_miss_count"] == 0
+    assert tick["aggressor_backoff_active"] is False
+    assert tick["aggressor_touch_side"] == "BUY"
+    assert tick["aggressor_touch_source"] == "cached_orderbook_touch"
+    assert tick["aggressor_touch_quality"] == "cached_quote_touch_or_crossed_ask"
+    assert tick["aggressor_touch_confirms_signed"] is True
+    assert tick["best_ask"] == 10110
+    assert tick["best_bid"] == 10100
+
+
+def test_realtime_0b_incomplete_cache_does_not_create_cached_touch(monkeypatch):
+    now = _epoch_at_090010()
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: now)
+    manager = KiwoomWSManager("test-token")
+    manager.subscribed_codes = {"005930"}
+    manager._update_tob_cache(
+        "005930",
+        best_ask=10110,
+        best_bid=0,
+        now_ms=int((now - 0.1) * 1000),
+    )
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "0B",
+                            "item": "005930",
+                            "values": {
+                                "10": "10110",
+                                "15": "+80",
+                                "20": "090010",
+                                "27": "",
+                                "28": "",
+                            },
+                        },
+                    ],
+                }
+            )
+        )
+    )
+
+    tick = manager.get_latest_data("005930")["recent_trade_ticks"][0]
+    assert tick["dir"] == "BUY"
+    assert tick["aggressor_source"] == "kiwoom_0b_signed_trade_volume"
+    assert tick["aggressor_quality"] == "signed_trade_volume_positive"
+    assert tick["aggressor_quote_source"] == "missing_best_quote"
+    assert tick["aggressor_cache_used"] is False
+    assert tick["aggressor_tob_miss_count"] == 1
+    assert tick["aggressor_touch_side"] == "UNKNOWN"
+    assert tick["aggressor_touch_source"] == "missing_best_quote"
+    assert tick["aggressor_touch_quality"] == "missing_best_quote"
+    assert tick["best_ask"] == 10110
+    assert tick["best_bid"] == 0
+
+
+def test_await_login_ack_raises_on_login_failure():
+    manager = KiwoomWSManager("test-token")
+    collector = _RecordingTransportEpochCollector()
+    manager._micro_reversion_forward_collector = collector
+    fake_ws = _FakeWS(
+        [
+            json.dumps(
+                {"trnm": "LOGIN", "return_code": 100013, "return_msg": "login pending"}
+            ),
+        ]
+    )
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(manager._await_login_ack(fake_ws, timeout_sec=1.0))
+
+    assert collector.epochs == []
+
+
+def test_post_login_bootstrap_skips_condition_list_by_default(monkeypatch):
+    monkeypatch.delenv("KORSTOCKSCAN_WS_CONDITION_SEARCH_ENABLED", raising=False)
+    manager = KiwoomWSManager("test-token")
+    collector = _RecordingTransportEpochCollector()
+    manager._micro_reversion_forward_collector = collector
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+
+    asyncio.run(manager._send_post_login_bootstrap())
+
+    sent = [json.loads(payload) for payload in fake_ws.sent]
+    assert not any(payload.get("trnm") == "CNSRLST" for payload in sent)
+    assert manager._session_ready.is_set()
+    assert collector.epochs == []
+
+
+def test_post_login_bootstrap_restores_symbols_after_readiness_boundary(monkeypatch):
+    monkeypatch.delenv("KORSTOCKSCAN_WS_CONDITION_SEARCH_ENABLED", raising=False)
+    manager = KiwoomWSManager("test-token")
+    boundary_order = []
+    collector = _RecordingTransportEpochCollector(boundary_order)
+    manager._micro_reversion_forward_collector = collector
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+    manager.is_reconnected = True
+    manager.subscribed_codes.add("005930")
+    manager._registered_items_by_code["005930"] = ("005930",)
+    original_enqueue = manager._enqueue_state_event
+
+    def record_enqueue(event_type, payload):
+        boundary_order.append(event_type)
+        return original_enqueue(event_type, payload)
+
+    manager._enqueue_state_event = record_enqueue
+
+    asyncio.run(manager._send_post_login_bootstrap())
+
+    sent = [json.loads(payload) for payload in fake_ws.sent]
+    symbol_regs = [
+        payload
+        for payload in sent
+        if payload.get("trnm") == "REG"
+        and any(
+            any(str(item).startswith("005930") for item in row.get("item", []))
+            for row in payload.get("data", [])
+        )
+    ]
+    assert manager._session_ready.is_set()
+    assert len(symbol_regs) == 1
+    assert symbol_regs[0]["refresh"] == "1"
+    assert collector.epochs == [1_000]
+    assert boundary_order[:2] == ["transport_epoch", "WS_RECONNECTED"]
+
+
+def test_reconnect_epoch_failure_schedules_cleanup_without_blocking_bootstrap(
+    monkeypatch,
+):
+    monkeypatch.delenv("KORSTOCKSCAN_WS_CONDITION_SEARCH_ENABLED", raising=False)
+    manager = KiwoomWSManager("test-token")
+    manager.websocket = _FakeWS([])
+    manager.is_reconnected = True
+
+    class BrokenCollector:
+        def begin_transport_epoch(self):
+            raise RuntimeError("synthetic epoch failure")
+
+    manager._micro_reversion_forward_collector = BrokenCollector()
+    scheduled = []
+    close_calls = []
+
+    class DeferredThread:
+        def __init__(self, *, target, name, daemon):
+            assert name == "micro-reversion-epoch-failure-close"
+            assert daemon is True
+            self.target = target
+
+        def start(self):
+            scheduled.append(self.target)
+
+    monkeypatch.setattr(kiwoom_websocket.threading, "Thread", DeferredThread)
+    monkeypatch.setattr(
+        manager,
+        "_close_micro_reversion_forward_collector",
+        lambda: close_calls.append(True),
+    )
+
+    asyncio.run(manager._send_post_login_bootstrap())
+
+    assert manager._session_ready.is_set()
+    assert manager._micro_reversion_forward_collector_stop_reason == (
+        "transport_epoch_failure:RuntimeError"
+    )
+    assert len(scheduled) == 1
+    assert close_calls == []
+    scheduled[0]()
+    assert close_calls == [True]
+
+
+def test_condition_list_ignored_by_default(monkeypatch):
+    monkeypatch.delenv("KORSTOCKSCAN_WS_CONDITION_SEARCH_ENABLED", raising=False)
+    monkeypatch.delenv("KORSTOCKSCAN_SWING_REAL_WATCHING_ENABLED", raising=False)
+
+    async def no_sleep(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(kiwoom_websocket.asyncio, "sleep", no_sleep)
+    manager = KiwoomWSManager("test-token")
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "CNSRLST",
+                    "data": [
+                        {"seq": "1", "name": "scalp_candid_normal_01"},
+                        {"seq": "6", "name": "kospi_short_swing_01"},
+                    ],
+                }
+            )
+        )
+    )
+
+    assert fake_ws.sent == []
+    assert manager.condition_dict == {}
+
+
+def test_condition_list_allows_conditions_when_explicitly_enabled(monkeypatch):
+    monkeypatch.setenv("KORSTOCKSCAN_WS_CONDITION_SEARCH_ENABLED", "true")
+    monkeypatch.setenv("KORSTOCKSCAN_SWING_REAL_WATCHING_ENABLED", "true")
+
+    async def no_sleep(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(kiwoom_websocket.asyncio, "sleep", no_sleep)
+    manager = KiwoomWSManager("test-token")
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "CNSRLST",
+                    "data": [
+                        {"seq": "1", "name": "scalp_candid_normal_01"},
+                        {"seq": "6", "name": "kospi_short_swing_01"},
+                    ],
+                }
+            )
+        )
+    )
+
+    sent = [json.loads(payload) for payload in fake_ws.sent]
+    assert [payload["seq"] for payload in sent] == ["1", "6"]
+    assert manager.condition_dict == {
+        "1": "scalp_candid_normal_01",
+        "6": "kospi_short_swing_01",
+    }
+
+
+def test_condition_realtime_events_ignored_by_default(monkeypatch):
+    monkeypatch.delenv("KORSTOCKSCAN_WS_CONDITION_SEARCH_ENABLED", raising=False)
+    manager = KiwoomWSManager("test-token")
+    manager.condition_dict = {"1": "scalp_candid_normal_01"}
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "02",
+                            "name": "조건검색",
+                            "values": {"841": "1", "9001": "A005930", "843": "I"},
+                        }
+                    ],
+                }
+            )
+        )
+    )
+
+    assert manager._state_event_queue.empty()
+
+
+def test_scalp_condition_init_matches_blocked_outside_buy_window(monkeypatch):
+    monkeypatch.setenv("KORSTOCKSCAN_WS_CONDITION_SEARCH_ENABLED", "true")
+    monkeypatch.setattr(
+        kiwoom_websocket, "is_scalping_buy_time_allowed", lambda now=None: False
+    )
+    monkeypatch.setattr(
+        kiwoom_websocket,
+        "scalping_buy_time_block_reason",
+        lambda now=None: "outside_scalping_buy_window",
+    )
+    manager = KiwoomWSManager("test-token")
+    manager.condition_dict = {"1": "scalp_candid_normal_01"}
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "CNSRREQ",
+                    "seq": "1",
+                    "data": [{"jmcode": "A005930"}],
+                }
+            )
+        )
+    )
+
+    assert manager._state_event_queue.empty()
+
+
+def test_scalp_condition_realtime_insert_blocked_outside_buy_window(monkeypatch):
+    monkeypatch.setenv("KORSTOCKSCAN_WS_CONDITION_SEARCH_ENABLED", "true")
+    monkeypatch.setattr(
+        kiwoom_websocket, "is_scalping_buy_time_allowed", lambda now=None: False
+    )
+    monkeypatch.setattr(
+        kiwoom_websocket,
+        "scalping_buy_time_block_reason",
+        lambda now=None: "outside_scalping_buy_window",
+    )
+    manager = KiwoomWSManager("test-token")
+    manager.condition_dict = {"1": "scalp_candid_normal_01"}
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "02",
+                            "name": "조건검색",
+                            "values": {"841": "1", "9001": "A005930", "843": "I"},
+                        }
+                    ],
+                }
+            )
+        )
+    )
+
+    assert manager._state_event_queue.empty()
+
+
+def test_scalp_condition_deferred_insert_flushes_when_buy_window_opens(monkeypatch):
+    monkeypatch.setenv("KORSTOCKSCAN_WS_CONDITION_SEARCH_ENABLED", "true")
+    buy_window_open = {"value": False}
+    monkeypatch.setattr(
+        kiwoom_websocket,
+        "is_scalping_buy_time_allowed",
+        lambda now=None: buy_window_open["value"],
+    )
+    monkeypatch.setattr(
+        kiwoom_websocket,
+        "scalping_buy_time_block_reason",
+        lambda now=None: "outside_scalping_buy_window",
+    )
+    manager = KiwoomWSManager("test-token")
+    manager.condition_dict = {"1": "scalp_candid_normal_01"}
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "02",
+                            "name": "조건검색",
+                            "values": {"841": "1", "9001": "A005930", "843": "I"},
+                        }
+                    ],
+                }
+            )
+        )
+    )
+
+    assert manager._state_event_queue.empty()
+    assert len(manager._deferred_scalp_condition_matches) == 1
+
+    buy_window_open["value"] = True
+    asyncio.run(manager._handle_message(json.dumps({"trnm": "PING"})))
+
+    event_name, payload = manager._state_event_queue.get_nowait()
+    assert event_name == "CONDITION_MATCHED"
+    assert payload["code"] == "005930"
+    assert payload["type"] == "DEFERRED_BUY_WINDOW"
+    assert manager._deferred_scalp_condition_matches == {}
+
+
+def test_scalp_condition_defer_prewarm_registers_ws_once_without_entry_authority(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kiwoom_websocket,
+        "is_scalping_prewarm_time_allowed",
+        lambda now=None: True,
+    )
+    manager = KiwoomWSManager("test-token")
+    calls = []
+    monkeypatch.setattr(
+        manager,
+        "execute_subscribe",
+        lambda codes, **kwargs: calls.append((list(codes), kwargs)),
+    )
+    payload = {
+        "code": "005930",
+        "condition_name": "scalp_candid_normal_01",
+    }
+
+    manager._defer_scalp_condition_match(payload)
+    manager._defer_scalp_condition_match(payload)
+
+    assert calls == [
+        (
+            ["005930"],
+            {
+                "force": False,
+                "source": "scanner_condition_buy_window_prewarm",
+                "repair_cycle": "",
+                "required_realtime_types": ("0B",),
+            },
+        )
+    ]
+    assert list(manager._scalp_condition_prewarm_codes) == ["005930"]
+    assert len(manager._deferred_scalp_condition_matches) == 1
+
+
+def test_scalp_condition_unmatched_drops_deferred_insert(monkeypatch):
+    monkeypatch.setenv("KORSTOCKSCAN_WS_CONDITION_SEARCH_ENABLED", "true")
+    buy_window_open = {"value": False}
+    monkeypatch.setattr(
+        kiwoom_websocket,
+        "is_scalping_buy_time_allowed",
+        lambda now=None: buy_window_open["value"],
+    )
+    monkeypatch.setattr(
+        kiwoom_websocket,
+        "scalping_buy_time_block_reason",
+        lambda now=None: "outside_scalping_buy_window",
+    )
+    manager = KiwoomWSManager("test-token")
+    manager.condition_dict = {"1": "scalp_candid_normal_01"}
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "02",
+                            "name": "조건검색",
+                            "values": {"841": "1", "9001": "A005930", "843": "I"},
+                        }
+                    ],
+                }
+            )
+        )
+    )
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "02",
+                            "name": "조건검색",
+                            "values": {"841": "1", "9001": "A005930", "843": "D"},
+                        }
+                    ],
+                }
+            )
+        )
+    )
+    manager._state_event_queue.get_nowait()
+
+    buy_window_open["value"] = True
+    asyncio.run(manager._handle_message(json.dumps({"trnm": "PING"})))
+
+    assert manager._state_event_queue.empty()
+    assert manager._deferred_scalp_condition_matches == {}
+
+
+def test_scalp_condition_unmatched_after_window_open_drops_before_flush(monkeypatch):
+    monkeypatch.setenv("KORSTOCKSCAN_WS_CONDITION_SEARCH_ENABLED", "true")
+    buy_window_open = {"value": False}
+    monkeypatch.setattr(
+        kiwoom_websocket,
+        "is_scalping_buy_time_allowed",
+        lambda now=None: buy_window_open["value"],
+    )
+    monkeypatch.setattr(
+        kiwoom_websocket,
+        "scalping_buy_time_block_reason",
+        lambda now=None: "outside_scalping_buy_window",
+    )
+    manager = KiwoomWSManager("test-token")
+    manager.condition_dict = {"1": "scalp_candid_normal_01"}
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "02",
+                            "name": "조건검색",
+                            "values": {"841": "1", "9001": "A005930", "843": "I"},
+                        }
+                    ],
+                }
+            )
+        )
+    )
+
+    buy_window_open["value"] = True
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "02",
+                            "name": "조건검색",
+                            "values": {"841": "1", "9001": "A005930", "843": "D"},
+                        }
+                    ],
+                }
+            )
+        )
+    )
+
+    event_name, payload = manager._state_event_queue.get_nowait()
+    assert event_name == "CONDITION_UNMATCHED"
+    assert payload["code"] == "005930"
+    assert manager._state_event_queue.empty()
+    assert manager._deferred_scalp_condition_matches == {}
+
+
+def test_scalp_condition_unmatched_still_flows_outside_buy_window(monkeypatch):
+    monkeypatch.setenv("KORSTOCKSCAN_WS_CONDITION_SEARCH_ENABLED", "true")
+    monkeypatch.setattr(
+        kiwoom_websocket, "is_scalping_buy_time_allowed", lambda now=None: False
+    )
+    manager = KiwoomWSManager("test-token")
+    manager.condition_dict = {"1": "scalp_candid_normal_01"}
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "02",
+                            "name": "조건검색",
+                            "values": {"841": "1", "9001": "A005930", "843": "D"},
+                        }
+                    ],
+                }
+            )
+        )
+    )
+
+    event_name, payload = manager._state_event_queue.get_nowait()
+    assert event_name == "CONDITION_UNMATCHED"
+    assert payload["code"] == "005930"
+
+
+def test_swing_condition_insert_not_blocked_by_scalping_buy_window(monkeypatch):
+    monkeypatch.setenv("KORSTOCKSCAN_WS_CONDITION_SEARCH_ENABLED", "true")
+    monkeypatch.setattr(
+        kiwoom_websocket, "is_scalping_buy_time_allowed", lambda now=None: False
+    )
+    manager = KiwoomWSManager("test-token")
+    manager.condition_dict = {"6": "kospi_short_swing_01"}
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "02",
+                            "name": "조건검색",
+                            "values": {"841": "6", "9001": "A005930", "843": "I"},
+                        }
+                    ],
+                }
+            )
+        )
+    )
+
+    event_name, payload = manager._state_event_queue.get_nowait()
+    assert event_name == "CONDITION_MATCHED"
+    assert payload["code"] == "005930"
+    assert payload["condition_name"] == "kospi_short_swing_01"
+
+
+@pytest.mark.parametrize(
+    "code,message,expected",
+    [
+        ("8005", "Token이 유효하지 않습니다", True),
+        ("805004", "토큰 인증에 실패했습니다 [CODE=8005]", True),
+        ("100013", "login pending", False),
+    ],
+)
+def test_is_auth_token_failure(code, message, expected):
+    assert KiwoomWSManager._is_auth_token_failure(code, message) is expected
+
+
+def test_target_defaults_include_intraday_high_low():
+    manager = KiwoomWSManager("test-token")
+
+    target = manager._ensure_target_defaults("005930")
+
+    assert target["high"] == 0
+    assert target["low"] == 0
+    assert target["foreign_broker_net_est_qty"] == 0
+    assert target["foreign_broker_net_est_delta_qty"] == 0
+
+
+def test_send_reg_subscribes_foreign_broker_and_program_types():
+    manager = KiwoomWSManager("test-token")
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+    manager._session_ready.set()
+
+    asyncio.run(manager._send_reg(["005930"]))
+
+    payload = json.loads(fake_ws.sent[0])
+    reg_types = [entry["type"][0] for entry in payload["data"]]
+    assert "0F" in reg_types
+    assert "0w" in reg_types
+    target = manager.get_latest_data("005930")
+    assert target["program_subscription_requested_at"] > 0
+    assert target["program_missing_reason"] == ("program_0w_awaiting_first_observation")
+
+
+def test_program_first_observation_closes_missing_provenance(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    manager.subscribed_codes.add("005930")
+    target = manager._ensure_target_defaults("005930")
+    target["program_subscription_requested_at"] = 1000.0
+    target["program_missing_reason"] = "program_0w_awaiting_first_observation"
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: 1001.25)
+    monkeypatch.setattr(manager, "_maybe_write_dashboard_snapshot", lambda: None)
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "0w",
+                            "item": "005930",
+                            "values": {"206": "120", "210": "0"},
+                        }
+                    ],
+                }
+            )
+        )
+    )
+
+    snapshot = manager.get_latest_data("005930")
+    assert snapshot["program_first_observed_at"] == 1001.25
+    assert snapshot["program_first_observed_latency_ms"] == 1250.0
+    assert "program_missing_reason" not in snapshot
+    assert snapshot["prog_buy_qty"] == 120
+    assert snapshot["prog_net_qty"] == 0
+
+
+def test_send_reg_uses_exchange_aware_items_for_nxt(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+    manager._session_ready.set()
+
+    monkeypatch.setattr(
+        "src.utils.kiwoom_utils.get_effective_kiwoom_code",
+        lambda code: f"{code}_AL" if code == "039490" else code,
+    )
+
+    asyncio.run(manager._send_reg(["039490"]))
+
+    payload = json.loads(fake_ws.sent[0])
+    assert payload["data"][0]["item"] == ["039490_AL"]
+    assert manager.subscribed_codes == {"039490"}
+
+
+def test_send_reg_preserves_explicit_nxt_only_item(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+    manager._session_ready.set()
+
+    monkeypatch.setattr(
+        "src.utils.kiwoom_utils.get_effective_kiwoom_code",
+        lambda code: code,
+    )
+
+    asyncio.run(manager._send_reg(["039490_NX"]))
+
+    payload = json.loads(fake_ws.sent[0])
+    assert payload["data"][0]["item"] == ["039490_NX"]
+    assert manager.subscribed_codes == {"039490"}
+    assert manager._registered_items_by_code["039490"] == ("039490_NX",)
+
+
+def test_send_reg_source_only_types_are_limited_to_0b_and_0d(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+    manager._session_ready.set()
+
+    monkeypatch.setattr(
+        "src.utils.kiwoom_utils.get_effective_kiwoom_code",
+        lambda code: code,
+    )
+
+    asyncio.run(
+        manager._send_reg(
+            ["039490_NX"],
+            realtime_types=("0B", "0D"),
+            source="micro_reversion_collection_feedback",
+        )
+    )
+
+    payload = json.loads(fake_ws.sent[0])
+    assert payload["refresh"] == "1"
+    assert [row["type"] for row in payload["data"]] == [["0B"], ["0D"]]
+    assert all(row["item"] == ["039490_NX"] for row in payload["data"])
+    assert not manager.realtime_data["039490"].get("program_subscription_requested_at")
+
+
+def test_send_reg_uses_single_effective_route_by_default(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+    manager._session_ready.set()
+
+    monkeypatch.setattr(
+        "src.utils.kiwoom_utils.get_effective_kiwoom_code",
+        lambda code: code,
+    )
+
+    asyncio.run(manager._send_reg(["240810"]))
+
+    payload = json.loads(fake_ws.sent[0])
+    assert payload["data"][0]["item"] == ["240810"]
+    assert manager.subscribed_codes == {"240810"}
+
+
+def test_send_reg_adds_alternate_route_for_persistent_repair(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+    manager._session_ready.set()
+
+    monkeypatch.setattr(
+        "src.utils.kiwoom_utils.get_effective_kiwoom_code",
+        lambda code: code,
+    )
+
+    asyncio.run(manager._send_reg(["240810"], include_alternate_route=True))
+
+    payload = json.loads(fake_ws.sent[0])
+    assert payload["refresh"] == "1"
+    assert payload["data"][0]["item"] == ["240810", "240810_AL"]
+    assert manager.subscribed_codes == {"240810"}
+
+
+def test_required_0b_receipt_is_not_masked_by_first_0d():
+    manager = KiwoomWSManager("test-token")
+    manager.subscribed_codes.add("000001")
+    manager._required_realtime_types_by_code["000001"] = ("0B",)
+    manager._persistent_repair_no_tick_attempts["000001"] = 2
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "0D",
+                            "item": "000001",
+                            "values": {"121": "100", "125": "100"},
+                        }
+                    ],
+                }
+            )
+        )
+    )
+
+    row = manager.get_subscription_freshness_snapshot(["000001"])["rows"][0]
+    assert row["required_realtime_types"] == ["0B"]
+    assert row["required_realtime_received"] is False
+    assert row["required_realtime_missing_types"] == ["0B"]
+    assert row["repair_recommended"] is True
+    assert row["repair_reason"] == "subscription_required_realtime_missing"
+    assert "000001" not in manager._persistent_repair_no_tick_attempts
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "0B",
+                            "item": "000001",
+                            "values": {"10": "10000", "15": "+1", "228": "101.5"},
+                        }
+                    ],
+                }
+            )
+        )
+    )
+
+    row = manager.get_subscription_freshness_snapshot(["000001"])["rows"][0]
+    assert row["required_realtime_received"] is True
+    assert row["required_realtime_missing_types"] == []
+    assert "000001" not in manager._persistent_repair_no_tick_attempts
+
+
+def test_send_reg_respects_registered_item_budget(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    fake_ws = _FakeWS([])
+    published = []
+    manager.websocket = fake_ws
+    manager._session_ready.set()
+    manager.event_bus = SimpleNamespace(
+        publish=lambda name, payload: published.append((name, payload))
+    )
+
+    monkeypatch.setenv("KORSTOCKSCAN_WS_MAX_REG_ITEMS", "1")
+    monkeypatch.setattr(
+        "src.utils.kiwoom_utils.get_effective_kiwoom_code", lambda code: code
+    )
+
+    asyncio.run(manager._send_reg(["000001", "000002"], enforce_item_budget=True))
+
+    payload = json.loads(fake_ws.sent[0])
+    assert payload["data"][0]["item"] == ["000001"]
+    assert manager.subscribed_codes == {"000001"}
+    assert manager._registered_items_by_code == {"000001": ("000001",)}
+    assert published == [
+        (
+            "WS_REG_BUDGET_SKIPPED",
+            {
+                "codes": ["000002"],
+                "source": "",
+                "max_items": 1,
+                "registered_item_count": 0,
+            },
+        )
+    ]
+
+
+def test_execute_unsubscribe_removes_registered_item_budget_state(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+    manager._session_ready.set()
+
+    monkeypatch.setattr(
+        "src.utils.kiwoom_utils.get_effective_kiwoom_code", lambda code: code
+    )
+
+    asyncio.run(manager._send_reg(["000001"]))
+    manager.execute_unsubscribe(["000001"])
+
+    assert manager.subscribed_codes == set()
+    assert manager._registered_items_by_code == {}
+    assert "000001" not in manager.realtime_data
+
+
+def test_execute_unsubscribe_retains_widget_comparison_observation(monkeypatch):
+    monkeypatch.delenv(kiwoom_websocket.WS_PINNED_OBSERVATION_ITEMS_ENV, raising=False)
+    manager = KiwoomWSManager("test-token")
+    manager.subscribed_codes = {"005930"}
+    manager._registered_items_by_code = {"005930": ("005930_AL",)}
+    manager.realtime_data = {"005930": {"curr": 242_000}}
+
+    manager.execute_unsubscribe(["005930"])
+
+    assert manager.subscribed_codes == {"005930"}
+    assert manager._registered_items_by_code == {"005930": ("005930_AL",)}
+    assert manager.realtime_data["005930"]["curr"] == 242_000
+
+
+def test_execute_unsubscribe_retains_micro_collection_as_source_only(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    manager.subscribed_codes = {"111111"}
+    manager._registered_items_by_code = {"111111": ("111111_AL",)}
+    manager._micro_reversion_observation_items_by_code = {"111111": "111111_AL"}
+    manager.realtime_data = {"111111": {"curr": 1000}}
+
+    manager.execute_unsubscribe(["111111"])
+
+    assert manager.subscribed_codes == {"111111"}
+    assert manager.is_micro_reversion_observation_only_subscription("111111") is True
+    assert manager.realtime_data["111111"]["curr"] == 1000
+
+
+def test_widget_observation_registration_is_not_reclassified_as_micro_only(
+    monkeypatch,
+):
+    monkeypatch.delenv(kiwoom_websocket.WS_PINNED_OBSERVATION_ITEMS_ENV, raising=False)
+    manager = KiwoomWSManager("test-token")
+    manager.subscribed_codes = {"005930"}
+    manager._registered_items_by_code = {"005930": ("005930_AL",)}
+    manager._micro_reversion_observation_items_by_code = {"005930": "005930_AL"}
+
+    manager.execute_unsubscribe(["005930"])
+
+    assert manager.subscribed_codes == {"005930"}
+    assert manager.is_micro_reversion_observation_only_subscription("005930") is False
+
+
+def test_micro_collection_demotion_replaces_route_with_source_only_types(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    manager._started = True
+    manager.loop = SimpleNamespace(is_running=lambda: True)
+    manager.subscribed_codes = {"111111"}
+    manager._registered_items_by_code = {"111111": ("111111",)}
+    manager._micro_reversion_observation_items_by_code = {"111111": "111111_AL"}
+    captured = []
+
+    def fake_send_reg(codes, **kwargs):
+        captured.append((list(codes), kwargs))
+
+        async def complete():
+            return None
+
+        return complete()
+
+    def fake_schedule(coro, loop):
+        coro.close()
+        return type(
+            "FakeFuture", (), {"add_done_callback": lambda self, callback: None}
+        )()
+
+    monkeypatch.setattr(manager, "_send_reg", fake_send_reg)
+    monkeypatch.setattr(
+        kiwoom_websocket.asyncio, "run_coroutine_threadsafe", fake_schedule
+    )
+
+    assert manager.retain_micro_reversion_as_observation_only("111111") is True
+    assert manager.retain_micro_reversion_as_observation_only("111111") is True
+
+    assert captured[0][0] == ["111111_AL"]
+    assert captured[0][1]["remove_before_reg"] is True
+    assert captured[0][1]["realtime_types"] == ("0B", "0D")
+    assert captured[0][1]["replacement_codes"] == {"111111"}
+    assert captured[0][1]["trading_promotion_codes"] == set()
+    assert len(captured) == 1
+
+
+def test_micro_collection_set_rotation_removes_old_source_only_code(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    manager._micro_reversion_observation_items_by_code = {"111111": "111111_AL"}
+    manager._micro_reversion_observation_only_codes = {"111111"}
+    manager.subscribed_codes = {"111111"}
+    manager._registered_items_by_code = {"111111": ("111111_AL",)}
+    removed = []
+    subscribed = []
+    monkeypatch.setattr(
+        manager,
+        "execute_unsubscribe",
+        lambda codes: removed.extend(codes),
+    )
+    monkeypatch.setattr(
+        manager,
+        "execute_subscribe",
+        lambda codes, **kwargs: subscribed.append((list(codes), kwargs)),
+    )
+
+    assert manager._configure_micro_reversion_observation_items(
+        ["222222_NX"], source="test"
+    )
+
+    assert removed == ["111111"]
+    assert subscribed[0][0] == ["222222_NX"]
+    assert subscribed[0][1]["realtime_types"] == ("0B", "0D")
+    assert subscribed[0][1]["observation_only"] is True
+    assert manager._micro_reversion_observation_items_by_code == {"222222": "222222_NX"}
+
+
+def test_micro_collection_set_does_not_race_boot_runtime_registration(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    subscribed = []
+    monkeypatch.setattr(
+        manager,
+        "execute_subscribe",
+        lambda codes, **kwargs: subscribed.append((list(codes), kwargs)),
+    )
+
+    assert manager._configure_micro_reversion_observation_items(
+        ["111111_AL", "222222_NX"],
+        source="test",
+        protected_runtime_codes=["111111"],
+    )
+
+    assert subscribed[0][0] == ["222222_NX"]
+    assert manager._micro_reversion_observation_items_by_code == {
+        "111111": "111111_AL",
+        "222222": "222222_NX",
+    }
+    assert manager.is_micro_reversion_observation_only_subscription("111111") is False
+
+
+def test_real_subscription_stays_source_only_until_replacement_reg_is_sent():
+    manager = KiwoomWSManager("test-token")
+    manager._started = True
+    manager.subscribed_codes = {"111111"}
+    manager._micro_reversion_observation_items_by_code = {"111111": "111111_AL"}
+    manager._micro_reversion_observation_only_codes = {"111111"}
+
+    manager.execute_subscribe(["111111"], source="scanner_runtime_target_attach")
+
+    assert manager.is_micro_reversion_observation_only_subscription("111111") is True
+    assert manager.subscribed_codes == {"111111"}
+    assert manager.retain_micro_reversion_as_observation_only("111111") is True
+    assert manager.is_micro_reversion_observation_only_subscription("111111") is True
+
+
+def test_execute_subscribe_preserves_source_only_route_item(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    manager._started = True
+    manager.loop = SimpleNamespace(is_running=lambda: True)
+    captured = []
+
+    def fake_send_reg(codes, **kwargs):
+        captured.append((list(codes), kwargs))
+
+        async def complete():
+            return None
+
+        return complete()
+
+    def fake_schedule(coro, loop):
+        coro.close()
+        return type(
+            "FakeFuture", (), {"add_done_callback": lambda self, callback: None}
+        )()
+
+    monkeypatch.setattr(manager, "_send_reg", fake_send_reg)
+    monkeypatch.setattr(
+        kiwoom_websocket.asyncio, "run_coroutine_threadsafe", fake_schedule
+    )
+
+    manager.execute_subscribe(
+        ["222222_NX"],
+        source="micro_reversion_collection_feedback",
+        realtime_types=("0B", "0D"),
+        observation_only=True,
+    )
+
+    assert captured[0][0] == ["222222_NX"]
+    assert captured[0][1]["realtime_types"] == ("0B", "0D")
+
+
+def test_execute_subscribe_preserves_multiple_explicit_routes_for_same_symbol(
+    monkeypatch,
+):
+    manager = KiwoomWSManager("test-token")
+    manager._started = True
+    manager.loop = SimpleNamespace(is_running=lambda: True)
+    captured = []
+
+    def fake_send_reg(codes, **kwargs):
+        captured.append((list(codes), kwargs))
+
+        async def complete():
+            return None
+
+        return complete()
+
+    def fake_schedule(coro, loop):
+        coro.close()
+        return type(
+            "FakeFuture", (), {"add_done_callback": lambda self, callback: None}
+        )()
+
+    monkeypatch.setattr(manager, "_send_reg", fake_send_reg)
+    monkeypatch.setattr(
+        kiwoom_websocket.asyncio, "run_coroutine_threadsafe", fake_schedule
+    )
+
+    manager.execute_subscribe(
+        ["222222_NX", "222222_AL"],
+        force=True,
+        source="post_sell_exact_route_source_only_repair",
+        remove_before_reg=False,
+        realtime_types=("0B", "0D"),
+        observation_only=True,
+    )
+
+    assert captured[0][0] == ["222222_NX", "222222_AL"]
+    assert captured[0][1]["remove_before_reg"] is False
+    assert captured[0][1]["realtime_types"] == ("0B", "0D")
+
+
+def test_holding_repair_explicitly_requests_alternate_route(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    manager._started = True
+    manager.loop = SimpleNamespace(is_running=lambda: True)
+    captured = []
+
+    def fake_send_reg(codes, **kwargs):
+        captured.append((list(codes), kwargs))
+
+        async def complete():
+            return None
+
+        return complete()
+
+    def fake_schedule(coro, loop):
+        coro.close()
+        return type(
+            "FakeFuture", (), {"add_done_callback": lambda self, callback: None}
+        )()
+
+    monkeypatch.setattr(manager, "_send_reg", fake_send_reg)
+    monkeypatch.setattr(
+        manager,
+        "_filter_alternate_route_targets",
+        lambda codes: (list(codes), []),
+    )
+    monkeypatch.setattr(
+        kiwoom_websocket.asyncio, "run_coroutine_threadsafe", fake_schedule
+    )
+
+    manager.execute_subscribe(
+        ["237690"],
+        force=True,
+        source="holding_ws_freshness_repair",
+        repair_cycle="holding_ws_stale_or_missing",
+        include_alternate_route=True,
+    )
+
+    assert captured[0][0] == ["237690"]
+    assert captured[0][1]["include_alternate_route"] is True
+    assert captured[0][1]["alternate_route_codes"] == ["237690"]
+
+
+def test_reg_event_forwards_explicit_alternate_route_request(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    manager._started = True
+    subscribed = []
+    monkeypatch.setattr(
+        manager,
+        "execute_subscribe",
+        lambda codes, **kwargs: subscribed.append((list(codes), kwargs)),
+    )
+
+    manager._handle_reg_event(
+        {
+            "codes": ["237690"],
+            "source": "holding_ws_freshness_repair",
+            "force": True,
+            "repair_cycle": "holding_ws_stale_or_missing",
+            "include_alternate_route": True,
+        }
+    )
+
+    assert subscribed == [
+        (
+            ["237690"],
+            {
+                "force": True,
+                "source": "holding_ws_freshness_repair",
+                "repair_cycle": "holding_ws_stale_or_missing",
+                "include_alternate_route": True,
+            },
+        )
+    ]
+
+
+def test_send_reg_preserves_existing_plain_and_supplemental_integrated_route(
+    monkeypatch,
+):
+    manager = KiwoomWSManager("test-token")
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+    manager._session_ready.set()
+
+    asyncio.run(
+        manager._send_reg(
+            ["222222", "222222_AL"],
+            replace_existing=False,
+            enforce_item_budget=True,
+            source="post_sell_exact_route_source_only_repair",
+            realtime_types=("0B", "0D"),
+        )
+    )
+
+    sent = [json.loads(payload) for payload in fake_ws.sent]
+    assert len(sent) == 1
+    assert sent[0]["trnm"] == "REG"
+    assert sent[0]["refresh"] == "1"
+    assert sent[0]["data"] == [
+        {"item": ["222222", "222222_AL"], "type": ["0B"]},
+        {"item": ["222222", "222222_AL"], "type": ["0D"]},
+    ]
+    assert manager._registered_items_by_code["222222"] == (
+        "222222",
+        "222222_AL",
+    )
+
+
+def test_real_subscription_requests_source_only_route_replacement(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    manager._started = True
+    manager.loop = SimpleNamespace(is_running=lambda: True)
+    manager.subscribed_codes = {"111111"}
+    manager._registered_items_by_code = {"111111": ("111111_NX",)}
+    manager._micro_reversion_observation_items_by_code = {"111111": "111111_NX"}
+    manager._micro_reversion_observation_only_codes = {"111111"}
+    captured = []
+
+    def fake_send_reg(codes, **kwargs):
+        captured.append((list(codes), kwargs))
+
+        async def complete():
+            return None
+
+        return complete()
+
+    def fake_schedule(coro, loop):
+        coro.close()
+        return type(
+            "FakeFuture", (), {"add_done_callback": lambda self, callback: None}
+        )()
+
+    monkeypatch.setattr(manager, "_send_reg", fake_send_reg)
+    monkeypatch.setattr(
+        kiwoom_websocket.asyncio, "run_coroutine_threadsafe", fake_schedule
+    )
+
+    manager.execute_subscribe(["111111"], source="scanner_runtime_target_attach")
+
+    assert captured[0][0] == ["111111"]
+    assert captured[0][1]["remove_before_reg"] is True
+    assert manager.is_micro_reversion_observation_only_subscription("111111") is True
+
+
+def test_successful_replacement_reg_releases_source_only_suppression(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+    manager._session_ready.set()
+    manager.subscribed_codes = {"111111"}
+    manager._registered_items_by_code = {"111111": ("111111_NX",)}
+    manager._micro_reversion_observation_only_codes = {"111111"}
+    monkeypatch.setenv("KORSTOCKSCAN_WS_MAX_REG_ITEMS", "1")
+    monkeypatch.setattr(
+        "src.utils.kiwoom_utils.get_effective_kiwoom_code",
+        lambda code: f"{code}_AL",
+    )
+
+    asyncio.run(
+        manager._send_reg(
+            ["111111"],
+            remove_before_reg=True,
+            enforce_item_budget=True,
+            replacement_codes=("111111",),
+            trading_promotion_codes=("111111",),
+        )
+    )
+
+    sent = [json.loads(payload) for payload in fake_ws.sent]
+    assert sent[0]["trnm"] == "REMOVE"
+    assert sent[0]["data"][0]["item"] == ["111111_NX"]
+    assert sent[1]["trnm"] == "REG"
+    assert sent[1]["data"][0]["item"] == ["111111_AL"]
+    assert manager.is_micro_reversion_observation_only_subscription("111111") is False
+
+
+def test_failed_remove_keeps_source_only_suppression_and_blocks_promotion_reg(
+    monkeypatch,
+):
+    manager = KiwoomWSManager("test-token")
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+    manager._session_ready.set()
+    manager.subscribed_codes = {"111111"}
+    manager._registered_items_by_code = {"111111": ("111111_NX",)}
+    manager._micro_reversion_observation_only_codes = {"111111"}
+
+    async def failed_remove(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(manager, "_send_remove", failed_remove)
+    monkeypatch.setattr(
+        "src.utils.kiwoom_utils.get_effective_kiwoom_code",
+        lambda code: f"{code}_AL",
+    )
+
+    asyncio.run(
+        manager._send_reg(
+            ["111111"],
+            remove_before_reg=True,
+            replacement_codes=("111111",),
+            trading_promotion_codes=("111111",),
+        )
+    )
+
+    assert fake_ws.sent == []
+    assert manager.is_micro_reversion_observation_only_subscription("111111") is True
+
+
+def test_widget_observation_item_does_not_consume_trading_item_budget(monkeypatch):
+    monkeypatch.delenv(kiwoom_websocket.WS_PINNED_OBSERVATION_ITEMS_ENV, raising=False)
+    monkeypatch.setenv("KORSTOCKSCAN_WS_MAX_REG_ITEMS", "1")
+    monkeypatch.setattr(
+        "src.utils.kiwoom_utils.get_effective_kiwoom_code", lambda code: code
+    )
+    manager = KiwoomWSManager("test-token")
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+    manager._session_ready.set()
+
+    asyncio.run(manager._send_reg(["005930_AL"], enforce_item_budget=True))
+    asyncio.run(manager._send_reg(["000001"], enforce_item_budget=True))
+
+    assert manager.subscribed_codes == {"005930", "000001"}
+    assert manager._registered_items_by_code == {
+        "005930": ("005930_AL",),
+        "000001": ("000001",),
+    }
+
+
+def test_samsung_non_pinned_route_still_consumes_trading_item_budget(monkeypatch):
+    monkeypatch.delenv(kiwoom_websocket.WS_PINNED_OBSERVATION_ITEMS_ENV, raising=False)
+    monkeypatch.setenv("KORSTOCKSCAN_WS_MAX_REG_ITEMS", "1")
+    monkeypatch.setattr(
+        "src.utils.kiwoom_utils.get_effective_kiwoom_code", lambda code: code
+    )
+    manager = KiwoomWSManager("test-token")
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+    manager._session_ready.set()
+
+    asyncio.run(manager._send_reg(["000001"], enforce_item_budget=True))
+    asyncio.run(manager._send_reg(["005930"], enforce_item_budget=True))
+
+    assert manager.subscribed_codes == {"000001"}
+    assert manager._registered_items_by_code == {"000001": ("000001",)}
+
+
+def test_execute_unsubscribe_removes_samsung_non_pinned_route(monkeypatch):
+    monkeypatch.delenv(kiwoom_websocket.WS_PINNED_OBSERVATION_ITEMS_ENV, raising=False)
+    manager = KiwoomWSManager("test-token")
+    manager.subscribed_codes = {"005930"}
+    manager._registered_items_by_code = {"005930": ("005930",)}
+    manager.realtime_data = {"005930": {"curr": 242_000}}
+
+    manager.execute_unsubscribe(["005930"])
+
+    assert manager.subscribed_codes == set()
+    assert manager._registered_items_by_code == {}
+    assert "005930" not in manager.realtime_data
+
+
+def test_send_reg_preserves_refresh_for_all_batches(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+    manager._session_ready.set()
+
+    monkeypatch.setattr(
+        kiwoom_websocket, "TRADING_RULES", SimpleNamespace(WS_REG_BATCH_SIZE=2)
+    )
+    monkeypatch.setattr(
+        "src.utils.kiwoom_utils.get_effective_kiwoom_code", lambda code: code
+    )
+
+    asyncio.run(manager._send_reg(["000001", "000002", "000003", "000004", "000005"]))
+
+    payloads = [json.loads(payload) for payload in fake_ws.sent]
+    assert [payload["refresh"] for payload in payloads] == ["1", "1", "1"]
+    assert [payload["data"][0]["item"] for payload in payloads] == [
+        ["000001", "000002"],
+        ["000003", "000004"],
+        ["000005"],
+    ]
+    assert manager.subscribed_codes == {
+        "000001",
+        "000002",
+        "000003",
+        "000004",
+        "000005",
+    }
+
+
+def test_send_reg_incremental_mode_does_not_replace_existing_group(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+    manager._session_ready.set()
+
+    monkeypatch.setattr(
+        kiwoom_websocket, "TRADING_RULES", SimpleNamespace(WS_REG_BATCH_SIZE=2)
+    )
+    monkeypatch.setattr(
+        "src.utils.kiwoom_utils.get_effective_kiwoom_code", lambda code: code
+    )
+
+    asyncio.run(
+        manager._send_reg(
+            ["000003", "000004", "000005"],
+            replace_existing=False,
+        )
+    )
+
+    payloads = [json.loads(payload) for payload in fake_ws.sent]
+    assert [payload["refresh"] for payload in payloads] == ["1", "1"]
+    assert [payload["data"][0]["item"] for payload in payloads] == [
+        ["000003", "000004"],
+        ["000005"],
+    ]
+    assert manager.subscribed_codes == {"000003", "000004", "000005"}
+
+
+def test_command_ws_reg_recovery_forces_resubscribe(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    calls = []
+
+    def fake_execute(
+        codes, *, force=False, source="", repair_cycle="", required_realtime_types=None
+    ):
+        calls.append((codes, force, source, repair_cycle, required_realtime_types))
+
+    monkeypatch.setattr(manager, "execute_subscribe", fake_execute)
+
+    manager._handle_reg_event(
+        {"codes": ["240810"], "source": "scanner_watching_ws_snapshot_recovery"}
+    )
+
+    assert calls == [
+        (
+            ["240810"],
+            True,
+            "scanner_watching_ws_snapshot_recovery",
+            "",
+            ("0B",),
+        )
+    ]
+
+
+def test_command_ws_reg_persistent_repair_passes_repair_cycle(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    calls = []
+
+    def fake_execute(
+        codes, *, force=False, source="", repair_cycle="", required_realtime_types=None
+    ):
+        calls.append((codes, force, source, repair_cycle, required_realtime_types))
+
+    monkeypatch.setattr(manager, "execute_subscribe", fake_execute)
+
+    manager._handle_reg_event(
+        {
+            "codes": ["240810"],
+            "source": "scanner_persistent_ws_gap_recovery",
+            "force": True,
+            "repair_cycle": "persistent_ws_gap",
+        }
+    )
+
+    assert calls == [
+        (
+            ["240810"],
+            True,
+            "scanner_persistent_ws_gap_recovery",
+            "persistent_ws_gap",
+            ("0B",),
+        )
+    ]
+
+
+def test_command_ws_reg_string_false_force_is_not_truthy(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    calls = []
+
+    def fake_execute(
+        codes, *, force=False, source="", repair_cycle="", required_realtime_types=None
+    ):
+        calls.append((codes, force, source, repair_cycle, required_realtime_types))
+
+    monkeypatch.setattr(manager, "execute_subscribe", fake_execute)
+
+    manager._handle_reg_event(
+        {"codes": ["240810"], "source": "scanner_watch", "force": "false"}
+    )
+
+    assert calls == [(["240810"], False, "scanner_watch", "", ("0B",))]
+
+
+def test_execute_subscribe_string_false_force_does_not_resubscribe(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    manager._started = True
+    manager.loop = SimpleNamespace(is_running=lambda: True)
+    manager.subscribed_codes.add("039490")
+    scheduled = []
+
+    def fake_schedule(coro, loop):
+        coro.close()
+        scheduled.append(coro)
+        return type(
+            "FakeFuture", (), {"add_done_callback": lambda self, callback: None}
+        )()
+
+    monkeypatch.setattr(
+        kiwoom_websocket.asyncio, "run_coroutine_threadsafe", fake_schedule
+    )
+
+    manager.execute_subscribe(["039490"], force="false")
+
+    assert scheduled == []
+
+
+def test_recent_reg_filter_skips_non_force_duplicates(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_REG_RECENT_TTL_SEC", "20")
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: 1000.0)
+
+    allowed, skipped = manager._filter_recent_reg_targets(
+        ["240810", "039490"], force=False
+    )
+    assert allowed == ["240810", "039490"]
+    assert skipped == []
+
+    allowed, skipped = manager._filter_recent_reg_targets(
+        ["240810", "039490"], force=False
+    )
+    assert allowed == []
+    assert skipped == ["240810", "039490"]
+
+
+def test_recent_reg_filter_throttles_force_duplicates(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_REG_RECENT_TTL_SEC", "20")
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: 1000.0)
+
+    allowed, skipped = manager._filter_recent_reg_targets(["240810"], force=False)
+    assert allowed == ["240810"]
+    assert skipped == []
+
+    allowed, skipped = manager._filter_recent_reg_targets(["240810"], force=True)
+    assert allowed == []
+    assert skipped == ["240810"]
+
+
+def test_recent_reg_filter_allows_after_ttl(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_REG_RECENT_TTL_SEC", "20")
+    now = {"value": 1000.0}
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: now["value"])
+
+    assert manager._filter_recent_reg_targets(["240810"], force=False) == (
+        ["240810"],
+        [],
+    )
+    now["value"] = 1021.0
+    assert manager._filter_recent_reg_targets(["240810"], force=False) == (
+        ["240810"],
+        [],
+    )
+
+
+def test_alternate_route_filter_limits_codes_per_batch(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_ALTERNATE_ROUTE_MAX_CODES", "2")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_ALTERNATE_ROUTE_TTL_SEC", "180")
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: 1000.0)
+
+    allowed, skipped = manager._filter_alternate_route_targets(
+        ["000001", "000002", "000003"]
+    )
+
+    assert allowed == ["000001", "000002"]
+    assert skipped == ["000003"]
+
+
+def test_alternate_route_filter_throttles_recent_codes(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_ALTERNATE_ROUTE_MAX_CODES", "2")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_ALTERNATE_ROUTE_TTL_SEC", "180")
+    now = {"value": 1000.0}
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: now["value"])
+
+    assert manager._filter_alternate_route_targets(["000001", "000002"]) == (
+        ["000001", "000002"],
+        [],
+    )
+    assert manager._filter_alternate_route_targets(["000001", "000003"]) == (
+        ["000003"],
+        ["000001"],
+    )
+    now["value"] = 1181.0
+    assert manager._filter_alternate_route_targets(["000001"]) == (["000001"], [])
+
+
+def test_send_reg_applies_alternate_only_to_allowed_codes(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+    manager._session_ready.set()
+
+    monkeypatch.setattr(
+        "src.utils.kiwoom_utils.get_effective_kiwoom_code", lambda code: code
+    )
+
+    asyncio.run(
+        manager._send_reg(
+            ["000001", "000002", "000003"],
+            include_alternate_route=True,
+            alternate_route_codes=["000001", "000002"],
+        )
+    )
+
+    payload = json.loads(fake_ws.sent[0])
+    assert payload["data"][0]["item"] == [
+        "000001",
+        "000001_AL",
+        "000002",
+        "000002_AL",
+        "000003",
+    ]
+
+
+def test_persistent_repair_filter_limits_codes_per_batch(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_MAX_CODES", "3")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_TTL_SEC", "90")
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: 1000.0)
+
+    allowed, skipped = manager._filter_persistent_repair_targets(
+        ["000001", "000002", "000003", "000004", "000005"]
+    )
+
+    assert allowed == ["000001", "000002", "000003"]
+    assert skipped == ["000004", "000005"]
+
+
+def test_persistent_repair_filter_prioritizes_previous_overflow(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_MAX_CODES", "3")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_TTL_SEC", "0")
+    now = {"value": 1000.0}
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: now["value"])
+
+    allowed, skipped = manager._filter_persistent_repair_targets(
+        ["000001", "000002", "000003", "000004", "000005"]
+    )
+    assert allowed == ["000001", "000002", "000003"]
+    assert skipped == ["000004", "000005"]
+
+    now["value"] = 1001.0
+    allowed, skipped = manager._filter_persistent_repair_targets(
+        ["000001", "000002", "000003", "000004", "000005"]
+    )
+
+    assert allowed == ["000004", "000005", "000001"]
+    assert skipped == ["000002", "000003"]
+
+
+def test_persistent_repair_filter_enforces_global_window_budget(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_MAX_CODES", "8")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_MAX_CODES_PER_WINDOW", "3")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_WINDOW_SEC", "60")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_TTL_SEC", "0")
+    now = {"value": 1000.0}
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: now["value"])
+
+    assert manager._filter_persistent_repair_targets(
+        ["000001", "000002", "000003", "000004"]
+    ) == (["000001", "000002", "000003"], ["000004"])
+    now["value"] = 1030.0
+    assert manager._filter_persistent_repair_targets(["000004"]) == ([], ["000004"])
+    now["value"] = 1061.0
+    assert manager._filter_persistent_repair_targets(["000004"]) == (["000004"], [])
+
+
+def test_persistent_repair_rebuild_cannot_bypass_global_window_budget(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    manager.subscribed_codes.update({"000001", "000002", "000003"})
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_REBUILD_GROUP_ENABLED", "1")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_MAX_CODES_PER_WINDOW", "2")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_WINDOW_SEC", "60")
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: 1000.0)
+    manager._persistent_repair_window_epochs.append(1000.0)
+
+    rebuild, targets = manager._persistent_repair_rebuild_targets(["000001"])
+
+    assert rebuild is False
+    assert targets == ["000001"]
+    assert list(manager._persistent_repair_window_epochs) == [1000.0]
+
+
+def test_persistent_repair_defaults_refresh_stale_scanner_sources_quickly(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    monkeypatch.delenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_MAX_CODES", raising=False)
+    monkeypatch.delenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_TTL_SEC", raising=False)
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_WS_PERSISTENT_REPAIR_REBUILD_GROUP_ENABLED", raising=False
+    )
+    now = {"value": 1000.0}
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: now["value"])
+
+    assert manager._persistent_repair_max_codes() == 8
+    assert manager._persistent_repair_ttl_sec() == 30.0
+    assert manager._persistent_repair_remove_before_reg_enabled() is False
+    assert manager._persistent_repair_rebuild_group_enabled() is False
+    assert manager._filter_persistent_repair_targets(["000001"]) == (["000001"], [])
+    assert manager._filter_persistent_repair_targets(["000001"]) == ([], ["000001"])
+    now["value"] = 1030.0
+
+    assert manager._filter_persistent_repair_targets(["000001"]) == (["000001"], [])
+
+
+def test_persistent_repair_rebuild_targets_default_off(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    manager.subscribed_codes.update({"000001", "000002"})
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_WS_PERSISTENT_REPAIR_REBUILD_GROUP_ENABLED", raising=False
+    )
+
+    rebuild, targets = manager._persistent_repair_rebuild_targets(["000003"])
+
+    assert rebuild is False
+    assert targets == ["000003"]
+
+
+def test_persistent_repair_rebuild_targets_merges_subscribed_when_enabled(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    manager.subscribed_codes.update({"000001", "000002"})
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_REBUILD_GROUP_ENABLED", "1")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_TTL_SEC", "20")
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_WS_PERSISTENT_REPAIR_REBUILD_GROUP_MIN_INTERVAL_SEC", "30"
+    )
+    now = {"value": 1000.0}
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: now["value"])
+
+    rebuild, targets = manager._persistent_repair_rebuild_targets(["000003", "000001"])
+
+    assert rebuild is True
+    assert targets == ["000001", "000002", "000003"]
+    assert manager._persistent_repair_request_ts == {
+        "000001": 1000.0,
+        "000002": 1000.0,
+        "000003": 1000.0,
+    }
+
+    now["value"] = 1010.0
+    assert manager._filter_persistent_repair_targets(["000002"]) == (
+        [],
+        ["000002"],
+    )
+    rebuild, targets = manager._persistent_repair_rebuild_targets(["000004"])
+    assert rebuild is False
+    assert targets == ["000004"]
+
+    now["value"] = 1031.0
+    rebuild, targets = manager._persistent_repair_rebuild_targets(["000004"])
+    assert rebuild is True
+    assert targets == ["000001", "000002", "000004"]
+
+
+def test_alternate_route_defaults_cover_more_repair_candidates(monkeypatch):
+    monkeypatch.delenv("KORSTOCKSCAN_WS_ALTERNATE_ROUTE_MAX_CODES", raising=False)
+    monkeypatch.delenv("KORSTOCKSCAN_WS_ALTERNATE_ROUTE_TTL_SEC", raising=False)
+
+    assert KiwoomWSManager._alternate_route_max_codes() == 6
+    assert KiwoomWSManager._alternate_route_ttl_sec() == 45.0
+
+
+def test_alternate_route_hot_override_allows_rebuild_group_coverage(monkeypatch):
+    monkeypatch.setenv("KORSTOCKSCAN_WS_ALTERNATE_ROUTE_MAX_CODES", "28")
+
+    assert KiwoomWSManager._alternate_route_max_codes() == 28
+
+
+def test_ws_repair_budget_hot_reloads_operator_override_file(tmp_path, monkeypatch):
+    override_path = tmp_path / "operator_runtime_overrides.env"
+    monkeypatch.setattr(
+        kiwoom_websocket, "_WS_OPERATOR_RUNTIME_OVERRIDE_PATH", override_path
+    )
+    monkeypatch.setattr(kiwoom_websocket, "_WS_HOT_RUNTIME_OVERRIDE_REFRESH_SEC", 0.0)
+    monkeypatch.delenv("KORSTOCKSCAN_WS_ALTERNATE_ROUTE_MAX_CODES", raising=False)
+    monkeypatch.delenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_MAX_CODES", raising=False)
+    _reset_ws_hot_override_cache()
+
+    override_path.write_text(
+        "\n".join(
+            [
+                "export KORSTOCKSCAN_WS_ALTERNATE_ROUTE_MAX_CODES=11",
+                "export KORSTOCKSCAN_WS_ALTERNATE_ROUTE_TTL_SEC=30",
+                "export KORSTOCKSCAN_WS_FRESHNESS_STALE_SEC=17",
+                "export KORSTOCKSCAN_WS_MAX_REG_ITEMS=41",
+                "export KORSTOCKSCAN_WS_PERSISTENT_REPAIR_MAX_CODES=17",
+                "export KORSTOCKSCAN_WS_PERSISTENT_REPAIR_REMOVE_BEFORE_REG_ENABLED=false",
+                "export KORSTOCKSCAN_WS_PERSISTENT_REPAIR_REBUILD_GROUP_ENABLED=1",
+                "export KORSTOCKSCAN_WS_PERSISTENT_REPAIR_REBUILD_GROUP_MIN_INTERVAL_SEC=19",
+                "export KORSTOCKSCAN_WS_PERSISTENT_REPAIR_STUCK_COOLDOWN_SEC=120",
+                "export KORSTOCKSCAN_WS_PERSISTENT_REPAIR_STUCK_MIN_ATTEMPTS=4",
+                "export KORSTOCKSCAN_WS_PERSISTENT_REPAIR_TTL_SEC=20",
+                "export KORSTOCKSCAN_BUY_SCORE_THRESHOLD=1",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    os.utime(override_path, ns=(1_000_000_000, 1_000_000_000))
+
+    assert KiwoomWSManager._alternate_route_max_codes() == 11
+    assert KiwoomWSManager._alternate_route_ttl_sec() == 30.0
+    assert KiwoomWSManager._freshness_stale_sec() == 17.0
+    assert KiwoomWSManager._max_registered_item_count() == 41
+    assert KiwoomWSManager._persistent_repair_max_codes() == 17
+    assert KiwoomWSManager._persistent_repair_remove_before_reg_enabled() is False
+    assert KiwoomWSManager._persistent_repair_rebuild_group_enabled() is True
+    assert KiwoomWSManager._persistent_repair_rebuild_group_min_interval_sec() == 19.0
+    assert KiwoomWSManager._persistent_repair_stuck_cooldown_sec() == 120.0
+    assert KiwoomWSManager._persistent_repair_stuck_min_attempts() == 4
+    assert KiwoomWSManager._persistent_repair_ttl_sec() == 20.0
+    assert (
+        kiwoom_websocket._ws_hot_runtime_override_value(
+            "KORSTOCKSCAN_BUY_SCORE_THRESHOLD"
+        )
+        is None
+    )
+
+    override_path.write_text(
+        "export KORSTOCKSCAN_WS_ALTERNATE_ROUTE_MAX_CODES=9\n",
+        encoding="utf-8",
+    )
+    os.utime(override_path, ns=(2_000_000_000, 2_000_000_000))
+
+    assert KiwoomWSManager._alternate_route_max_codes() == 9
+
+
+def test_persistent_repair_filter_throttles_recent_codes(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_MAX_CODES", "3")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_TTL_SEC", "90")
+    now = {"value": 1000.0}
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: now["value"])
+
+    assert manager._filter_persistent_repair_targets(["000001", "000002"]) == (
+        ["000001", "000002"],
+        [],
+    )
+    assert manager._filter_persistent_repair_targets(["000001", "000003"]) == (
+        ["000003"],
+        ["000001"],
+    )
+    now["value"] = 1091.0
+    assert manager._filter_persistent_repair_targets(["000001"]) == (["000001"], [])
+
+
+def test_persistent_repair_stuck_cooldown_skips_no_tick_code(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_MAX_CODES", "3")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_TTL_SEC", "0")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_STUCK_MIN_ATTEMPTS", "2")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_STUCK_COOLDOWN_SEC", "120")
+    now = {"value": 1000.0}
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: now["value"])
+    manager.subscribed_codes.add("000001")
+
+    assert manager._filter_persistent_repair_targets(["000001"]) == (["000001"], [])
+    now["value"] = 1001.0
+    assert manager._filter_persistent_repair_targets(["000001"]) == (["000001"], [])
+    now["value"] = 1002.0
+    assert manager._filter_persistent_repair_targets(["000001", "000002"]) == (
+        ["000002"],
+        ["000001"],
+    )
+
+    now["value"] = 1122.0
+    assert manager._filter_persistent_repair_targets(["000001"]) == (["000001"], [])
+
+
+def test_persistent_repair_attempts_clear_after_first_realtime(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_TTL_SEC", "0")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_STUCK_MIN_ATTEMPTS", "2")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_STUCK_COOLDOWN_SEC", "120")
+    now = {"value": 1000.0}
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: now["value"])
+    manager.subscribed_codes.add("000001")
+
+    assert manager._filter_persistent_repair_targets(["000001"]) == (["000001"], [])
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "0B",
+                            "item": "000001",
+                            "values": {"10": "10000", "15": "+1", "228": "101.5"},
+                        }
+                    ],
+                }
+            )
+        )
+    )
+
+    assert manager._persistent_repair_no_tick_attempts.get("000001") is None
+    now["value"] = 1001.0
+    assert manager._filter_persistent_repair_targets(["000001"]) == (["000001"], [])
+
+
+def test_persistent_repair_quote_only_converges_to_required_0b_cooldown(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_TTL_SEC", "0")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_STUCK_MIN_ATTEMPTS", "2")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_STUCK_COOLDOWN_SEC", "120")
+    now = {"value": 1000.0}
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: now["value"])
+    manager.subscribed_codes.add("000001")
+    manager._required_realtime_types_by_code["000001"] = ("0B",)
+    manager.realtime_data["000001"] = {
+        "last_realtime_type_ts": {"0D": 999.0},
+        "received_types": {"0D"},
+    }
+
+    assert manager._filter_persistent_repair_targets(["000001"]) == (["000001"], [])
+    now["value"] = 1001.0
+    assert manager._filter_persistent_repair_targets(["000001"]) == (["000001"], [])
+    now["value"] = 1002.0
+
+    assert manager._filter_persistent_repair_targets(["000001"]) == ([], ["000001"])
+
+
+def test_persistent_repair_any_receipt_clears_counter_without_required_type_contract(
+    monkeypatch,
+):
+    manager = KiwoomWSManager("test-token")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_TTL_SEC", "0")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_STUCK_MIN_ATTEMPTS", "2")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PERSISTENT_REPAIR_STUCK_COOLDOWN_SEC", "120")
+    monkeypatch.setattr(kiwoom_websocket.time, "time", lambda: 1000.0)
+    manager.subscribed_codes.add("000001")
+    manager._persistent_repair_no_tick_attempts["000001"] = 1
+    manager.realtime_data["000001"] = {
+        "last_realtime_type_ts": {"0D": 999.0},
+        "received_types": {"0D"},
+    }
+
+    assert manager._filter_persistent_repair_targets(["000001"]) == (["000001"], [])
+    assert manager._persistent_repair_no_tick_attempts.get("000001") is None
+    assert manager._persistent_repair_stuck_until_ts.get("000001") is None
+
+
+def test_command_ws_reg_scanner_defaults_to_required_0b(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    captured = {}
+
+    monkeypatch.setattr(
+        manager,
+        "execute_subscribe",
+        lambda codes, **kwargs: captured.update(codes=list(codes), **kwargs),
+    )
+
+    manager._handle_reg_event(
+        {"codes": ["000001"], "source": "scanner_runtime_target_attach"}
+    )
+
+    assert captured["codes"] == ["000001"]
+    assert captured["required_realtime_types"] == ("0B",)
+
+
+def test_command_ws_reg_preserves_explicit_required_realtime_types(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    captured = {}
+
+    monkeypatch.setattr(
+        manager,
+        "execute_subscribe",
+        lambda codes, **kwargs: captured.update(codes=list(codes), **kwargs),
+    )
+
+    manager._handle_reg_event(
+        {
+            "codes": ["000001"],
+            "source": "scanner_runtime_target_attach",
+            "required_realtime_types": ["0B", "0D"],
+        }
+    )
+
+    assert captured["required_realtime_types"] == ["0B", "0D"]
+
+
+def test_real_payload_with_exchange_suffix_updates_canonical_snapshot():
+    manager = KiwoomWSManager("test-token")
+    manager.subscribed_codes.add("039490")
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "0B",
+                            "item": "039490_AL",
+                            "values": {"10": "10000", "15": "+1", "228": "101.5"},
+                        }
+                    ],
+                }
+            )
+        )
+    )
+
+    assert "039490" in manager.realtime_data
+    assert "039490_AL" not in manager.realtime_data
+    assert manager.realtime_data["039490"]["curr"] == 10000
+    assert manager.realtime_data["039490"]["received_types"] == {"0B"}
+    assert manager.realtime_data["039490"]["last_ws_item"] == "039490_AL"
+    assert manager.realtime_data["039490"]["last_ws_market_suffix"] == "_AL"
+    assert (
+        manager.realtime_data["039490"]["last_ws_market_route"] == "krx_nxt_integrated"
+    )
+    assert (
+        manager.realtime_data["039490"]["last_realtime_type_item"]["0B"] == "039490_AL"
+    )
+    assert manager.realtime_data["039490"]["last_realtime_type_market_route"]["0B"] == (
+        "krx_nxt_integrated"
+    )
+    assert (
+        manager.realtime_data["039490"]["last_realtime_type_effective_venue"]["0B"]
+        == ""
+    )
+    route_snapshot = manager.realtime_data["039490"][
+        "realtime_type_snapshots_by_route"
+    ]["_AL|krx_nxt_integrated"]["0B"]
+    assert route_snapshot["item"] == "039490_AL"
+    assert route_snapshot["current_price"] == 10000
+    assert route_snapshot["effective_venue"] == ""
+
+
+def test_realtime_snapshots_preserve_plain_and_integrated_routes_independently():
+    manager = KiwoomWSManager("test-token")
+    manager._micro_reversion_forward_collector = SimpleNamespace(
+        flags=SimpleNamespace(depth_capture_active=True),
+        observe_kiwoom_0b=lambda *_args, **_kwargs: None,
+        observe_kiwoom_0d=lambda *_args, **_kwargs: None,
+    )
+    manager.subscribed_codes.add("039490")
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "0B",
+                            "item": "039490_AL",
+                            "values": {"10": "10000", "15": "+1"},
+                        },
+                        {
+                            "type": "0D",
+                            "item": "039490_AL",
+                            "values": {
+                                "21": "090001000",
+                                "41": "10010",
+                                "61": "100",
+                                "51": "10000",
+                                "71": "200",
+                                "121": "100",
+                                "125": "200",
+                                "6064": "0",
+                                "6065": "0",
+                                "6086": "100",
+                                "6087": "200",
+                            },
+                        },
+                        {
+                            "type": "0B",
+                            "item": "039490",
+                            "values": {"10": "9990", "15": "-1"},
+                        },
+                        {
+                            "type": "0D",
+                            "item": "039490",
+                            "values": {
+                                "21": "090002000",
+                                "41": "10000",
+                                "61": "150",
+                                "51": "9990",
+                                "71": "250",
+                                "121": "150",
+                                "125": "250",
+                            },
+                        },
+                    ],
+                }
+            )
+        )
+    )
+
+    snapshots = manager.realtime_data["039490"]["realtime_type_snapshots_by_route"]
+    assert set(snapshots) == {
+        "_AL|krx_nxt_integrated",
+        "KRX|krx_regular",
+    }
+    assert snapshots["_AL|krx_nxt_integrated"]["0B"]["current_price"] == 10000
+    assert (
+        snapshots["_AL|krx_nxt_integrated"]["0D"]["orderbook"]["asks"][0]["price"]
+        == 10010
+    )
+    assert snapshots["_AL|krx_nxt_integrated"]["0D"]["route_depth_totals"] == {
+        "combined": {"ask": 100, "bid": 200},
+        "KRX": {"ask": 0, "bid": 0},
+        "NXT": {"ask": 100, "bid": 200},
+    }
+    assert snapshots["KRX|krx_regular"]["0B"]["current_price"] == 9990
+    assert snapshots["KRX|krx_regular"]["0D"]["orderbook"]["bids"][0]["price"] == 9990
+    depth = manager.realtime_data["039490"]["last_depth_tick"]
+    assert depth["item"] == "039490"
+    assert depth["orderbook_time_raw"] == "090002000"
+    assert depth["ask_levels"][0] == {
+        "level": 1,
+        "price": 10000,
+        "quantity": 150,
+    }
+    assert depth["route_depth_totals"]["combined"] == {"ask": 150, "bid": 250}
+
+
+def test_0d_depth_projection_is_not_built_while_feature_is_off():
+    manager = KiwoomWSManager("test-token")
+    manager.subscribed_codes.add("039490")
+
+    asyncio.run(
+        manager._handle_message(
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "0D",
+                            "item": "039490",
+                            "values": {
+                                "21": "090002000",
+                                "41": "10000",
+                                "61": "150",
+                                "51": "9990",
+                                "71": "250",
+                                "121": "150",
+                                "125": "250",
+                            },
+                        }
+                    ],
+                }
+            )
+        )
+    )
+
+    assert "last_depth_tick" not in manager.realtime_data["039490"]
+
+
+def test_ws_item_effective_venue_does_not_invent_integrated_underlying_venue():
+    assert KiwoomWSManager._ws_item_effective_venue("005930") == "KRX"
+    assert KiwoomWSManager._ws_item_effective_venue("005930_NX") == "NXT"
+    assert KiwoomWSManager._ws_item_effective_venue("005930_AL") == ""
+
+
+def test_subscription_freshness_snapshot_classifies_no_tick_stale_and_fresh(
+    monkeypatch,
+):
+    manager = KiwoomWSManager("test-token")
+    monkeypatch.setenv("KORSTOCKSCAN_WS_FRESHNESS_STALE_SEC", "30")
+    manager.subscribed_codes.update({"000001", "000002", "000003", "000004"})
+    manager._registered_items_by_code = {
+        "000001": ("000001",),
+        "000002": ("000002",),
+        "000003": ("000003", "000003_AL"),
+        "000004": ("000004",),
+    }
+    manager.realtime_data["000002"] = {
+        "last_ws_update_ts": 950.0,
+        "last_realtime_type_ts": {"0B": 950.0},
+        "received_types": {"0B"},
+    }
+    manager.realtime_data["000003"] = {
+        "last_ws_update_ts": 995.0,
+        "last_realtime_type_ts": {"0B": 995.0, "0D": 996.0},
+        "received_types": {"0B", "0D"},
+    }
+    manager.realtime_data["000004"] = {
+        "last_ws_update_ts": 996.0,
+        "last_realtime_type_ts": {"0B": 950.0, "0D": 996.0},
+        "last_trade_tick": {"ts": 950.0, "cum_volume": "1,234"},
+        "received_types": {"0B", "0D"},
+    }
+
+    snapshot = manager.get_subscription_freshness_snapshot(now_ts=1000.0)
+    rows = {row["stock_code"]: row for row in snapshot["rows"]}
+
+    assert rows["000001"]["freshness_state"] == "no_tick"
+    assert rows["000001"]["repair_recommended"] is True
+    assert rows["000001"]["repair_reason"] == "subscription_no_tick"
+    assert rows["000002"]["freshness_state"] == "stale"
+    assert rows["000002"]["last_receive_age_sec"] == 50.0
+    assert rows["000002"]["repair_reason"] == "subscription_stale"
+    assert rows["000003"]["freshness_state"] == "fresh"
+    assert rows["000003"]["last_receive_age_sec"] == 4.0
+    assert rows["000003"]["registered_item_count"] == 2
+    assert rows["000003"]["registered_item_quota_units"] == 2
+    assert rows["000003"]["registered_market_suffixes"] == ["", "_AL"]
+    assert rows["000003"]["registered_market_routes"] == [
+        "krx_regular",
+        "krx_nxt_integrated",
+    ]
+    assert rows["000003"]["registered_route_counts"] == {
+        "krx_nxt_integrated": 1,
+        "krx_regular": 1,
+    }
+    assert rows["000003"]["multi_route_registered"] is True
+    assert (
+        rows["000003"]["route_repair_policy"]
+        == "remove_then_reg_required_for_route_transition"
+    )
+    assert rows["000003"]["decision_authority"] == "ws_freshness_source_quality_only"
+    assert rows["000003"]["broker_order_forbidden"] is True
+    assert rows["000004"]["freshness_state"] == "fresh"
+    assert rows["000004"]["last_receive_age_sec"] == 4.0
+    assert rows["000004"]["last_0b_age_sec"] == 50.0
+    assert rows["000004"]["last_0d_age_sec"] == 4.0
+    assert rows["000004"]["last_trade_cum_volume"] == 1234
+    assert rows["000004"]["repair_recommended"] is False
+    assert rows["000004"]["repair_reason"] == "none"
+    assert rows["000004"]["recommended_repair"] == "none"
+    assert rows["000004"]["trade_tick_quiet"] is True
+    assert (
+        rows["000004"]["trade_tick_quiet_reason"]
+        == "fresh_non_trade_ws_without_fresh_0b"
+    )
+
+    filtered = manager.get_subscription_freshness_snapshot(["999999"], now_ts=1000.0)
+    assert filtered["rows"][0]["freshness_state"] == "unsubscribed"
+    assert filtered["rows"][0]["repair_recommended"] is False
+
+
+def test_send_reg_remove_before_reg_removes_existing_route_then_registers_new_route(
+    monkeypatch,
+):
+    manager = KiwoomWSManager("test-token")
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+    manager._session_ready.set()
+    manager.subscribed_codes.add("039490")
+    manager._registered_items_by_code["039490"] = ("039490_AL",)
+
+    monkeypatch.setattr(
+        "src.utils.kiwoom_utils.get_effective_kiwoom_code", lambda code: code
+    )
+
+    asyncio.run(
+        manager._send_reg(
+            ["039490"],
+            remove_before_reg=True,
+            source="scanner_persistent_ws_gap_recovery",
+            repair_cycle="persistent_ws_gap",
+        )
+    )
+
+    remove_payload = json.loads(fake_ws.sent[0])
+    reg_payload = json.loads(fake_ws.sent[1])
+    assert remove_payload["trnm"] == "REMOVE"
+    assert remove_payload["data"][0]["item"] == ["039490_AL"]
+    assert reg_payload["trnm"] == "REG"
+    assert reg_payload["data"][0]["item"] == ["039490"]
+    assert manager.subscribed_codes == {"039490"}
+    assert manager._registered_items_by_code["039490"] == ("039490",)
+
+
+def test_send_remove_updates_local_state_when_requested(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+    manager._session_ready.set()
+    manager.subscribed_codes.add("000001")
+    manager._registered_items_by_code["000001"] = ("000001", "000001_AL")
+    manager.realtime_data["000001"] = {"last_ws_update_ts": 1000.0}
+    manager._recent_reg_request_ts["000001"] = 999.0
+    manager._persistent_repair_request_ts["000001"] = 999.0
+
+    asyncio.run(
+        manager._send_remove(["000001"], update_local_state=True, source="test")
+    )
+
+    remove_payload = json.loads(fake_ws.sent[0])
+    assert remove_payload["trnm"] == "REMOVE"
+    assert remove_payload["data"][0]["item"] == ["000001", "000001_AL"]
+    assert "000001" not in manager.subscribed_codes
+    assert "000001" not in manager._registered_items_by_code
+    assert "000001" not in manager.realtime_data
+    assert "000001" not in manager._recent_reg_request_ts
+    assert "000001" not in manager._persistent_repair_request_ts
+
+
+def test_remove_before_reg_string_false_does_not_send_remove(monkeypatch):
+    manager = KiwoomWSManager("test-token")
+    fake_ws = _FakeWS([])
+    manager.websocket = fake_ws
+    manager._session_ready.set()
+    manager.subscribed_codes.add("039490")
+    manager._registered_items_by_code["039490"] = ("039490_AL",)
+
+    monkeypatch.setattr(
+        "src.utils.kiwoom_utils.get_effective_kiwoom_code", lambda code: code
+    )
+
+    asyncio.run(manager._send_reg(["039490"], remove_before_reg="false"))
+
+    payloads = [json.loads(payload) for payload in fake_ws.sent]
+    assert [payload["trnm"] for payload in payloads] == ["REG"]

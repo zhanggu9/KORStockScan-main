@@ -1,0 +1,7585 @@
+import gzip
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+
+import pytest
+
+from src.engine import verify_threshold_cycle_postclose_chain as mod
+
+
+def test_threshold_ev_reconciliation_mismatch_is_a_verifier_issue():
+    assert mod._threshold_ev_reconciliation_issues(
+        {
+            "daily_ev_summary": {
+                "trade_review_snapshot_reconciliation": {"count_match": False}
+            }
+        }
+    ) == ["threshold_cycle_ev_trade_review_calibration_count_mismatch"]
+    assert (
+        mod._threshold_ev_reconciliation_issues(
+            {
+                "daily_ev_summary": {
+                    "trade_review_snapshot_reconciliation": {"count_match": True}
+                }
+            }
+        )
+        == []
+    )
+
+
+def test_threshold_ev_reconciliation_accepts_declared_diagnostic_source_split():
+    assert mod._threshold_ev_reconciliation_issues(
+        {
+            "daily_ev_summary": {
+                "completed_trades": 5,
+                "headline_authority": "completed_by_source_same_day_real",
+                "source_split": {"real": {"sample": 5}},
+                "trade_review_snapshot_reconciliation": {
+                    "completed_trades": 3,
+                    "count_match": False,
+                    "decision_authority": (
+                        "diagnostic_only_when_same_day_source_split_present"
+                    ),
+                },
+            }
+        }
+    ) == []
+
+
+def test_workorder_source_fingerprint_detects_changed_bytes(tmp_path):
+    source = tmp_path / "source.json"
+    source.write_text('{"value":1}', encoding="utf-8")
+    import hashlib
+
+    original = source.read_bytes()
+    workorder = {
+        "schema_version": 1,
+        "source_fingerprint": [
+            {
+                "label": "source",
+                "path": str(source),
+                "exists": True,
+                "size_bytes": len(original),
+                "sha256": hashlib.sha256(original).hexdigest(),
+            }
+        ],
+    }
+    assert mod._workorder_source_fingerprint_issues(workorder) == []
+
+    source.write_text('{"value":2}', encoding="utf-8")
+
+    assert mod._workorder_source_fingerprint_issues(workorder) == [
+        "code_improvement_workorder_source_fingerprint_sha256_mismatch:source"
+    ]
+
+
+def test_low_price_postclose_contract_rejects_missing_handoff_artifacts():
+    status = mod._low_price_two_leg_postclose_contract_status(
+        {}, {}, {}, target_date="2026-08-12"
+    )
+
+    assert status["status"] == "fail"
+    assert "tuning_schema_invalid" in status["issues"]
+    assert "expanded_candidate_report_contract_invalid" in status["issues"]
+    assert status["runtime_effect"] is False
+
+
+def test_low_price_postclose_contract_uses_target_date_profile_inventory(
+    monkeypatch,
+):
+    from datetime import date
+
+    from src.engine.monitoring.low_price_two_leg_expanded_candidate_research import (
+        build_source_quality_blocked_report,
+    )
+    from src.engine.monitoring.low_price_two_leg_tuning import REPORT_SCHEMA
+    from src.trading.low_price_two_leg import policy_runtime
+    from src.trading.low_price_two_leg.profiles import (
+        PROFILES,
+        profiles_for_target_date,
+    )
+
+    target_date = "2026-08-21"
+    parsed_target_date = date.fromisoformat(target_date)
+    target_profiles = profiles_for_target_date(parsed_target_date)
+    assert len(target_profiles) < len(PROFILES)
+    monkeypatch.setattr(policy_runtime, "validate_candidate", lambda _: (True, "ok"))
+    tuning = {
+        "schema": REPORT_SCHEMA,
+        "target_date": target_date,
+        "daily": {"profiles": {profile_id: {} for profile_id in target_profiles}},
+        "runtime_effect": False,
+        "allowed_runtime_apply": False,
+        "actual_order_submitted": False,
+    }
+    candidate = {"source_date": target_date}
+    expanded = build_source_quality_blocked_report(
+        start_date=date(2026, 6, 5),
+        end_date=parsed_target_date,
+        reason="test_source_quality_blocked",
+    )
+
+    status = mod._low_price_two_leg_postclose_contract_status(
+        tuning, candidate, expanded, target_date=target_date
+    )
+
+    assert status["status"] == "pass"
+    assert status["live_profile_count"] == len(target_profiles)
+    assert status["live_catalog_profile_count"] == len(PROFILES)
+    assert status["research_profile_count"] == len(
+        expanded["research_profile_inventory"]
+    )
+
+
+def test_low_price_postclose_contract_rejects_malformed_daily_profiles(
+    monkeypatch,
+):
+    from src.engine.monitoring.low_price_two_leg_expanded_candidate_research import (
+        CandidateRecommendationNotifier,
+    )
+    from src.engine.monitoring.low_price_two_leg_tuning import REPORT_SCHEMA
+    from src.trading.low_price_two_leg import policy_runtime
+
+    monkeypatch.setattr(policy_runtime, "validate_candidate", lambda _: (True, "ok"))
+    monkeypatch.setattr(
+        CandidateRecommendationNotifier,
+        "_valid_report",
+        staticmethod(lambda _: False),
+    )
+
+    status = mod._low_price_two_leg_postclose_contract_status(
+        {
+            "schema": REPORT_SCHEMA,
+            "target_date": "2026-08-20",
+            "daily": {"profiles": [{"unexpected": "list_row"}]},
+            "runtime_effect": False,
+            "allowed_runtime_apply": False,
+            "actual_order_submitted": False,
+        },
+        {"source_date": "2026-08-20"},
+        {},
+        target_date="2026-08-20",
+    )
+
+    assert status["status"] == "fail"
+    assert "tuning_daily_profiles_invalid" in status["issues"]
+    assert "tuning_profile_inventory_mismatch" in status["issues"]
+
+
+def test_low_price_recommendations_without_approved_mapping_are_source_only(
+    monkeypatch,
+):
+    from datetime import date
+    from types import SimpleNamespace
+
+    from src.engine.monitoring import low_price_two_leg_expanded_candidate_research
+    from src.engine.monitoring.low_price_two_leg_expanded_candidate_research import (
+        CandidateRecommendationNotifier,
+    )
+    from src.engine.monitoring.low_price_two_leg_tuning import REPORT_SCHEMA
+    from src.trading.low_price_two_leg import policy_runtime
+    from src.trading.low_price_two_leg.profiles import profiles_for_target_date
+
+    target_date = "2026-08-25"
+    target_profiles = profiles_for_target_date(date.fromisoformat(target_date))
+    monkeypatch.setattr(policy_runtime, "validate_candidate", lambda _: (True, "ok"))
+    monkeypatch.setattr(
+        CandidateRecommendationNotifier,
+        "_valid_report",
+        staticmethod(lambda _: True),
+    )
+    monkeypatch.setattr(
+        low_price_two_leg_expanded_candidate_research,
+        "_target_date_research_inventory",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            research_profiles={},
+            time_extension_profiles={},
+            logic_improvement_profiles={},
+        ),
+    )
+    tuning = {
+        "schema": REPORT_SCHEMA,
+        "target_date": target_date,
+        "daily": {"profiles": {profile_id: {} for profile_id in target_profiles}},
+        "runtime_effect": False,
+        "allowed_runtime_apply": False,
+        "actual_order_submitted": False,
+    }
+    expanded = {
+        "target_date": target_date,
+        "status": "recommendations_ready",
+        "candidate_symbols": {},
+        "candidate_universe_size": 0,
+        "new_symbol_profile_count": 0,
+        "existing_symbol_time_extension_profile_count": 0,
+        "existing_symbol_logic_improvement_profile_count": 0,
+        "research_profile_inventory": {},
+        "profiles": {},
+        "recommendations": [{"profile_id": "future_source_only_candidate"}],
+    }
+
+    status = mod._low_price_two_leg_postclose_contract_status(
+        tuning,
+        {"source_date": target_date},
+        expanded,
+        target_date=target_date,
+    )
+
+    assert status["status"] == "pass"
+    assert (
+        status["recommendation_implementation_status"]
+        == "not_applicable_no_approved_runtime_mapping"
+    )
+    assert status["recommendation_profile_mapping_count"] == 0
+    assert status["recommendation_profile_contract_pass_count"] == 0
+
+
+def test_low_price_20260824_recommendations_verify_20260825_mapping(monkeypatch):
+    from datetime import date
+    from types import SimpleNamespace
+
+    from src.engine.monitoring import low_price_two_leg_expanded_candidate_research
+    from src.engine.monitoring.low_price_two_leg_expanded_candidate_research import (
+        CandidateRecommendationNotifier,
+    )
+    from src.engine.monitoring.low_price_two_leg_tuning import REPORT_SCHEMA
+    from src.trading.low_price_two_leg import policy_runtime, preflight
+    from src.trading.low_price_two_leg.profiles import profiles_for_target_date
+
+    target_date = "2026-08-24"
+    target_profiles = profiles_for_target_date(date.fromisoformat(target_date))
+    monkeypatch.setattr(policy_runtime, "validate_candidate", lambda _: (True, "ok"))
+    monkeypatch.setattr(
+        CandidateRecommendationNotifier,
+        "_valid_report",
+        staticmethod(lambda _: True),
+    )
+    monkeypatch.setattr(
+        preflight,
+        "validate_research_evidence",
+        lambda *_args, **_kwargs: (True, "ready"),
+    )
+    monkeypatch.setattr(
+        low_price_two_leg_expanded_candidate_research,
+        "_target_date_research_inventory",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            research_profiles={},
+            time_extension_profiles={},
+            logic_improvement_profiles={},
+        ),
+    )
+    tuning = {
+        "schema": REPORT_SCHEMA,
+        "target_date": target_date,
+        "daily": {"profiles": {profile_id: {} for profile_id in target_profiles}},
+        "runtime_effect": False,
+        "allowed_runtime_apply": False,
+        "actual_order_submitted": False,
+    }
+    expanded = {
+        "target_date": target_date,
+        "status": "recommendations_ready",
+        "candidate_symbols": {},
+        "candidate_universe_size": 0,
+        "new_symbol_profile_count": 0,
+        "existing_symbol_time_extension_profile_count": 0,
+        "existing_symbol_logic_improvement_profile_count": 0,
+        "research_profile_inventory": {},
+        "profiles": {},
+        "recommendations": [
+            {"profile_id": report_profile_id}
+            for report_profile_id in preflight.RECOMMENDATION_20260824_PROFILE_MAP.values()
+        ],
+    }
+
+    status = mod._low_price_two_leg_postclose_contract_status(
+        tuning,
+        {"source_date": target_date},
+        expanded,
+        target_date=target_date,
+    )
+
+    assert status["status"] == "pass"
+    assert status["recommendation_implementation_status"] == "pass"
+    assert status["recommendation_effective_date"] == "2026-08-25"
+    assert status["recommendation_profile_mapping_count"] == 12
+    assert status["recommendation_profile_contract_pass_count"] == 12
+    assert status["recommendation_profile_contract_failures"] == {}
+
+
+def test_samsung_machine_entry_postclose_contract_validates_windows_and_candidate():
+    from src.engine.monitoring.samsung_machine_entry_tuning import (
+        MACHINE_FILES,
+        REPORT_SCHEMA,
+    )
+    from src.trading.order.samsung_entry_policy import (
+        BASELINE_POLICIES,
+        CANDIDATE_SCHEMA,
+        policy_hash,
+    )
+
+    target_date = "2026-08-14"
+    machines = {
+        machine: {
+            "selection_status": "carry_forward_current_policy_insufficient_evidence",
+            "selected_axis": None,
+            "policy": dict(policy),
+            "evidence": {},
+            "allowed_runtime_apply": True,
+        }
+        for machine, policy in BASELINE_POLICIES.items()
+    }
+    candidate = {
+        "schema": CANDIDATE_SCHEMA,
+        "source_date": target_date,
+        "source_report": "samsung_machine_entry_tuning",
+        "source_report_schema": REPORT_SCHEMA,
+        "clean_tuning_baseline_date": "2026-06-05",
+        "policy_hash": policy_hash(
+            {machine: item["policy"] for machine, item in machines.items()}
+        ),
+        "policy_mutations": [],
+        "machines": machines,
+        "decision_authority": "postclose_bounded_candidate_only",
+        "runtime_effect": False,
+        "allowed_runtime_apply": False,
+        "actual_order_submitted": False,
+    }
+    report = {
+        "schema": REPORT_SCHEMA,
+        "target_date": target_date,
+        "runtime_effect": False,
+        "allowed_runtime_apply": False,
+        "actual_order_submitted": False,
+        "daily": {"machines": {machine: {} for machine in MACHINE_FILES}},
+        "windows": {
+            name: {machine: {} for machine in MACHINE_FILES}
+            for name in ("clean_baseline_cumulative", "rolling_10d", "rolling_20d")
+        },
+    }
+
+    status = mod._samsung_machine_entry_postclose_contract_status(
+        report, candidate, target_date=target_date
+    )
+    assert status["status"] == "pass"
+    del report["windows"]["rolling_10d"]
+    invalid = mod._samsung_machine_entry_postclose_contract_status(
+        report, candidate, target_date=target_date
+    )
+    assert "tuning_window_contract_invalid" in invalid["issues"]
+
+
+def test_machine_entry_timing_postclose_contract_binds_report_and_applied_policy(
+    tmp_path: Path,
+):
+    from src.engine.automation.machine_entry_timing_tuning import (
+        REPORT_SCHEMA,
+        build_applied_policy,
+    )
+
+    target_date = "2026-08-27"
+    effective_date = "2026-08-28"
+    report_path = tmp_path / f"machine_entry_timing_tuning_{target_date}.json"
+    policy_dir = tmp_path / "policy"
+    report = {
+        "schema": REPORT_SCHEMA,
+        "target_date": target_date,
+        "effective_date": effective_date,
+        "decision": "baseline_immediate_entry_carry_forward",
+        "clean_tuning_baseline_date": "2026-06-05",
+        "target_source_ready": True,
+        "winner": None,
+        "same_stage_owner_guard": {"mutation_present": False},
+        "runtime_effect": False,
+        "actual_order_submitted": False,
+        "broker_order_forbidden": True,
+    }
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    applied = build_applied_policy(report, source_report_path=report_path)
+    policy_dir.mkdir()
+    policy_path = policy_dir / f"machine_entry_timing_policy_{effective_date}.json"
+    policy_path.write_text(json.dumps(applied), encoding="utf-8")
+
+    status = mod._machine_entry_timing_postclose_contract_status(
+        report,
+        applied,
+        target_date=target_date,
+        report_path=report_path,
+        policy_dir=policy_dir,
+    )
+
+    assert status["status"] == "pass"
+    assert status["baseline_immediate"] is True
+    report_path.write_text(json.dumps({**report, "decision": "tampered"}))
+    invalid = mod._machine_entry_timing_postclose_contract_status(
+        report,
+        applied,
+        target_date=target_date,
+        report_path=report_path,
+        policy_dir=policy_dir,
+    )
+    assert invalid["status"] == "fail"
+    assert any(
+        issue.startswith("applied_policy_invalid:") for issue in invalid["issues"]
+    )
+
+
+def _smoothing_journal(sample_floor: int, *, arm_id: str) -> dict:
+    return {
+        "schema": "smoothing_source_only_path_journal_v3",
+        "sample_floor": sample_floor,
+        "primary_decision_metric": "source_quality_adjusted_ev_pct",
+        "runtime_effect": False,
+        "allowed_runtime_apply": False,
+        "actual_order_submitted": False,
+        "broker_order_forbidden": True,
+        "eligible_for_live_review": False,
+        "arm_count": 1,
+        "source_event_counts": {"armed": 1, "horizon": 5, "closed": 1},
+        "exclusion_reason_counts": {},
+        "guarded_terminal_reason_counts": {},
+        "observation_phase_summary": {
+            phase: {
+                "arm_count": 1 if phase == "holding" else 0,
+                "horizon_count": 5 if phase == "holding" else 0,
+                "ev_eligible_horizon_count": 5 if phase == "holding" else 0,
+                "excluded_horizon_count": 0,
+                "status_counts": {"observed": 5} if phase == "holding" else {},
+                "registration_status_counts": {},
+            }
+            for phase in (
+                "holding",
+                "post_sell_watching",
+                "post_sell_non_revive",
+            )
+        },
+        "horizons": {
+            str(horizon): {
+                "source_quality_adjusted_ev_pct": 0.1,
+                "exact_observed_count": 1,
+                "guarded_terminal_count": 0,
+                "ev_eligible_count": 1,
+            }
+            for horizon in (10, 20, 40, 60, 90)
+        },
+        "rows": [
+            {
+                "journal_arm_id": arm_id,
+                "position_key": "record:1",
+                "trace_id": "trace:1",
+                "snapshot_id": "snapshot:1",
+                "reference_buy_price": 10_100,
+                "observation_phase": "holding",
+                "post_sell_registration_status": "-",
+                "horizon_sec": horizon,
+                "status": "observed",
+                "opportunity_ev_delta_pct": 0.1,
+            }
+            for horizon in (10, 20, 40, 60, 90)
+        ],
+    }
+
+
+def _smoothing_rolling_decision() -> dict:
+    return {
+        "schema": "smoothing_source_only_rolling_decision_v1",
+        "metric_role": "sim_probe_ev",
+        "decision_authority": "source_only_rolling_review_no_runtime_change",
+        "window_policy": "rolling_5d_10d_20d_primary_90s_with_guarded_downside",
+        "sample_floor": {
+            "soft_stop_whipsaw_confirmation": 10,
+            "holding_flow_ofi_smoothing": 20,
+        },
+        "primary_decision_metric": "source_quality_adjusted_ev_pct",
+        "source_quality_gate": "journal_v3_exact_lineage_and_guarded_downside",
+        "forbidden_uses": (
+            "standalone_live_promotion|hard_or_emergency_bypass|threshold_apply|"
+            "provider_route_change|quantity_or_cap_change|bot_restart"
+        ),
+        "runtime_effect": False,
+        "allowed_runtime_apply": False,
+        "actual_order_submitted": False,
+        "broker_order_forbidden": True,
+        "eligible_for_live_review": False,
+        "families": {
+            family: {
+                "decision": "source_only_bounded_review_ready",
+                "sample_floor": floor,
+                "all_samples_ready": True,
+                "all_primary_ev_present": True,
+                "all_risk_evidence_ready": True,
+                "positive_primary_ev_window_count": 3,
+                "contract_gaps": [],
+                "window_evidence": {
+                    window: {
+                        "status": "ready",
+                        "sample_floor_met": True,
+                        "exact_complete_path_count": floor,
+                        "primary_90s_ev_pct": 0.1,
+                        "primary_90s_downside_p10_ev_pct": -0.2,
+                        "primary_90s_guarded_terminal_count": 1,
+                        "primary_90s_guarded_terminal_rate": 0.1,
+                        "primary_90s_guarded_terminal_ev_pct": -0.1,
+                        "risk_evidence_ready": True,
+                        "exclusion_reason_counts": {},
+                        "observation_phase_summary": {},
+                    }
+                    for window in ("rolling_5d", "rolling_10d", "rolling_20d")
+                },
+            }
+            for family, floor in (
+                ("soft_stop_whipsaw_confirmation", 10),
+                ("holding_flow_ofi_smoothing", 20),
+            )
+        },
+    }
+
+
+def test_smoothing_source_only_path_journal_contract_verifies_daily_rolling_lineage():
+    daily_families = {
+        "soft_stop_whipsaw_confirmation": {
+            "source_only_path_journal": _smoothing_journal(10, arm_id="soft:1")
+        },
+        "holding_flow_ofi_smoothing": {
+            "source_only_path_journal": _smoothing_journal(20, arm_id="ofi:1")
+        },
+    }
+    daily = {"threshold_snapshot": daily_families}
+    cumulative = {
+        "windows": {"cumulative": ["2026-08-10"], "rolling_5d": ["2026-08-10"]},
+        "threshold_snapshot_by_window": {
+            "cumulative": daily_families,
+            "rolling_5d": daily_families,
+        },
+    }
+
+    status = mod._smoothing_source_only_path_journal_contract_status(daily, cumulative)
+
+    assert status["status"] == "pass"
+    assert status["runtime_effect"] is False
+    assert status["issues"] == []
+
+
+def test_smoothing_source_only_path_journal_rejects_partition_report_count_drift():
+    daily_families = {
+        "soft_stop_whipsaw_confirmation": {
+            "source_only_path_journal": _smoothing_journal(10, arm_id="soft:1")
+        },
+        "holding_flow_ofi_smoothing": {
+            "source_only_path_journal": _smoothing_journal(20, arm_id="ofi:1")
+        },
+    }
+    stage_counts = {
+        family: {
+            "smoothing_source_only_path_armed": 1,
+            "smoothing_source_only_path_horizon": 5,
+            "smoothing_source_only_path_closed": 1,
+        }
+        for family in daily_families
+    }
+    stage_counts["soft_stop_whipsaw_confirmation"][
+        "smoothing_source_only_path_armed"
+    ] = 2
+    daily = {
+        "date": "2026-08-13",
+        "meta": {
+            "pipeline_load": {
+                "2026-08-13": {
+                    "smoothing_source_only_ingestion": {
+                        "schema": "smoothing_source_only_partition_ingestion_audit_v1",
+                        "status": "pass",
+                        "runtime_effect": False,
+                        "checkpoint_completed": True,
+                        "checkpoint_source_exists": True,
+                        "coverage_complete": True,
+                        "unroutable_stage_count": 0,
+                        "partition_stage_counts_by_family": stage_counts,
+                    }
+                }
+            }
+        },
+        "threshold_snapshot": daily_families,
+    }
+    cumulative = {
+        "windows": {"cumulative": ["2026-08-13"]},
+        "threshold_snapshot_by_window": {"cumulative": daily_families},
+    }
+
+    status = mod._smoothing_source_only_path_journal_contract_status(daily, cumulative)
+
+    assert status["status"] == "fail"
+    assert (
+        "soft_stop_whipsaw_confirmation_partition_report_event_count_mismatch"
+        in status["issues"]
+    )
+
+
+def test_smoothing_source_only_path_journal_rejects_field_projection_failure():
+    daily_families = {
+        "soft_stop_whipsaw_confirmation": {
+            "source_only_path_journal": _smoothing_journal(10, arm_id="soft:1")
+        },
+        "holding_flow_ofi_smoothing": {
+            "source_only_path_journal": _smoothing_journal(20, arm_id="ofi:1")
+        },
+    }
+    stage_counts = {
+        family: {
+            "smoothing_source_only_path_armed": 1,
+            "smoothing_source_only_path_horizon": 5,
+            "smoothing_source_only_path_closed": 1,
+        }
+        for family in daily_families
+    }
+    daily = {
+        "date": "2026-08-21",
+        "meta": {
+            "pipeline_load": {
+                "2026-08-21": {
+                    "smoothing_source_only_ingestion": {
+                        "schema": (
+                            "smoothing_source_only_partition_ingestion_audit_v1"
+                        ),
+                        "status": "pass",
+                        "runtime_effect": False,
+                        "checkpoint_completed": True,
+                        "checkpoint_source_exists": True,
+                        "coverage_complete": True,
+                        "unroutable_stage_count": 0,
+                        "partition_stage_counts_by_family": stage_counts,
+                        "field_projection": {
+                            "schema": "smoothing_field_projection_audit_v1",
+                            "status": "pass",
+                            "required_from_date": "2026-08-21",
+                            "checked_stage_counts": {
+                                "smoothing_source_only_path_horizon": 10
+                            },
+                            "missing_field_counts": {},
+                            "invalid_value_counts": {},
+                            "issues": [],
+                        },
+                    }
+                }
+            }
+        },
+        "threshold_snapshot": daily_families,
+    }
+    cumulative = {
+        "windows": {"cumulative": ["2026-08-21"]},
+        "threshold_snapshot_by_window": {"cumulative": daily_families},
+    }
+
+    valid_status = mod._smoothing_source_only_path_journal_contract_status(
+        daily, cumulative
+    )
+
+    assert valid_status["status"] == "pass"
+
+    field_projection = daily["meta"]["pipeline_load"]["2026-08-21"][
+        "smoothing_source_only_ingestion"
+    ]["field_projection"]
+    field_projection["status"] = "fail"
+    field_projection["missing_field_counts"] = {"path_max_valid_observation_gap_sec": 1}
+    field_projection["issues"] = ["smoothing_compact_required_field_missing"]
+    status = mod._smoothing_source_only_path_journal_contract_status(daily, cumulative)
+
+    assert status["status"] == "fail"
+    assert "smoothing_source_only_field_projection_audit_failed" in status["issues"]
+    assert (
+        "smoothing_source_only_field_projection_missing_field_counts_invalid"
+        in status["issues"]
+    )
+    assert "smoothing_source_only_field_projection_issues_invalid" in status["issues"]
+
+
+def test_smoothing_source_only_path_journal_requires_daily_pipeline_load_meta():
+    daily_families = {
+        "soft_stop_whipsaw_confirmation": {
+            "source_only_path_journal": _smoothing_journal(10, arm_id="soft:1")
+        },
+        "holding_flow_ofi_smoothing": {
+            "source_only_path_journal": _smoothing_journal(20, arm_id="ofi:1")
+        },
+    }
+    daily = {
+        "date": "2026-08-13",
+        "meta": {},
+        "threshold_snapshot": daily_families,
+    }
+    cumulative = {
+        "windows": {"cumulative": ["2026-08-13"]},
+        "threshold_snapshot_by_window": {"cumulative": daily_families},
+    }
+
+    status = mod._smoothing_source_only_path_journal_contract_status(daily, cumulative)
+
+    assert status["status"] == "fail"
+    assert "smoothing_source_only_pipeline_load_meta_missing" in status["issues"]
+
+
+def test_smoothing_source_only_path_journal_contract_rejects_lineage_drop():
+    daily_families = {
+        "soft_stop_whipsaw_confirmation": {
+            "source_only_path_journal": _smoothing_journal(10, arm_id="soft:1")
+        },
+        "holding_flow_ofi_smoothing": {
+            "source_only_path_journal": _smoothing_journal(20, arm_id="ofi:1")
+        },
+    }
+    rolling_families = {
+        "soft_stop_whipsaw_confirmation": {
+            "source_only_path_journal": _smoothing_journal(10, arm_id="soft:other")
+        },
+        "holding_flow_ofi_smoothing": {
+            "source_only_path_journal": _smoothing_journal(20, arm_id="ofi:1")
+        },
+    }
+
+    status = mod._smoothing_source_only_path_journal_contract_status(
+        {"threshold_snapshot": daily_families},
+        {
+            "windows": {"rolling_5d": ["2026-08-10"]},
+            "threshold_snapshot_by_window": {"rolling_5d": rolling_families},
+        },
+    )
+
+    assert status["status"] == "fail"
+    assert (
+        "soft_stop_whipsaw_confirmation_rolling_5d_daily_lineage_mismatch"
+        in status["issues"]
+    )
+
+
+def test_smoothing_source_only_path_journal_contract_rejects_invalid_buy_price():
+    soft = _smoothing_journal(10, arm_id="soft:1")
+    soft["rows"][0]["reference_buy_price"] = 0
+    families = {
+        "soft_stop_whipsaw_confirmation": {"source_only_path_journal": soft},
+        "holding_flow_ofi_smoothing": {
+            "source_only_path_journal": _smoothing_journal(20, arm_id="ofi:1")
+        },
+    }
+
+    status = mod._smoothing_source_only_path_journal_contract_status(
+        {"threshold_snapshot": families},
+        {
+            "windows": {"rolling_5d": ["2026-08-10"]},
+            "threshold_snapshot_by_window": {"rolling_5d": families},
+        },
+    )
+
+    assert status["status"] == "fail"
+    assert any(
+        issue.endswith("row_0_reference_buy_price_invalid")
+        for issue in status["issues"]
+    )
+
+
+def test_smoothing_source_only_path_journal_contract_rejects_phase_count_drift():
+    soft = _smoothing_journal(10, arm_id="soft:1")
+    soft["observation_phase_summary"]["holding"]["horizon_count"] = 4
+    families = {
+        "soft_stop_whipsaw_confirmation": {"source_only_path_journal": soft},
+        "holding_flow_ofi_smoothing": {
+            "source_only_path_journal": _smoothing_journal(20, arm_id="ofi:1")
+        },
+    }
+
+    status = mod._smoothing_source_only_path_journal_contract_status(
+        {"threshold_snapshot": families},
+        {
+            "windows": {"rolling_5d": ["2026-08-10"]},
+            "threshold_snapshot_by_window": {"rolling_5d": families},
+        },
+    )
+
+    assert status["status"] == "fail"
+    assert any(
+        issue.endswith("holding_phase_counts_inconsistent")
+        for issue in status["issues"]
+    )
+
+
+def test_smoothing_source_only_path_journal_contract_requires_rollout_artifacts():
+    status = mod._smoothing_source_only_path_journal_contract_status(
+        {"date": "2026-08-10"},
+        {"date": "2026-08-10"},
+    )
+
+    assert status["status"] == "fail"
+    assert status["issues"] == ["smoothing_source_only_path_journal_missing"]
+
+
+def test_smoothing_source_only_contract_requires_rolling_decision_from_0811():
+    families = {
+        "soft_stop_whipsaw_confirmation": {
+            "source_only_path_journal": _smoothing_journal(10, arm_id="soft:1")
+        },
+        "holding_flow_ofi_smoothing": {
+            "source_only_path_journal": _smoothing_journal(20, arm_id="ofi:1")
+        },
+    }
+    cumulative = {
+        "date": "2026-08-11",
+        "windows": {
+            "cumulative": ["2026-08-11"],
+            "rolling_5d": ["2026-08-11"],
+        },
+        "threshold_snapshot_by_window": {
+            "cumulative": families,
+            "rolling_5d": families,
+        },
+    }
+
+    status = mod._smoothing_source_only_path_journal_contract_status(
+        {"date": "2026-08-11", "threshold_snapshot": families}, cumulative
+    )
+
+    assert status["status"] == "fail"
+    assert "smoothing_source_only_rolling_decision_missing" in status["issues"]
+
+    cumulative["smoothing_source_only_rolling_decision"] = _smoothing_rolling_decision()
+    status = mod._smoothing_source_only_path_journal_contract_status(
+        {"date": "2026-08-11", "threshold_snapshot": families}, cumulative
+    )
+    assert status["status"] == "pass"
+    assert status["rolling_decision_status"] == "pass"
+
+
+def test_smoothing_rolling_decision_rejects_unready_review_state():
+    decision = _smoothing_rolling_decision()
+    evidence = decision["families"]["holding_flow_ofi_smoothing"]["window_evidence"][
+        "rolling_5d"
+    ]
+    evidence["sample_floor_met"] = False
+    evidence["exact_complete_path_count"] = 19
+    families = {
+        "soft_stop_whipsaw_confirmation": {
+            "source_only_path_journal": _smoothing_journal(10, arm_id="soft:1")
+        },
+        "holding_flow_ofi_smoothing": {
+            "source_only_path_journal": _smoothing_journal(20, arm_id="ofi:1")
+        },
+    }
+
+    status = mod._smoothing_source_only_path_journal_contract_status(
+        {"date": "2026-08-11", "threshold_snapshot": families},
+        {
+            "date": "2026-08-11",
+            "windows": {"rolling_5d": ["2026-08-11"]},
+            "threshold_snapshot_by_window": {"rolling_5d": families},
+            "smoothing_source_only_rolling_decision": decision,
+        },
+    )
+
+    assert status["status"] == "fail"
+    assert "holding_flow_ofi_smoothing_rolling_decision_state_drift" in status["issues"]
+
+
+def test_smoothing_rolling_decision_recalculates_risk_and_metric_contract():
+    decision = _smoothing_rolling_decision()
+    decision["metric_role"] = "diagnostic_only"
+    evidence = decision["families"]["holding_flow_ofi_smoothing"]["window_evidence"][
+        "rolling_5d"
+    ]
+    evidence["primary_90s_downside_p10_ev_pct"] = None
+    families = {
+        "soft_stop_whipsaw_confirmation": {
+            "source_only_path_journal": _smoothing_journal(10, arm_id="soft:1")
+        },
+        "holding_flow_ofi_smoothing": {
+            "source_only_path_journal": _smoothing_journal(20, arm_id="ofi:1")
+        },
+    }
+
+    status = mod._smoothing_source_only_path_journal_contract_status(
+        {"date": "2026-08-11", "threshold_snapshot": families},
+        {
+            "date": "2026-08-11",
+            "windows": {"rolling_5d": ["2026-08-11"]},
+            "threshold_snapshot_by_window": {"rolling_5d": families},
+            "smoothing_source_only_rolling_decision": decision,
+        },
+    )
+
+    assert status["status"] == "fail"
+    assert "smoothing_rolling_decision_metric_role_invalid" in status["issues"]
+    assert (
+        "holding_flow_ofi_smoothing_rolling_5d_rolling_decision_"
+        "risk_evidence_state_drift"
+    ) in status["issues"]
+    assert "holding_flow_ofi_smoothing_rolling_decision_state_drift" in status["issues"]
+
+
+def test_artifact_paths_separate_daily_report_from_calibration_payload():
+    paths = mod._artifact_paths("2026-08-10")
+
+    assert paths["threshold_cycle_daily"].name == "threshold_cycle_2026-08-10.json"
+    assert paths["threshold_cycle_calibration"].name == (
+        "threshold_cycle_calibration_2026-08-10_postclose.json"
+    )
+    assert paths["threshold_cycle_daily"] != paths["threshold_cycle_calibration"]
+
+
+def test_source_quality_hard_block_status_fails_runtime_candidate_without_handoff():
+    preflight = {
+        "summary": {
+            "tuning_input_allowed": False,
+            "hard_blocking_contract_gap_count": 1,
+            "hard_blocking_stages": ["blocked_ai_score"],
+        }
+    }
+
+    status = mod._source_quality_hard_block_status(
+        preflight,
+        ev_report={"approval_requests": [{"family": "score65_74_recovery_probe"}]},
+        runtime_summary={},
+        ldm_report={},
+        bridge_report={},
+        workorder={"orders": []},
+    )
+
+    assert status["status"] == "fail"
+    assert status["candidate_violation_sources"] == ["threshold_cycle_ev"]
+    assert status["workorder_handoff_present"] is False
+
+
+def test_ai_decision_action_outcome_calibration_status_accepts_current_contract():
+    status = mod._ai_decision_action_outcome_calibration_status(
+        {
+            "schema": "ai_decision_action_outcome_calibration_v1",
+            "status": "cumulative_action_outcome_calibration_updated",
+            "runtime_effect": False,
+            "allowed_runtime_apply": False,
+            "actual_order_submitted": False,
+            "broker_order_forbidden": True,
+            "candidate_summaries": [{"candidate_prompt_version": "candidate_v1"}],
+        }
+    )
+
+    assert status["status"] == "pass"
+    assert status["candidate_count"] == 1
+    assert status["contract_errors"] == []
+
+
+def test_source_quality_hard_block_status_detects_bridge_selected_alias_without_handoff():
+    preflight = {
+        "status": "warning",
+        "tuning_input_allowed": False,
+        "blocked_reason": "blocked_contract_gap",
+        "hard_blocking_contract_gap_count": 1,
+        "hard_blocking_stages": ["scalp_sim_duplicate_buy_signal"],
+    }
+
+    status = mod._source_quality_hard_block_status(
+        preflight,
+        ev_report={},
+        runtime_summary={},
+        ldm_report={},
+        bridge_report={
+            "runtime_apply_bridge": {
+                "selected": [{"family": "entry_wait6579_score66_69_recovery_gate_v1"}],
+                "selected_count": 1,
+                "approved_requests": [
+                    {"family": "entry_wait6579_score66_69_recovery_gate_v1"}
+                ],
+            }
+        },
+        workorder={
+            "orders": [
+                {"order_id": "order_observation_source_quality_hard_block_contract_gap"}
+            ]
+        },
+    )
+
+    assert status["status"] == "fail"
+    assert status["candidate_violation_sources"] == ["runtime_apply_bridge"]
+    assert status["workorder_handoff_present"] is True
+
+
+def test_source_quality_hard_block_status_passes_when_blocked_artifacts_handoff_only():
+    preflight = {
+        "summary": {
+            "tuning_input_allowed": False,
+            "hard_blocking_contract_gap_count": 1,
+            "hard_blocking_stages": ["blocked_ai_score"],
+        }
+    }
+
+    status = mod._source_quality_hard_block_status(
+        preflight,
+        ev_report={"status": "source_quality_blocked", "allowed_runtime_apply": False},
+        runtime_summary={
+            "status": "source_quality_blocked",
+            "summary": {"runtime_candidate_count": 0},
+        },
+        ldm_report={
+            "status": "source_quality_blocked",
+            "runtime_approval_candidates": [],
+        },
+        bridge_report={},
+        workorder={
+            "orders": [
+                {"order_id": "order_observation_source_quality_hard_block_contract_gap"}
+            ]
+        },
+    )
+
+    assert status["status"] == "pass"
+    assert status["candidate_violation_sources"] == []
+    assert status["workorder_handoff_present"] is True
+
+
+def test_raw_row_exclusion_handoff_fails_without_producer_fix_workorder():
+    status = mod._raw_row_exclusion_handoff_status(
+        {
+            "raw_row_exclusion": {
+                "excluded_row_count": 2,
+                "stage_counts": {"custom_runtime_context_stage": 2},
+                "exclusion_reasons": {"required_field_missing": 2},
+            }
+        },
+        workorder={"orders": []},
+    )
+
+    assert status["status"] == "fail"
+    assert status["excluded_row_count"] == 2
+    assert status["workorder_handoff_present"] is False
+
+
+def test_conversion_kpi_warns_when_new_postclose_candidate_not_due_until_next_preopen():
+    status, issues, warnings = mod._conversion_kpi_health(
+        conversion_check_enabled=True,
+        key_lineage_ledger={"summary": {}},
+        conversion_lane={"summary": {"conversion_candidate_count": 1}},
+        key_lineage_summary={
+            "preopen_missing_count": 23,
+            "new_postclose_candidates_due_state": "not_due_until_next_preopen",
+        },
+        conversion_lane_summary={"conversion_candidate_count": 1},
+    )
+
+    assert status == "warning"
+    assert issues == []
+    assert warnings == ["active_or_hypothesis_preopen_handoff_pending"]
+
+
+def test_conversion_kpi_fails_when_due_preopen_candidate_is_missing():
+    status, issues, warnings = mod._conversion_kpi_health(
+        conversion_check_enabled=True,
+        key_lineage_ledger={"summary": {}},
+        conversion_lane={"summary": {"conversion_candidate_count": 1}},
+        key_lineage_summary={
+            "preopen_missing_count": 1,
+            "new_postclose_candidates_due_state": "due_same_day",
+        },
+        conversion_lane_summary={"conversion_candidate_count": 1},
+    )
+
+    assert status == "fail"
+    assert issues == ["active_or_hypothesis_preopen_missing"]
+    assert warnings == []
+
+
+def test_raw_row_exclusion_handoff_passes_with_producer_fix_workorder():
+    status = mod._raw_row_exclusion_handoff_status(
+        {"raw_row_exclusion": {"excluded_row_count": 1}},
+        workorder={
+            "orders": [
+                {
+                    "order_id": "order_observation_source_quality_raw_row_exclusion_producer_gap",
+                    "decision": "implement_now",
+                    "runtime_effect": False,
+                    "allowed_runtime_apply": False,
+                    "forbidden_uses": ["real_order_authority"],
+                }
+            ]
+        },
+    )
+
+    assert status["status"] == "pass"
+    assert status["workorder_handoff_present"] is True
+
+
+def test_raw_row_exclusion_handoff_passes_with_limit_up_review_only_context():
+    status = mod._raw_row_exclusion_handoff_status(
+        {
+            "raw_row_exclusion": {
+                "excluded_row_count": 6,
+                "stage_counts": {
+                    "blocked_overbought": 3,
+                    "blocked_strength_momentum": 3,
+                },
+                "field_gap_counts": {"zero_fields:intraday_range_pct": 6},
+            }
+        },
+        workorder={
+            "orders": [],
+            "non_selected_orders": [
+                {
+                    "order_id": "order_observation_source_quality_raw_row_exclusion_producer_gap",
+                    "improvement_type": "source_quality_raw_row_exclusion_limit_up_locked_context",
+                    "route": "review_required_limit_up_locked_context",
+                    "raw_row_exclusion_context_classification": "limit_up_locked_context",
+                    "decision": "attach_existing_family",
+                    "runtime_effect": False,
+                    "allowed_runtime_apply": False,
+                }
+            ],
+        },
+    )
+
+    assert status["status"] == "pass"
+    assert status["workorder_handoff_present"] is True
+    assert status["review_only_context_count"] == 1
+
+
+def test_raw_row_exclusion_handoff_passes_with_market_halt_review_only_context():
+    status = mod._raw_row_exclusion_handoff_status(
+        {
+            "raw_row_exclusion": {
+                "excluded_row_count": 10,
+                "stage_counts": {"blocked_strength_momentum": 10},
+                "field_gap_counts": {"zero_fields:intraday_range_pct": 10},
+                "market_halt_or_circuit_window_overlap": True,
+            }
+        },
+        workorder={
+            "orders": [],
+            "non_selected_orders": [
+                {
+                    "order_id": "order_observation_source_quality_raw_row_exclusion_producer_gap",
+                    "improvement_type": "source_quality_raw_row_exclusion_market_halt_context",
+                    "route": "review_required_market_halt_context",
+                    "raw_row_exclusion_context_classification": (
+                        "market_halt_or_circuit_window_overlap"
+                    ),
+                    "decision": "attach_existing_family",
+                    "runtime_effect": False,
+                    "allowed_runtime_apply": False,
+                }
+            ],
+        },
+    )
+
+    assert status["status"] == "pass"
+    assert status["workorder_handoff_present"] is True
+    assert status["review_only_context_count"] == 1
+
+
+def test_raw_row_exclusion_handoff_passes_after_final_revalidation_closed():
+    status = mod._raw_row_exclusion_handoff_status(
+        {
+            "status": "pass",
+            "summary": {
+                "tuning_input_allowed": True,
+                "hard_blocking_contract_gap_count": 0,
+                "current_scan_hard_blocking_excluded_row_count": 0,
+                "post_exclusion_hard_blocking_excluded_row_count": 0,
+                "raw_row_exclusion_revalidation_required": False,
+            },
+            "raw_row_exclusion": {"excluded_row_count": 2},
+        },
+        workorder={
+            "orders": [
+                {
+                    "order_id": (
+                        "order_observation_source_quality_raw_row_exclusion_producer_gap"
+                    ),
+                    "improvement_type": (
+                        "source_quality_raw_row_exclusion_revalidated_closed"
+                    ),
+                    "route": "source_quality_raw_row_exclusion_revalidated_closed",
+                    "raw_row_exclusion_context_classification": (
+                        "post_exclusion_revalidation_closed"
+                    ),
+                    "decision": "attach_existing_family",
+                    "runtime_effect": False,
+                    "allowed_runtime_apply": False,
+                }
+            ]
+        },
+    )
+
+    assert status["status"] == "pass"
+    assert status["workorder_handoff_present"] is True
+    assert status["revalidation_closed_count"] == 1
+
+
+def test_raw_row_exclusion_handoff_ignores_unrelated_preflight_warning():
+    status = mod._raw_row_exclusion_handoff_status(
+        {
+            "status": "warning",
+            "summary": {
+                "tuning_input_allowed": True,
+                "hard_blocking_contract_gap_count": 0,
+                "current_scan_hard_blocking_excluded_row_count": 0,
+                "post_exclusion_hard_blocking_excluded_row_count": 0,
+                "raw_row_exclusion_revalidation_required": False,
+            },
+            "raw_row_exclusion": {"excluded_row_count": 2},
+        },
+        workorder={
+            "orders": [
+                {
+                    "order_id": (
+                        "order_observation_source_quality_raw_row_exclusion_producer_gap"
+                    ),
+                    "improvement_type": (
+                        "source_quality_raw_row_exclusion_revalidated_closed"
+                    ),
+                    "route": "source_quality_raw_row_exclusion_revalidated_closed",
+                    "decision": "attach_existing_family",
+                    "runtime_effect": False,
+                    "allowed_runtime_apply": False,
+                }
+            ]
+        },
+    )
+
+    assert status["status"] == "pass"
+    assert status["workorder_handoff_present"] is True
+
+
+def test_raw_row_exclusion_handoff_warning_missing_counts_stays_open():
+    status = mod._raw_row_exclusion_handoff_status(
+        {
+            "status": "warning",
+            "summary": {
+                "tuning_input_allowed": True,
+                "raw_row_exclusion_revalidation_required": False,
+            },
+            "raw_row_exclusion": {"excluded_row_count": 2},
+        },
+        workorder={
+            "orders": [
+                {
+                    "order_id": (
+                        "order_observation_source_quality_raw_row_exclusion_producer_gap"
+                    ),
+                    "route": "source_quality_raw_row_exclusion_revalidated_closed",
+                    "decision": "attach_existing_family",
+                    "runtime_effect": False,
+                    "allowed_runtime_apply": False,
+                }
+            ]
+        },
+    )
+
+    assert status["status"] == "fail"
+    assert (
+        "raw_row_exclusion_revalidation_not_closed"
+        in status["invalid_contract_reasons"]
+    )
+
+
+def test_raw_row_exclusion_handoff_rejects_stale_revalidation_closed_order():
+    status = mod._raw_row_exclusion_handoff_status(
+        {
+            "status": "warning",
+            "summary": {
+                "tuning_input_allowed": True,
+                "current_scan_hard_blocking_excluded_row_count": 1,
+                "post_exclusion_hard_blocking_excluded_row_count": 1,
+                "raw_row_exclusion_revalidation_required": True,
+            },
+            "raw_row_exclusion": {"excluded_row_count": 2},
+        },
+        workorder={
+            "orders": [
+                {
+                    "order_id": (
+                        "order_observation_source_quality_raw_row_exclusion_producer_gap"
+                    ),
+                    "route": "source_quality_raw_row_exclusion_revalidated_closed",
+                    "decision": "attach_existing_family",
+                    "runtime_effect": False,
+                    "allowed_runtime_apply": False,
+                }
+            ]
+        },
+    )
+
+    assert status["status"] == "fail"
+    assert (
+        "raw_row_exclusion_revalidation_not_closed"
+        in status["invalid_contract_reasons"]
+    )
+
+
+def test_raw_row_exclusion_handoff_fails_when_order_is_non_selected_only():
+    status = mod._raw_row_exclusion_handoff_status(
+        {"raw_row_exclusion": {"excluded_row_count": 1}},
+        workorder={
+            "orders": [],
+            "non_selected_orders": [
+                {
+                    "order_id": "order_observation_source_quality_raw_row_exclusion_producer_gap",
+                    "decision": "implement_now",
+                    "runtime_effect": False,
+                }
+            ],
+        },
+    )
+
+    assert status["status"] == "fail"
+    assert status["workorder_handoff_present"] is False
+
+
+def test_raw_row_exclusion_handoff_fails_when_safe_producer_fix_is_non_selected_only():
+    status = mod._raw_row_exclusion_handoff_status(
+        {"raw_row_exclusion": {"excluded_row_count": 1}},
+        workorder={
+            "orders": [],
+            "non_selected_orders": [
+                {
+                    "order_id": "order_observation_source_quality_raw_row_exclusion_producer_gap",
+                    "decision": "implement_now",
+                    "runtime_effect": False,
+                    "allowed_runtime_apply": False,
+                    "forbidden_uses": ["real_order_authority"],
+                }
+            ],
+        },
+    )
+
+    assert status["status"] == "fail"
+    assert status["workorder_handoff_present"] is False
+
+
+def test_raw_row_exclusion_handoff_fails_when_workorder_contract_is_not_safe_scope():
+    status = mod._raw_row_exclusion_handoff_status(
+        {"raw_row_exclusion": {"excluded_row_count": 1}},
+        workorder={
+            "orders": [
+                {
+                    "order_id": "order_observation_source_quality_raw_row_exclusion_producer_gap",
+                    "decision": "implement_now",
+                    "runtime_effect": True,
+                    "allowed_runtime_apply": False,
+                    "forbidden_uses": ["real_order_authority"],
+                }
+            ],
+        },
+    )
+
+    assert status["status"] == "fail"
+    assert status["workorder_handoff_present"] is False
+    assert status["invalid_contract_reasons"] == ["runtime_effect_not_false"]
+
+
+def test_raw_row_exclusion_handoff_fails_without_forbidden_uses_contract():
+    status = mod._raw_row_exclusion_handoff_status(
+        {"raw_row_exclusion": {"excluded_row_count": 1}},
+        workorder={
+            "orders": [
+                {
+                    "order_id": "order_observation_source_quality_raw_row_exclusion_producer_gap",
+                    "decision": "implement_now",
+                    "runtime_effect": False,
+                    "allowed_runtime_apply": False,
+                }
+            ],
+        },
+    )
+
+    assert status["status"] == "fail"
+    assert status["workorder_handoff_present"] is False
+    assert status["invalid_contract_reasons"] == ["missing_forbidden_uses_contract"]
+
+
+def test_read_lines_includes_rotated_numeric_log(tmp_path):
+    log_path = tmp_path / "threshold_cycle_postclose_cron.log"
+    (tmp_path / "threshold_cycle_postclose_cron.log.1").write_text(
+        "[START] threshold-cycle postclose target_date=2026-05-22\n"
+        "[DONE] threshold-cycle postclose target_date=2026-05-22\n",
+        encoding="utf-8",
+    )
+    log_path.write_text("", encoding="utf-8")
+
+    lines = mod._read_lines(log_path)
+
+    assert any(
+        "[DONE] threshold-cycle postclose target_date=2026-05-22" in line
+        for line in lines
+    )
+
+
+def test_clean_baseline_report_residue_status_fails_pre_baseline_reports(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("KORSTOCKSCAN_CLEAN_TUNING_BASELINE_DATE", "2026-06-04")
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_CLEAN_TUNING_BASELINE_TS_KST", "2026-06-04T14:29:09+09:00"
+    )
+    old_report = tmp_path / "threshold_cycle_ev" / "threshold_cycle_ev_2026-06-02.json"
+    same_day_old_report = (
+        tmp_path / "threshold_cycle_ev" / "threshold_cycle_ev_2026-06-04.json"
+    )
+    future_report = (
+        tmp_path / "threshold_cycle_ev" / "threshold_cycle_ev_2026-06-05.json"
+    )
+    for path, generated_at in (
+        (old_report, "2026-06-02T18:00:00+09:00"),
+        (same_day_old_report, "2026-06-04T13:00:00+09:00"),
+        (future_report, "2026-06-05T18:00:00+09:00"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"generated_at": generated_at}), encoding="utf-8")
+
+    status = mod._clean_baseline_report_residue_status(tmp_path)
+
+    assert status["status"] == "fail"
+    assert status["residue_count"] == 2
+    reasons = {item["reason"] for item in status["residue"]}
+    assert "pre_clean_baseline_report_archive_only" in reasons
+    assert "same_day_pre_clean_baseline_report_archive_only" in reasons
+
+
+def test_clean_baseline_analytics_residue_status_fails_old_parquet_and_duckdb(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("KORSTOCKSCAN_CLEAN_TUNING_BASELINE_DATE", "2026-06-04")
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_CLEAN_TUNING_BASELINE_TS_KST", "2026-06-04T14:29:09+09:00"
+    )
+    old_parquet = (
+        tmp_path
+        / "parquet"
+        / "pipeline_events"
+        / "date=2026-06-02"
+        / "pipeline_events.parquet"
+    )
+    new_parquet = (
+        tmp_path
+        / "parquet"
+        / "pipeline_events"
+        / "date=2026-06-04"
+        / "pipeline_events.parquet"
+    )
+    duckdb_path = tmp_path / "duckdb" / "korstockscan_analytics.duckdb"
+    for path in (old_parquet, new_parquet, duckdb_path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+    os.utime(duckdb_path, (0, 0))
+
+    status = mod._clean_baseline_analytics_residue_status(tmp_path)
+
+    assert status["status"] == "fail"
+    assert status["residue_count"] == 2
+    reasons = {item["reason"] for item in status["residue"]}
+    assert "pre_clean_baseline_parquet_archive_only" in reasons
+    assert "pre_clean_baseline_duckdb_archive_only" in reasons
+
+
+def test_latest_run_lines_prefers_repaired_full_done_marker_after_partial_marker():
+    log_lines = [
+        "[START] threshold-cycle postclose target_date=2026-05-28 started_at=2026-05-28T19:30:30+0900",
+        "[DONE] threshold-cycle postclose target_date=2026-05-28 swing_lifecycle=false lifecycle_decision_matrix=false lifecycle_bucket_discovery=false runtime_apply_bridge=false finished_at=2026-05-28T19:34:29+0900",
+        "[START] threshold-cycle postclose target_date=2026-05-28 started_at=2026-05-29T12:35:33+0900",
+        "[DONE] threshold-cycle postclose target_date=2026-05-28 swing_lifecycle=true lifecycle_decision_matrix=true lifecycle_bucket_discovery=true runtime_apply_bridge=true finished_at=2026-05-29T12:58:25+0900",
+    ]
+
+    run_lines, start_line = mod._latest_run_lines(log_lines, "2026-05-28")
+    done_line = next(
+        line for line in run_lines if "[DONE] threshold-cycle postclose" in line
+    )
+
+    assert "2026-05-29T12:35:33+0900" in (start_line or "")
+    assert "2026-05-29T12:58:25+0900" in done_line
+    assert mod._parse_bool_flags(done_line)["runtime_apply_bridge"] is True
+    assert mod._parse_bool_flags(done_line)["lifecycle_bucket_discovery"] is True
+
+
+def test_artifact_paths_include_one_share_threshold_opportunity():
+    path = mod._artifact_paths("2026-07-02")["one_share_threshold_opportunity"]
+
+    assert str(path).endswith(
+        "data/report/one_share_threshold_opportunity/one_share_threshold_opportunity_2026-07-02.json"
+    )
+
+
+def test_artifact_paths_include_smoothing_daily_and_cumulative_reports():
+    paths = mod._artifact_paths("2026-08-10")
+
+    assert str(paths["threshold_cycle_calibration"]).endswith(
+        "threshold_cycle_calibration_2026-08-10_postclose.json"
+    )
+    assert str(paths["threshold_cycle_cumulative"]).endswith(
+        "threshold_cycle_cumulative_2026-08-10.json"
+    )
+
+
+def _limit_down_readiness(**overrides):
+    payload = {
+        "stage": "source_observation",
+        "decision": "collect_source_then_build_sim_candidate",
+        "candidate_source_valid": True,
+        "event_source_valid": True,
+        "source_quality_status": "pass",
+        "sim_candidate_ready": False,
+        "real_trading_ready": False,
+        "blockers": [
+            "multi_day_cohort_sample_floor_not_established",
+            "counterfactual_entry_exit_labels_missing",
+            "clean_baseline_rolling_ev_missing",
+            "sim_policy_catalog_handoff_missing",
+            "post_sim_attribution_missing",
+            "bounded_live_candidate_contract_missing",
+            "separate_live_conversion_approval_missing",
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _limit_down_live_readiness(**overrides):
+    payload = {
+        "stage": "source_observation",
+        "decision": "collect_source_and_auto_promote_eligible_type",
+        "candidate_source_valid": True,
+        "event_source_valid": True,
+        "source_quality_status": "pass",
+        "sim_candidate_ready": False,
+        "real_trading_ready": False,
+        "blockers": ["bounded_live_candidate_contract_missing"],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _limit_down_metric_contract():
+    return dict(mod.LIMIT_DOWN_WATCH_CONTRACT)
+
+
+def _limit_down_conversion(**overrides):
+    payload = {
+        "schema_version": 1,
+        "decision": "keep_observing_and_build_evidence",
+        "observer_activation_expected": True,
+        "observer_activation_observed": True,
+        "daily_source_ready": True,
+        "rolling_observation_ready": False,
+        "counterfactual_ev_ready": False,
+        "sim_policy_catalog_ready": False,
+        "post_sim_attribution_ready": False,
+        "bounded_live_candidate_ready": False,
+        "live_conversion_review_ready": False,
+        "operator_approval_required": False,
+        "operator_approval_present": False,
+        "separate_preopen_apply_ready": False,
+        "automatic_live_conversion_scheduled": False,
+        "automatic_live_conversion_performed": False,
+        "real_trading_ready": False,
+        "allowed_runtime_apply": False,
+        "runtime_effect": False,
+        "actual_order_submitted": False,
+        "broker_order_forbidden": True,
+        "blockers": ["bounded_live_candidate_contract_missing"],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _limit_down_observer_activation(**overrides):
+    payload = {
+        "policy": "persistent_daily_source_observation",
+        "expected_enabled": True,
+        "observed_enabled": True,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_artifact_paths_include_limit_down_watch():
+    paths = mod._artifact_paths("2026-07-30")
+
+    assert str(paths["limit_down_watch"]).endswith(
+        "data/report/limit_down_watch/limit_down_watch_2026-07-30.json"
+    )
+    assert str(paths["limit_down_watch_markdown"]).endswith(
+        "data/report/limit_down_watch/limit_down_watch_2026-07-30.md"
+    )
+
+
+def test_limit_down_watch_report_flag_required_from_rollout_date():
+    assert mod._limit_down_watch_report_required("2026-07-29") is False
+    assert mod._limit_down_watch_report_required("2026-07-30") is True
+
+
+def test_limit_down_watch_report_stays_verified_during_marker_recovery():
+    assert (
+        mod._limit_down_watch_verification_enabled(
+            "2026-07-30",
+            execution_flags={},
+            recovery_done=True,
+        )
+        is True
+    )
+    assert (
+        mod._limit_down_watch_verification_enabled(
+            "2026-07-30",
+            execution_flags={"limit_down_watch_report": False},
+            recovery_done=True,
+        )
+        is False
+    )
+    assert (
+        mod._limit_down_watch_verification_enabled(
+            "2026-07-30",
+            execution_flags={},
+            recovery_done=False,
+        )
+        is False
+    )
+
+
+def test_limit_down_watch_report_status_passes_source_only_contract():
+    status = mod._limit_down_watch_report_status(
+        {
+            "schema_version": 1,
+            "report_type": "limit_down_watch",
+            "target_date": "2026-07-30",
+            "generated_at": "2026-07-30T20:10:00+09:00",
+            **_limit_down_metric_contract(),
+            "status": "pass",
+            "decision_authority": "limit_down_source_observation_only",
+            "runtime_effect": False,
+            "actual_order_submitted": False,
+            "broker_order_forbidden": True,
+            "allowed_sim_apply": False,
+            "allowed_runtime_apply": False,
+            "evidence_readiness": _limit_down_readiness(),
+        },
+        enabled=True,
+        target_date="2026-07-30",
+    )
+
+    assert status["status"] == "pass"
+    assert status["sim_candidate_ready"] is False
+    assert status["real_trading_ready"] is False
+
+
+def test_limit_down_watch_report_validates_daily_conversion_check_contract():
+    status = mod._limit_down_watch_report_status(
+        {
+            "schema_version": 1,
+            "report_type": "limit_down_watch",
+            "target_date": "2026-08-03",
+            "generated_at": "2026-08-03T20:10:00+09:00",
+            **_limit_down_metric_contract(),
+            "status": "pass",
+            "decision_authority": "limit_down_source_observation_only",
+            "runtime_effect": False,
+            "actual_order_submitted": False,
+            "broker_order_forbidden": True,
+            "allowed_sim_apply": False,
+            "allowed_runtime_apply": False,
+            "evidence_readiness": _limit_down_live_readiness(),
+            "conversion_readiness": _limit_down_conversion(),
+            "observer_activation": _limit_down_observer_activation(),
+        },
+        enabled=True,
+        target_date="2026-08-03",
+    )
+
+    assert status["status"] == "pass"
+    assert status["conversion_decision"] == "keep_observing_and_build_evidence"
+    assert status["separate_preopen_apply_ready"] is False
+
+
+def test_limit_down_watch_report_surfaces_auto_live_policy_ready():
+    conversion = _limit_down_conversion(
+        decision="auto_live_policy_ready",
+        rolling_observation_ready=True,
+        counterfactual_ev_ready=True,
+        sim_policy_catalog_ready=True,
+        post_sim_attribution_ready=True,
+        bounded_live_candidate_ready=True,
+        live_conversion_review_ready=True,
+        separate_preopen_apply_ready=True,
+        automatic_live_conversion_scheduled=True,
+        real_trading_ready=True,
+        allowed_runtime_apply=True,
+        blockers=[],
+    )
+    status = mod._limit_down_watch_report_status(
+        {
+            "schema_version": 1,
+            "report_type": "limit_down_watch",
+            "target_date": "2026-08-03",
+            "generated_at": "2026-08-03T20:10:00+09:00",
+            **_limit_down_metric_contract(),
+            "status": "pass",
+            "decision_authority": "limit_down_source_observation_only",
+            "runtime_effect": False,
+            "actual_order_submitted": False,
+            "broker_order_forbidden": True,
+            "allowed_sim_apply": False,
+            "allowed_runtime_apply": False,
+            "evidence_readiness": _limit_down_live_readiness(
+                real_trading_ready=True,
+                blockers=[],
+            ),
+            "conversion_readiness": conversion,
+            "observer_activation": _limit_down_observer_activation(),
+        },
+        enabled=True,
+        target_date="2026-08-03",
+    )
+
+    assert status["status"] == "warning"
+    assert status["operator_approval_required"] is False
+    assert status["warnings"] == ["limit_down_watch_auto_live_policy_ready"]
+
+
+def test_limit_down_watch_report_rejects_conversion_authority_leak():
+    status = mod._limit_down_watch_report_status(
+        {
+            "schema_version": 1,
+            "report_type": "limit_down_watch",
+            "target_date": "2026-08-03",
+            "generated_at": "2026-08-03T20:10:00+09:00",
+            **_limit_down_metric_contract(),
+            "status": "pass",
+            "decision_authority": "limit_down_source_observation_only",
+            "runtime_effect": False,
+            "actual_order_submitted": False,
+            "broker_order_forbidden": True,
+            "allowed_sim_apply": False,
+            "allowed_runtime_apply": False,
+            "evidence_readiness": _limit_down_live_readiness(),
+            "conversion_readiness": _limit_down_conversion(
+                automatic_live_conversion_performed=True,
+                allowed_runtime_apply=True,
+            ),
+            "observer_activation": _limit_down_observer_activation(),
+        },
+        enabled=True,
+        target_date="2026-08-03",
+    )
+
+    assert status["status"] == "fail"
+    assert {
+        "limit_down_watch_conversion_contract_mismatch:automatic_live_conversion_performed",
+        "limit_down_watch_runtime_apply_readiness_invalid",
+    }.issubset(status["issues"])
+
+
+def test_limit_down_watch_report_status_fails_authority_leak():
+    status = mod._limit_down_watch_report_status(
+        {
+            "schema_version": 1,
+            "report_type": "limit_down_watch",
+            "target_date": "2026-07-30",
+            "generated_at": "2026-07-30T20:10:00+09:00",
+            **_limit_down_metric_contract(),
+            "status": "pass",
+            "decision_authority": "limit_down_source_observation_only",
+            "runtime_effect": False,
+            "actual_order_submitted": False,
+            "broker_order_forbidden": True,
+            "allowed_sim_apply": False,
+            "allowed_runtime_apply": False,
+            "evidence_readiness": _limit_down_readiness(
+                sim_candidate_ready=True,
+                real_trading_ready=True,
+            ),
+        },
+        enabled=True,
+        target_date="2026-07-30",
+    )
+
+    assert status["status"] == "fail"
+    assert "limit_down_watch_sim_authority_leak" in status["issues"]
+    assert "limit_down_watch_real_authority_leak" in status["issues"]
+
+
+def test_limit_down_watch_report_status_warns_without_ordered_path():
+    status = mod._limit_down_watch_report_status(
+        {
+            "schema_version": 1,
+            "report_type": "limit_down_watch",
+            "target_date": "2026-07-30",
+            "generated_at": "2026-07-30T20:10:00+09:00",
+            **_limit_down_metric_contract(),
+            "status": "no_observation",
+            "decision_authority": "limit_down_source_observation_only",
+            "runtime_effect": False,
+            "actual_order_submitted": False,
+            "broker_order_forbidden": True,
+            "allowed_sim_apply": False,
+            "allowed_runtime_apply": False,
+            "evidence_readiness": _limit_down_readiness(),
+        },
+        enabled=True,
+        target_date="2026-07-30",
+    )
+
+    assert status["status"] == "warning"
+    assert status["warnings"] == ["limit_down_watch_ordered_path_not_observed"]
+
+
+def test_limit_down_watch_report_status_fails_stale_candidate_source():
+    status = mod._limit_down_watch_report_status(
+        {
+            "schema_version": 1,
+            "report_type": "limit_down_watch",
+            "target_date": "2026-07-29",
+            "generated_at": "2026-07-30T20:10:00+09:00",
+            **_limit_down_metric_contract(),
+            "status": "pass",
+            "decision_authority": "limit_down_source_observation_only",
+            "runtime_effect": False,
+            "actual_order_submitted": False,
+            "broker_order_forbidden": True,
+            "allowed_sim_apply": False,
+            "allowed_runtime_apply": False,
+            "evidence_readiness": _limit_down_readiness(
+                candidate_source_valid=False,
+                source_quality_status="stale_or_invalid",
+            ),
+        },
+        enabled=True,
+        target_date="2026-07-30",
+    )
+
+    assert status["status"] == "fail"
+    assert "limit_down_watch_contract_mismatch:target_date" in status["issues"]
+    assert "limit_down_watch_candidate_source_invalid" in status["warnings"]
+
+
+def test_limit_down_watch_report_status_warns_for_blocked_event_source():
+    status = mod._limit_down_watch_report_status(
+        {
+            "schema_version": 1,
+            "report_type": "limit_down_watch",
+            "target_date": "2026-07-30",
+            "generated_at": "2026-07-30T20:10:00+09:00",
+            **_limit_down_metric_contract(),
+            "status": "source_blocked",
+            "decision_authority": "limit_down_source_observation_only",
+            "runtime_effect": False,
+            "actual_order_submitted": False,
+            "broker_order_forbidden": True,
+            "allowed_sim_apply": False,
+            "allowed_runtime_apply": False,
+            "evidence_readiness": _limit_down_readiness(
+                event_source_valid=False,
+                blockers=[
+                    *_limit_down_readiness()["blockers"],
+                    "ordered_intraday_event_source_invalid",
+                ],
+            ),
+        },
+        enabled=True,
+        target_date="2026-07-30",
+    )
+
+    assert status["status"] == "warning"
+    assert "limit_down_watch_event_source_invalid" in status["warnings"]
+    assert "limit_down_watch_source_blocked" in status["warnings"]
+
+
+def test_limit_down_watch_report_status_fails_stale_markdown_pair():
+    status = mod._limit_down_watch_report_status(
+        {
+            "schema_version": 1,
+            "report_type": "limit_down_watch",
+            "target_date": "2026-07-30",
+            "generated_at": "2026-07-30T20:10:00+09:00",
+            **_limit_down_metric_contract(),
+            "status": "pass",
+            "decision_authority": "limit_down_source_observation_only",
+            "runtime_effect": False,
+            "actual_order_submitted": False,
+            "broker_order_forbidden": True,
+            "allowed_sim_apply": False,
+            "allowed_runtime_apply": False,
+            "evidence_readiness": _limit_down_readiness(),
+        },
+        enabled=True,
+        target_date="2026-07-30",
+        markdown_text=(
+            "# Limit-Down Watch Report — 2026-07-30\n"
+            "- generated_at: `2026-07-30T19:00:00+09:00`\n"
+        ),
+    )
+
+    assert status["status"] == "fail"
+    assert "limit_down_watch_markdown_generation_mismatch" in status["issues"]
+
+
+def test_postclose_verifier_fails_runtime_apply_gap_audit_fail(tmp_path, monkeypatch):
+    project_root = tmp_path
+    report_dir = project_root / "data" / "report"
+    log_path = project_root / "logs" / "threshold_cycle_postclose_cron.log"
+    (project_root / "logs").mkdir(parents=True)
+    monkeypatch.setattr(mod, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(mod, "REPORT_DIR", report_dir)
+    monkeypatch.setattr(mod, "LOG_PATH", log_path)
+    monkeypatch.setattr(
+        mod, "VERIFY_DIR", report_dir / "threshold_cycle_postclose_verification"
+    )
+    monkeypatch.setattr(mod, "_next_krx_trading_day", lambda target_date: "2026-05-13")
+    (project_root / "docs" / "checklists").mkdir(parents=True)
+    (
+        project_root / "docs" / "checklists" / "2026-05-13-stage2-todo-checklist.md"
+    ).write_text(
+        "# checklist\n",
+        encoding="utf-8",
+    )
+    for label, path in mod._artifact_paths("2026-05-12").items():
+        if label == "next_stage2_checklist":
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"report_type": label}
+        if label == "runtime_apply_gap_audit":
+            payload = {
+                "report_type": label,
+                "status": "fail",
+                "summary": {
+                    "critical_failure_count": 1,
+                    "ai_review_retry_pending": False,
+                },
+                "retry_queue": [{"failure_code": "producer_consumer_handoff_missing"}],
+            }
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    log_path.write_text(
+        "\n".join(
+            [
+                "[START] threshold-cycle postclose target_date=2026-05-12 started_at=2026-05-12T21:00:00+0900",
+                "[DONE] threshold-cycle postclose target_date=2026-05-12 swing_lifecycle=false pattern_labs=false deepseek_swing_lab=false pattern_lab_currentness_audit=false pattern_lab_propagation_audit=false scalp_entry_adm=false lifecycle_decision_matrix=false code_improvement_workorder=false daily_ev=false runtime_approval_summary=false runtime_apply_gap_audit=true next_stage2_checklist=false finished_at=2026-05-12T21:30:00+0900",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    report = mod.build_threshold_cycle_postclose_verification("2026-05-12")
+
+    assert report["status"] == "fail"
+    assert (
+        "runtime_apply_gap_audit_failed" in report["runtime_apply_gap_audit"]["issues"]
+    )
+
+
+def test_postclose_verifier_fails_stale_runtime_apply_gap_after_bridge_update(
+    tmp_path, monkeypatch
+):
+    project_root = tmp_path
+    report_dir = project_root / "data" / "report"
+    log_path = project_root / "logs" / "threshold_cycle_postclose_cron.log"
+    (project_root / "logs").mkdir(parents=True)
+    monkeypatch.setattr(mod, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(mod, "REPORT_DIR", report_dir)
+    monkeypatch.setattr(mod, "LOG_PATH", log_path)
+    monkeypatch.setattr(
+        mod, "VERIFY_DIR", report_dir / "threshold_cycle_postclose_verification"
+    )
+    monkeypatch.setattr(mod, "_next_krx_trading_day", lambda target_date: "2026-05-27")
+    (project_root / "docs" / "checklists").mkdir(parents=True)
+    (
+        project_root / "docs" / "checklists" / "2026-05-27-stage2-todo-checklist.md"
+    ).write_text(
+        "# checklist\n",
+        encoding="utf-8",
+    )
+    for label, path in mod._artifact_paths("2026-05-26").items():
+        if label == "next_stage2_checklist":
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"report_type": label, "generated_at": "2026-05-26T21:00:00+09:00"}
+        if label == "runtime_apply_gap_audit":
+            payload = {
+                "report_type": label,
+                "status": "pass",
+                "generated_at": "2026-05-26T21:00:00+09:00",
+                "summary": {
+                    "critical_failure_count": 0,
+                    "ai_review_retry_pending": False,
+                },
+                "retry_queue": [],
+            }
+        elif label == "runtime_apply_bridge":
+            payload = {
+                "report_type": label,
+                "generated_at": "2026-05-26T22:00:00+09:00",
+                "candidates": [],
+            }
+        elif label == "threshold_preopen_apply_next":
+            payload = {
+                "report_type": label,
+                "generated_at": "2026-05-26T22:05:00+09:00",
+            }
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    log_path.write_text(
+        "\n".join(
+            [
+                "[START] threshold-cycle postclose target_date=2026-05-26 started_at=2026-05-26T21:00:00+0900",
+                "[DONE] threshold-cycle postclose target_date=2026-05-26 swing_lifecycle=false pattern_labs=false deepseek_swing_lab=false pattern_lab_currentness_audit=false pattern_lab_propagation_audit=false scalp_entry_adm=false lifecycle_decision_matrix=false runtime_apply_bridge=true code_improvement_workorder=false daily_ev=false runtime_approval_summary=false runtime_apply_gap_audit=true next_stage2_checklist=false finished_at=2026-05-26T22:30:00+0900",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    report = mod.build_threshold_cycle_postclose_verification("2026-05-26")
+
+    assert report["status"] == "fail"
+    assert (
+        "runtime_apply_gap_audit_stale_before_runtime_apply_bridge"
+        in report["runtime_apply_gap_audit"]["issues"]
+    )
+    assert (
+        "runtime_apply_gap_audit_stale_before_threshold_preopen_apply"
+        in report["runtime_apply_gap_audit"]["issues"]
+    )
+
+
+def test_overnight_bucket_handoff_status_detects_downstream_drops():
+    ldm = {
+        "overnight_bucket_attribution": {
+            "runtime_approval_candidates": [
+                {
+                    "candidate_id": "overnight_bucket_1",
+                    "bucket_type": "overnight_action",
+                    "bucket_key": "SELL_TODAY",
+                }
+            ],
+            "code_improvement_workorders": [
+                {"bucket_type": "overnight_status", "bucket_key": "HOLD_OVERNIGHT"}
+            ],
+        }
+    }
+
+    report = mod._overnight_bucket_handoff_status(ldm, {}, {}, {"orders": []})
+
+    assert report["status"] == "fail"
+    assert report["missing_ev_candidate_ids"] == ["overnight_bucket_1"]
+    assert report["missing_runtime_summary_candidate_ids"] == ["overnight_bucket_1"]
+    assert report["missing_workorder_order_ids"] == [
+        "order_lifecycle_overnight_bucket_overnight_status_hold_overnight"
+    ]
+
+
+def test_lifecycle_bucket_discovery_handoff_detects_missing_downstream():
+    discovery = {
+        "surfaced_candidates": [
+            {
+                "bucket_id": "entry:combo:test",
+                "classification_state": "live_auto_apply_ready",
+                "live_auto_apply_family": "entry_wait6579_score66_69_recovery_gate_v1",
+            },
+            {
+                "bucket_id": "entry:combo:unknown",
+                "classification_state": "new_bucket_candidate",
+            },
+        ]
+    }
+
+    report = mod._lifecycle_bucket_discovery_handoff_status(
+        discovery, {}, {}, {"orders": []}
+    )
+
+    assert report["status"] == "fail"
+    assert report["missing_bridge_families"] == [
+        "entry_wait6579_score66_69_recovery_gate_v1"
+    ]
+    assert (
+        "runtime_approval_summary_lifecycle_bucket_discovery_missing"
+        in report["missing"]
+    )
+    assert (
+        "code_improvement_workorder_lifecycle_bucket_discovery_orders_missing"
+        in report["missing"]
+    )
+
+
+def test_lifecycle_bucket_discovery_handoff_warns_when_source_dimension_gap_not_surfaced():
+    discovery = {
+        "surfaced_candidates": [
+            {
+                "bucket_id": "entry:combo:unknown",
+                "stage": "entry",
+                "classification_state": "source_only_keep_collecting",
+                "source_dimension_gap": "unknown_source_dimensions",
+                "recommended_resolution": "resolve_unknown_source_dimensions",
+            }
+        ]
+    }
+    runtime_summary = {"surfaced_candidate_ids": ["entry:combo:unknown"]}
+
+    report = mod._lifecycle_bucket_discovery_handoff_status(
+        discovery, {}, runtime_summary, {"orders": []}
+    )
+
+    assert report["status"] == "warning"
+    assert "lifecycle_source_dimension_gap_handoff_missing" in report["warnings"]
+    assert report["actionable_source_dimension_gap_bucket_ids"] == [
+        "entry:combo:unknown"
+    ]
+
+
+def test_lifecycle_bucket_discovery_handoff_warns_from_source_dimension_summary():
+    discovery = {
+        "source_dimension_gap_summary": {
+            "actionable_unknown_gap_count": 2,
+            "actionable_candidates": [],
+        },
+        "surfaced_candidates": [],
+    }
+
+    report = mod._lifecycle_bucket_discovery_handoff_status(
+        discovery, {}, {}, {"orders": []}
+    )
+
+    assert report["status"] == "warning"
+    assert "lifecycle_source_dimension_gap_handoff_missing" in report["warnings"]
+    assert report["actionable_source_dimension_gap_bucket_ids"] == [
+        "source_dimension_gap_summary"
+    ]
+    assert report["actionable_source_dimension_gap_count"] == 2
+
+
+def test_lifecycle_bucket_discovery_handoff_fails_when_sim_source_dimension_gap_not_surfaced():
+    discovery = {
+        "surfaced_candidates": [
+            {
+                "bucket_id": "lifecycle_flow:combo:unknown",
+                "stage": "lifecycle_flow",
+                "classification_state": "lifecycle_flow_sim_probe_candidate",
+                "source_dimension_gap": "unknown_source_dimensions",
+                "recommended_resolution": "resolve_unknown_source_dimensions",
+            }
+        ]
+    }
+    runtime_summary = {"surfaced_candidate_ids": ["lifecycle_flow:combo:unknown"]}
+
+    report = mod._lifecycle_bucket_discovery_handoff_status(
+        discovery, {}, runtime_summary, {"orders": []}
+    )
+
+    assert report["status"] == "fail"
+    assert "lifecycle_source_dimension_gap_handoff_missing" in report["missing"]
+    assert report["blocking_source_dimension_gap_bucket_ids"] == [
+        "lifecycle_flow:combo:unknown"
+    ]
+
+
+def test_lifecycle_bucket_discovery_handoff_warns_when_quiet_gap_rollup_missing():
+    discovery = {
+        "quiet_gap_summary": {
+            "quiet_gap_count": 2,
+            "rollup_required_count": 2,
+            "sim_live_connected_quiet_gap_count": 0,
+        },
+        "surfaced_candidates": [],
+    }
+
+    report = mod._lifecycle_bucket_discovery_handoff_status(
+        discovery, {}, {}, {"orders": []}
+    )
+
+    assert report["status"] == "warning"
+    assert "lifecycle_quiet_gap_handoff_missing" in report["warnings"]
+    assert report["quiet_gap_count"] == 2
+    assert report["has_quiet_gap_rollup_workorder"] is False
+
+
+def test_lifecycle_bucket_discovery_handoff_fails_when_sim_quiet_gap_rollup_missing():
+    discovery = {
+        "quiet_gap_summary": {
+            "quiet_gap_count": 1,
+            "rollup_required_count": 1,
+            "sim_live_connected_quiet_gap_count": 1,
+            "sim_live_connected_candidate_ids": ["lifecycle_flow:sim-probe"],
+        },
+        "surfaced_candidates": [],
+    }
+
+    report = mod._lifecycle_bucket_discovery_handoff_status(
+        discovery, {}, {}, {"orders": []}
+    )
+
+    assert report["status"] == "fail"
+    assert "lifecycle_quiet_gap_handoff_missing" in report["missing"]
+    assert report["sim_live_connected_quiet_gap_count"] == 1
+
+
+def test_lifecycle_bucket_discovery_handoff_passes_when_quiet_gap_rollup_exists():
+    discovery = {
+        "quiet_gap_summary": {"quiet_gap_count": 1, "rollup_required_count": 1},
+        "surfaced_candidates": [],
+    }
+    workorder = {
+        "orders": [{"order_id": "order_lifecycle_quiet_gap_parent_conflict_rollup"}]
+    }
+
+    report = mod._lifecycle_bucket_discovery_handoff_status(
+        discovery, {}, {}, workorder
+    )
+
+    assert report["status"] == "pass"
+    assert report["has_quiet_gap_rollup_workorder"] is True
+
+
+def test_lifecycle_bucket_discovery_handoff_warns_when_quiet_gap_rollup_is_partial():
+    discovery = {
+        "quiet_gap_summary": {
+            "quiet_gap_count": 2,
+            "rollup_required_count": 2,
+            "quiet_gap_type_counts": {
+                "parent_conflict_child": 1,
+                "ai_review_parsed_low_coverage": 1,
+            },
+        },
+        "surfaced_candidates": [],
+    }
+    workorder = {
+        "orders": [{"order_id": "order_lifecycle_quiet_gap_parent_conflict_rollup"}]
+    }
+
+    report = mod._lifecycle_bucket_discovery_handoff_status(
+        discovery, {}, {}, workorder
+    )
+
+    assert report["status"] == "warning"
+    assert report["missing_quiet_gap_workorder_order_ids"] == [
+        "order_lifecycle_quiet_gap_ai_review_coverage_rollup"
+    ]
+    assert report["has_quiet_gap_rollup_workorder"] is False
+
+
+def test_lifecycle_bucket_discovery_greenfield_bridge_exclusion_is_not_missing_family():
+    discovery = {
+        "summary": {
+            "source_contract_status": "pass",
+            "ai_two_pass_review_status": "parsed",
+        },
+        "surfaced_candidates": [
+            {
+                "bucket_id": "lifecycle_flow:combo:greenfield",
+                "stage": "lifecycle_flow",
+                "classification_state": "live_auto_apply_ready",
+                "live_auto_apply_family": "greenfield_real_environment_authority",
+            }
+        ],
+    }
+    bridge = {
+        "summary": {
+            "greenfield_policy_emit_state": "not_emitted_no_complete_lifecycle_flow"
+        }
+    }
+    runtime_summary = {"surfaced_candidate_ids": ["lifecycle_flow:combo:greenfield"]}
+
+    report = mod._lifecycle_bucket_discovery_handoff_status(
+        discovery, bridge, runtime_summary, {"orders": []}
+    )
+
+    assert report["status"] == "pass"
+    assert report["missing_bridge_families"] == []
+    assert report["explicit_bridge_exclusion_families"] == [
+        "greenfield_real_environment_authority"
+    ]
+
+
+def test_lifecycle_bucket_windows_status_fails_missing_enabled_windows(tmp_path):
+    paths = {}
+    for suffix in ("rolling5d", "rolling10d", "mtd"):
+        paths[f"lifecycle_decision_matrix_{suffix}"] = (
+            tmp_path / f"lifecycle_decision_matrix_2026-05-29_{suffix}.json"
+        )
+        paths[f"lifecycle_bucket_discovery_{suffix}"] = (
+            tmp_path / f"lifecycle_bucket_discovery_2026-05-29_{suffix}.json"
+        )
+
+    report = mod._lifecycle_bucket_windows_status(
+        paths=paths,
+        done_line="[DONE] threshold-cycle postclose target_date=2026-05-29 lifecycle_bucket_windows=true",
+        bridge_report={},
+        ev_report={},
+        runtime_summary={},
+    )
+
+    assert report["status"] == "fail"
+    assert (
+        "lifecycle_bucket_windows_marker_true_but_artifacts_missing"
+        in report["missing"]
+    )
+    assert "lifecycle_bucket_discovery_mtd_missing" in report["missing"]
+
+
+def test_lifecycle_bucket_windows_status_blocks_daily_only_authority(tmp_path):
+    paths = {}
+    for suffix in ("rolling5d", "rolling10d", "mtd"):
+        ldm = tmp_path / f"lifecycle_decision_matrix_2026-05-29_{suffix}.json"
+        discovery = tmp_path / f"lifecycle_bucket_discovery_2026-05-29_{suffix}.json"
+        ldm.write_text("{}", encoding="utf-8")
+        discovery.write_text(
+            json.dumps(
+                {
+                    "summary": {
+                        "source_contract_status": "pass",
+                        "parent_granularity_status": "target_pass",
+                        "parent_bucket_count": 36,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        paths[f"lifecycle_decision_matrix_{suffix}"] = ldm
+        paths[f"lifecycle_bucket_discovery_{suffix}"] = discovery
+
+    report = mod._lifecycle_bucket_windows_status(
+        paths=paths,
+        done_line="[DONE] threshold-cycle postclose target_date=2026-05-29 lifecycle_bucket_windows=true",
+        bridge_report={
+            "summary": {
+                "live_auto_apply_ready_count": 1,
+                "lifecycle_bucket_promotion_contract_passed": False,
+            }
+        },
+        ev_report={},
+        runtime_summary={},
+    )
+
+    assert report["status"] == "fail"
+    assert "runtime_apply_bridge_daily_only_live_authority" in report["missing"]
+
+
+def test_lifecycle_bucket_windows_status_warns_when_non_promotion_confirmation_window_is_too_broad(
+    tmp_path,
+):
+    paths = {}
+    for suffix, granularity in (
+        ("rolling5d", "too_broad"),
+        ("rolling10d", "target_pass"),
+        ("mtd", "target_pass"),
+    ):
+        ldm = tmp_path / f"lifecycle_decision_matrix_2026-05-29_{suffix}.json"
+        discovery = tmp_path / f"lifecycle_bucket_discovery_2026-05-29_{suffix}.json"
+        ldm.write_text("{}", encoding="utf-8")
+        discovery.write_text(
+            json.dumps(
+                {
+                    "summary": {
+                        "source_contract_status": "pass",
+                        "parent_granularity_status": granularity,
+                        "parent_bucket_count": 36,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        paths[f"lifecycle_decision_matrix_{suffix}"] = ldm
+        paths[f"lifecycle_bucket_discovery_{suffix}"] = discovery
+
+    report = mod._lifecycle_bucket_windows_status(
+        paths=paths,
+        done_line="[DONE] threshold-cycle postclose target_date=2026-05-29 lifecycle_bucket_windows=true",
+        bridge_report={"summary": {"lifecycle_bucket_promotion_contract_passed": True}},
+        ev_report={
+            "lifecycle_bucket_windows": {
+                "promotion_window": "mtd",
+                "confirmation_windows": ["rolling5d", "rolling10d"],
+            }
+        },
+        runtime_summary={},
+    )
+
+    assert report["status"] == "warning"
+    assert report["missing"] == []
+    assert (
+        "lifecycle_bucket_discovery_rolling5d_parent_granularity_not_target"
+        in report["warnings"]
+    )
+
+
+def test_lifecycle_bucket_windows_status_warns_when_all_confirmation_windows_are_immature_without_live_authority(
+    tmp_path,
+):
+    paths = {}
+    for suffix, granularity in (
+        ("rolling5d", "too_broad"),
+        ("rolling10d", "too_broad"),
+        ("mtd", "target_pass"),
+    ):
+        ldm = tmp_path / f"lifecycle_decision_matrix_2026-05-29_{suffix}.json"
+        discovery = tmp_path / f"lifecycle_bucket_discovery_2026-05-29_{suffix}.json"
+        ldm.write_text("{}", encoding="utf-8")
+        discovery.write_text(
+            json.dumps(
+                {
+                    "summary": {
+                        "source_contract_status": "pass",
+                        "parent_granularity_status": granularity,
+                        "parent_bucket_count": 18 if suffix == "rolling5d" else 27,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        paths[f"lifecycle_decision_matrix_{suffix}"] = ldm
+        paths[f"lifecycle_bucket_discovery_{suffix}"] = discovery
+
+    report = mod._lifecycle_bucket_windows_status(
+        paths=paths,
+        done_line=(
+            "[DONE] threshold-cycle postclose target_date=2026-05-29 "
+            "lifecycle_bucket_windows=true"
+        ),
+        bridge_report={
+            "summary": {
+                "live_auto_apply_ready_count": 0,
+                "lifecycle_bucket_promotion_contract_passed": True,
+            }
+        },
+        ev_report={
+            "lifecycle_bucket_windows": {
+                "promotion_window": "mtd",
+                "confirmation_windows": ["rolling5d", "rolling10d"],
+            }
+        },
+        runtime_summary={},
+    )
+
+    assert report["status"] == "warning"
+    assert report["missing"] == []
+    assert "lifecycle_bucket_confirmation_windows_not_target" in report["warnings"]
+
+
+def test_lifecycle_bucket_windows_status_fails_when_all_confirmation_windows_are_immature_with_live_authority(
+    tmp_path,
+):
+    paths = {}
+    for suffix, granularity in (
+        ("rolling5d", "too_broad"),
+        ("rolling10d", "too_broad"),
+        ("mtd", "target_pass"),
+    ):
+        ldm = tmp_path / f"lifecycle_decision_matrix_2026-05-29_{suffix}.json"
+        discovery = tmp_path / f"lifecycle_bucket_discovery_2026-05-29_{suffix}.json"
+        ldm.write_text("{}", encoding="utf-8")
+        discovery.write_text(
+            json.dumps(
+                {
+                    "summary": {
+                        "source_contract_status": "pass",
+                        "parent_granularity_status": granularity,
+                        "parent_bucket_count": 18 if suffix == "rolling5d" else 27,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        paths[f"lifecycle_decision_matrix_{suffix}"] = ldm
+        paths[f"lifecycle_bucket_discovery_{suffix}"] = discovery
+
+    report = mod._lifecycle_bucket_windows_status(
+        paths=paths,
+        done_line=(
+            "[DONE] threshold-cycle postclose target_date=2026-05-29 "
+            "lifecycle_bucket_windows=true"
+        ),
+        bridge_report={
+            "summary": {
+                "live_auto_apply_ready_count": 1,
+                "lifecycle_bucket_promotion_contract_passed": True,
+            }
+        },
+        ev_report={
+            "lifecycle_bucket_windows": {
+                "promotion_window": "mtd",
+                "confirmation_windows": ["rolling5d", "rolling10d"],
+            }
+        },
+        runtime_summary={},
+    )
+
+    assert report["status"] == "fail"
+    assert "lifecycle_bucket_confirmation_windows_not_target" in report["missing"]
+
+
+def test_lifecycle_bucket_windows_status_warns_promotion_granularity_without_live_authority(
+    tmp_path,
+):
+    paths = {}
+    for suffix, granularity in (
+        ("rolling5d", "target_pass"),
+        ("rolling10d", "target_pass"),
+        ("mtd", "too_broad"),
+    ):
+        ldm = tmp_path / f"lifecycle_decision_matrix_2026-05-29_{suffix}.json"
+        discovery = tmp_path / f"lifecycle_bucket_discovery_2026-05-29_{suffix}.json"
+        ldm.write_text("{}", encoding="utf-8")
+        discovery.write_text(
+            json.dumps(
+                {
+                    "summary": {
+                        "source_contract_status": "pass",
+                        "parent_granularity_status": granularity,
+                        "parent_bucket_count": 29 if suffix == "mtd" else 36,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        paths[f"lifecycle_decision_matrix_{suffix}"] = ldm
+        paths[f"lifecycle_bucket_discovery_{suffix}"] = discovery
+
+    report = mod._lifecycle_bucket_windows_status(
+        paths=paths,
+        done_line="[DONE] threshold-cycle postclose target_date=2026-05-29 lifecycle_bucket_windows=true",
+        bridge_report={
+            "summary": {
+                "live_auto_apply_ready_count": 0,
+                "lifecycle_bucket_promotion_contract_passed": False,
+            }
+        },
+        ev_report={
+            "lifecycle_bucket_windows": {
+                "promotion_window": "mtd",
+                "confirmation_windows": ["rolling5d", "rolling10d"],
+            }
+        },
+        runtime_summary={},
+    )
+
+    assert report["status"] == "warning"
+    assert report["missing"] == []
+    assert (
+        "lifecycle_bucket_discovery_mtd_parent_granularity_not_target"
+        in report["warnings"]
+    )
+
+
+def test_real_detail_primary_sample_book_counts_as_real_for_verifier():
+    assert mod._is_real_primary_sample_book("real")
+    assert mod._is_real_primary_sample_book("real_submit_post_submit_observed_low")
+    assert mod._is_real_primary_sample_book("real_submit_execution_shape")
+    assert not mod._is_real_primary_sample_book("sim_diagnostic")
+
+
+def test_lifecycle_bucket_windows_status_fails_promotion_granularity_when_live_authority_open(
+    tmp_path,
+):
+    paths = {}
+    for suffix, granularity in (
+        ("rolling5d", "target_pass"),
+        ("rolling10d", "target_pass"),
+        ("mtd", "too_broad"),
+    ):
+        ldm = tmp_path / f"lifecycle_decision_matrix_2026-05-29_{suffix}.json"
+        discovery = tmp_path / f"lifecycle_bucket_discovery_2026-05-29_{suffix}.json"
+        ldm.write_text("{}", encoding="utf-8")
+        discovery.write_text(
+            json.dumps(
+                {
+                    "summary": {
+                        "source_contract_status": "pass",
+                        "parent_granularity_status": granularity,
+                        "parent_bucket_count": 29 if suffix == "mtd" else 36,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        paths[f"lifecycle_decision_matrix_{suffix}"] = ldm
+        paths[f"lifecycle_bucket_discovery_{suffix}"] = discovery
+
+    report = mod._lifecycle_bucket_windows_status(
+        paths=paths,
+        done_line="[DONE] threshold-cycle postclose target_date=2026-05-29 lifecycle_bucket_windows=true",
+        bridge_report={
+            "summary": {
+                "live_auto_apply_ready_count": 1,
+                "lifecycle_bucket_promotion_contract_passed": True,
+            }
+        },
+        ev_report={
+            "lifecycle_bucket_windows": {
+                "promotion_window": "mtd",
+                "confirmation_windows": ["rolling5d", "rolling10d"],
+            }
+        },
+        runtime_summary={},
+    )
+
+    assert report["status"] == "fail"
+    assert (
+        "lifecycle_bucket_discovery_mtd_parent_granularity_not_target"
+        in report["missing"]
+    )
+
+
+def test_stage_hook_workorder_handoff_detects_missing_selected_order():
+    stage_hook = {
+        "status": "warning",
+        "summary": {"ai_two_pass_review_status": "parsed", "audit_status": "pass"},
+        "ai_two_pass_review": {
+            "provider": "openai",
+            "provider_status": {"provider": "openai", "status": "success"},
+        },
+        "context": {
+            "consumed_candidate_ids": ["producer_gap_sim_holding_runner_gap_missing"]
+        },
+        "code_improvement_orders": [
+            {
+                "order_id": "order_stage_hook_runner",
+                "stage_hook_priority": "high",
+                "stage_hook_candidate_contract": {
+                    "readiness_tier": "implementation_workorder_ready"
+                },
+            }
+        ],
+    }
+    producer_gap = {
+        "producer_gap_candidates": [
+            {
+                "candidate_id": "producer_gap_sim_holding_runner_gap_missing",
+                "pattern_type": "sim_holding_runner_gap_missing",
+            }
+        ]
+    }
+
+    report = mod._stage_hook_workorder_handoff_status(
+        stage_hook, producer_gap, {"orders": []}
+    )
+
+    assert report["status"] == "fail"
+    assert report["missing_workorder_order_ids"] == ["order_stage_hook_runner"]
+    assert "stage_hook_workorder_handoff_missing" in report["missing"]
+
+
+def test_stage_hook_workorder_handoff_allows_blocked_source_quality_without_order():
+    stage_hook = {
+        "status": "pass",
+        "summary": {"ai_two_pass_review_status": "parsed", "audit_status": "pass"},
+        "ai_two_pass_review": {
+            "provider": "openai",
+            "provider_status": {"provider": "openai", "status": "success"},
+        },
+        "context": {
+            "consumed_candidate_ids": [
+                "producer_gap_sim_source_quality_join_gap_missing"
+            ]
+        },
+        "code_improvement_orders": [],
+    }
+    producer_gap = {
+        "producer_gap_candidates": [
+            {
+                "candidate_id": "producer_gap_sim_source_quality_join_gap_missing",
+                "pattern_type": "sim_source_quality_join_gap_missing",
+            }
+        ]
+    }
+
+    report = mod._stage_hook_workorder_handoff_status(
+        stage_hook, producer_gap, {"orders": []}
+    )
+
+    assert report["status"] == "pass"
+    assert report["missing_workorder_order_ids"] == []
+
+
+def test_lifecycle_bucket_discovery_handoff_surfaces_ai_followup_without_fail():
+    discovery = {
+        "summary": {
+            "source_contract_status": "pass",
+            "ai_two_pass_review_status": "unavailable",
+        },
+        "warnings": ["ai_two_pass_review_unavailable_live_auto_deferred_to_post_apply"],
+        "surfaced_candidates": [
+            {
+                "bucket_id": "entry:combo:test",
+                "classification_state": "live_auto_apply_ready",
+                "live_auto_apply_family": "entry_wait6579_score66_69_recovery_gate_v1",
+                "ai_review_followup_required": "post_apply_verification",
+            }
+        ],
+    }
+    bridge = {"candidates": [{"family": "entry_wait6579_score66_69_recovery_gate_v1"}]}
+    runtime_summary = {"surfaced_candidate_ids": ["entry:combo:test"]}
+
+    report = mod._lifecycle_bucket_discovery_handoff_status(
+        discovery, bridge, runtime_summary, {"orders": []}
+    )
+
+    assert report["status"] == "pass"
+    assert report["ai_post_apply_followup_bucket_ids"] == ["entry:combo:test"]
+    assert (
+        "lifecycle_bucket_discovery_ai_post_apply_followup_required"
+        in report["warnings"]
+    )
+
+
+def test_lifecycle_bucket_discovery_handoff_fails_source_contract_fail():
+    discovery = {
+        "summary": {"source_contract_status": "fail"},
+        "surfaced_candidates": [],
+    }
+
+    report = mod._lifecycle_bucket_discovery_handoff_status(
+        discovery, {}, {}, {"orders": []}
+    )
+
+    assert report["status"] == "fail"
+    assert "lifecycle_bucket_discovery_source_contract_fail" in report["missing"]
+
+
+def test_lifecycle_bucket_discovery_handoff_warns_policy_key_required_missing():
+    discovery = {
+        "source_dimension_gap_summary": {
+            "missing_dimension_key_counts": {"policy_key": 5},
+            "policy_key_gap_classification_counts": {
+                "policy_key_required_missing": 3,
+                "policy_key_provided": 12,
+            },
+        },
+        "surfaced_candidates": [],
+    }
+
+    report = mod._lifecycle_bucket_discovery_handoff_status(
+        discovery, {}, {}, {"orders": []}
+    )
+
+    assert report["status"] == "warning"
+    assert (
+        "lifecycle_bucket_discovery_policy_key_required_missing" in report["warnings"]
+    )
+
+
+def test_lifecycle_bucket_discovery_handoff_warns_policy_key_missing_non_blocking_context():
+    discovery = {
+        "source_dimension_gap_summary": {
+            "missing_dimension_key_counts": {"policy_key": 8},
+            "policy_key_gap_classification_counts": {
+                "policy_key_not_required_context_row": 5,
+                "policy_key_not_applicable_matrix_missing": 3,
+            },
+        },
+        "surfaced_candidates": [],
+    }
+
+    report = mod._lifecycle_bucket_discovery_handoff_status(
+        discovery, {}, {}, {"orders": []}
+    )
+
+    assert report["status"] == "warning"
+    assert (
+        "lifecycle_bucket_discovery_policy_key_missing_non_blocking_context"
+        in report["warnings"]
+    )
+
+
+def test_lifecycle_bucket_discovery_handoff_warns_policy_key_missing_await_classification():
+    discovery = {
+        "source_dimension_gap_summary": {
+            "missing_dimension_key_counts": {"policy_key": 10},
+        },
+        "surfaced_candidates": [],
+    }
+
+    report = mod._lifecycle_bucket_discovery_handoff_status(
+        discovery, {}, {}, {"orders": []}
+    )
+
+    assert report["status"] == "warning"
+    assert (
+        "lifecycle_bucket_discovery_policy_key_missing_await_classification"
+        in report["warnings"]
+    )
+
+
+def test_warning_followup_summary_breaks_down_postclose_warning_priorities():
+    summary = mod._warning_followup_summary(
+        buy_funnel_submit_drought_handoff={
+            "status": "pass",
+            "critical": True,
+            "primary": "SUBMIT_DROUGHT_CRITICAL",
+            "matches": ["SUBMIT_DROUGHT_CRITICAL"],
+            "missing": [],
+        },
+        scalp_entry_adm={
+            "summary": {
+                "status": "warning",
+                "warnings": ["unknown_bucket_source_quality_gap"],
+                "unknown_bucket_summary": {
+                    "affected_rows": 255,
+                    "dimension_counts": {"score_bucket": 255},
+                    "recommended_route": "source_quality_workorder",
+                    "not_available_route": "field_legitimately_unavailable_no_workorder",
+                },
+                "adm_bucket_lookup_status_counts": {
+                    "new_or_unseen_token_vs_prior_adm": 386,
+                    "matched_prior_bucket": 373,
+                },
+            }
+        },
+        currentness_audit={"status": "pass", "summary": {"fail_count": 0}},
+        pattern_lab_ai_review={"status": "pass", "summary": {"workorder_count": 0}},
+        discovery_report={
+            "summary": {
+                "live_auto_apply_ready_count": 0,
+                "state_counts": {"source_only_keep_collecting": 401},
+                "source_bucket_kind_counts": {"source_only_observation": 335},
+                "source_contract_status": "warning",
+                "source_contract_change_count": 11,
+                "ai_two_pass_review_status": "parsed",
+            }
+        },
+        runtime_apply_gap_audit={
+            "summary": {
+                "derived_review_category_counts": {"source_quality_blocker": 536},
+                "positive_edge_source_quality_pass_count": 24,
+                "bridge_blocker_ledger_count": 200,
+                "runtime_uptake_rate_pct": 0.0,
+            }
+        },
+        lifecycle_bucket_discovery_handoff={
+            "warnings": ["lifecycle_bucket_discovery_source_contract_warning"]
+        },
+    )
+
+    items = {item["topic"]: item for item in summary["items"]}
+    assert summary["status"] == "warning"
+    assert summary["runtime_effect"] is False
+    assert summary["allowed_runtime_apply"] is False
+    assert items["submit_drought"]["decision"] == "pass_handoff_closed"
+    assert items["scalp_entry_adm_unknown_bucket_source_quality_gap"]["decision"] == (
+        "source_quality_followup_required"
+    )
+    assert (
+        items["pattern_lab_warning"]["decision"] == "pass_no_current_handoff_workorder"
+    )
+    assert (
+        items["live_auto_ready_zero_breakdown"]["decision"]
+        == "warning_explained_no_live_auto_ready"
+    )
+    assert items["live_auto_ready_zero_breakdown"]["evidence"][
+        "runtime_gap_categories"
+    ] == {"source_quality_blocker": 536}
+
+
+def test_warning_followup_unknown_bucket_pass_has_no_stale_repair_instruction():
+    summary = mod._warning_followup_summary(
+        buy_funnel_submit_drought_handoff={"status": "pass", "critical": False},
+        scalp_entry_adm={
+            "summary": {
+                "status": "pass",
+                "warnings": [],
+                "unknown_bucket_summary": {
+                    "affected_rows": 3,
+                    "recommended_route": "classified_not_applicable_no_workorder",
+                    "unknown_root_cause_counts": {
+                        "risk_context_bucket:post_submit_or_exit_not_required": 3
+                    },
+                },
+            }
+        },
+        currentness_audit={"status": "pass", "summary": {}},
+        pattern_lab_ai_review={"status": "pass", "summary": {}},
+        discovery_report={"summary": {"live_auto_apply_ready_count": 1}},
+        runtime_apply_gap_audit={"summary": {}},
+        lifecycle_bucket_discovery_handoff={"warnings": []},
+    )
+
+    item = next(
+        row
+        for row in summary["items"]
+        if row["topic"] == "scalp_entry_adm_unknown_bucket_source_quality_gap"
+    )
+    assert item["decision"] == "pass_no_unknown_bucket_warning"
+    assert item["next_action"].startswith("No actionable unknown bucket remains")
+    assert "Prioritize source score" not in item["next_action"]
+
+
+def test_submit_bucket_handoff_status_detects_downstream_drops():
+    ldm = {
+        "submit_bucket_attribution": {
+            "runtime_approval_candidates": [
+                {
+                    "candidate_id": "submit_bucket_1",
+                    "bucket_type": "revalidation_state",
+                    "bucket_key": "ok",
+                }
+            ],
+            "code_improvement_workorders": [
+                {
+                    "bucket_type": "broker_receipt_contract_gap",
+                    "bucket_key": "broker_receipt_or_real_submit_flag_missing",
+                }
+            ],
+        }
+    }
+
+    report = mod._submit_bucket_handoff_status(ldm, {}, {}, {"orders": []})
+
+    assert report["status"] == "fail"
+    assert report["missing_ev_candidate_ids"] == ["submit_bucket_1"]
+    assert report["missing_runtime_summary_candidate_ids"] == ["submit_bucket_1"]
+    assert report["missing_workorder_order_ids"] == [
+        "order_lifecycle_submit_bucket_broker_receipt_contract_gap_broker_receipt_or_real_submit_flag_missing"
+    ]
+
+
+def test_submit_bucket_handoff_preserves_named_entry_contract_order_ids():
+    ldm = {
+        "submit_bucket_attribution": {
+            "code_improvement_workorders": [
+                {
+                    "workorder_id": "order_entry_broker_receipt_contract_gap_review",
+                    "bucket_type": "broker_receipt_contract_gap",
+                    "bucket_key": "broker_receipt_or_real_submit_flag_missing",
+                }
+            ],
+        }
+    }
+
+    report = mod._submit_bucket_handoff_status(ldm, {}, {}, {"orders": []})
+
+    assert report["missing_workorder_order_ids"] == [
+        "order_entry_broker_receipt_contract_gap_review"
+    ]
+
+
+def test_stage_only_holding_bucket_handoff_detects_runtime_candidates_and_drops():
+    workorder = {
+        "workorder_id": "holding_bucket_source_quality_1",
+        "bucket_type": "combo_holding_flow",
+        "bucket_key": "source=sim|action=HOLD|profit=profit_unknown|held=held_unknown",
+    }
+    ldm = {
+        "holding_bucket_attribution": {
+            "summary": {"bucket_count": 1, "workorder_count": 1},
+            "runtime_approval_candidates": [{"candidate_id": "forbidden"}],
+            "code_improvement_workorders": [workorder],
+        }
+    }
+    ev = {
+        "lifecycle_decision_matrix": {"holding_bucket_code_improvement_workorders": []}
+    }
+    runtime = {
+        "lifecycle_decision_matrix": {"holding_bucket_code_improvement_workorders": []}
+    }
+
+    report = mod._stage_only_bucket_handoff_status(
+        ldm, ev, runtime, {"orders": []}, stage="holding"
+    )
+
+    assert report["status"] == "fail"
+    assert "holding_stage_only_runtime_candidates_forbidden" in report["missing"]
+    assert "threshold_cycle_ev_holding_bucket_count_missing" in report["missing"]
+    assert "runtime_approval_summary_holding_bucket_count_missing" in report["missing"]
+    assert "threshold_cycle_ev_holding_bucket_workorders_missing" in report["missing"]
+    assert (
+        "runtime_approval_summary_holding_bucket_workorders_missing"
+        in report["missing"]
+    )
+    assert report["missing_workorder_order_ids"] == [
+        mod._stage_bucket_order_id("holding", workorder)
+    ]
+
+
+def test_stage_only_holding_bucket_handoff_passes_when_counts_and_orders_propagate():
+    workorder = {
+        "workorder_id": "holding_bucket_source_quality_1",
+        "bucket_type": "combo_holding_flow",
+        "bucket_key": "source=sim|action=HOLD|profit=profit_unknown|held=held_unknown",
+    }
+    order_id = mod._stage_bucket_order_id("holding", workorder)
+    ldm = {
+        "holding_bucket_attribution": {
+            "summary": {"bucket_count": 1, "workorder_count": 1},
+            "runtime_approval_candidates": [],
+            "code_improvement_workorders": [workorder],
+        }
+    }
+    ev = {
+        "lifecycle_decision_matrix": {
+            "holding_bucket_count": 1,
+            "holding_bucket_workorder_count": 1,
+            "holding_bucket_code_improvement_workorders": [workorder],
+        }
+    }
+    runtime = {
+        "lifecycle_decision_matrix": {
+            "holding_bucket_count": 1,
+            "holding_bucket_workorder_count": 1,
+            "holding_bucket_code_improvement_workorders": [workorder],
+        }
+    }
+
+    report = mod._stage_only_bucket_handoff_status(
+        ldm,
+        ev,
+        runtime,
+        {"orders": [{"order_id": order_id}]},
+        stage="holding",
+    )
+
+    assert report["status"] == "pass"
+    assert report["missing"] == []
+
+
+def test_lifecycle_flow_handoff_fails_when_complete_flow_absent():
+    ldm = {
+        "lifecycle_flow_bucket_attribution": {
+            "summary": {
+                "flow_count": 4,
+                "complete_flow_count": 0,
+                "direct_sim_record_complete_flow_count": 0,
+                "adm_bridge_complete_flow_count": 0,
+                "fallback_complete_flow_count": 0,
+                "incomplete_flow_count": 4,
+                "complete_flow_rate": 0.0,
+                "join_contract_blocked": True,
+                "bundle_ev_tuning_state": "blocked_join_gap",
+                "top_incomplete_reason": "identity_namespace_mismatch",
+            },
+            "runtime_approval_candidates": [],
+            "code_improvement_workorders": [],
+        }
+    }
+
+    report = mod._lifecycle_flow_bucket_handoff_status(ldm, {}, {}, {"orders": []})
+
+    assert report["status"] == "fail"
+    assert "lifecycle_complete_flow_absent" in report["missing"]
+    assert "lifecycle_join_contract_blocked" in report["missing"]
+    assert report["bundle_ev_tuning_state"] == "blocked_join_gap"
+    assert report["direct_sim_record_complete_flow_count"] == 0
+    assert report["adm_bridge_complete_flow_count"] == 0
+
+
+def test_lifecycle_flow_handoff_warns_when_source_gap_workorder_is_handed_off():
+    workorder = {
+        "lifecycle_flow_bucket_id": "flow:incomplete",
+    }
+    order_id = mod._lifecycle_flow_bucket_order_id(workorder)
+    ldm = {
+        "lifecycle_flow_bucket_attribution": {
+            "summary": {
+                "flow_count": 4,
+                "complete_flow_count": 0,
+                "incomplete_flow_count": 4,
+                "join_contract_blocked": True,
+                "bundle_ev_tuning_state": "blocked_join_gap",
+            },
+            "runtime_approval_candidates": [],
+            "code_improvement_workorders": [workorder],
+        }
+    }
+
+    report = mod._lifecycle_flow_bucket_handoff_status(
+        ldm,
+        {},
+        {},
+        {"orders": [{"order_id": order_id}]},
+    )
+
+    assert report["status"] == "warning"
+    assert report["missing"] == [
+        "lifecycle_complete_flow_absent",
+        "lifecycle_join_contract_blocked",
+    ]
+    assert report["warnings"] == [
+        "lifecycle_complete_flow_absent_workorder_handoff",
+        "lifecycle_join_contract_blocked_workorder_handoff",
+    ]
+
+
+def test_lifecycle_flow_handoff_warns_only_for_present_source_gap():
+    workorder = {
+        "lifecycle_flow_bucket_id": "flow:incomplete",
+    }
+    order_id = mod._lifecycle_flow_bucket_order_id(workorder)
+    ldm = {
+        "lifecycle_flow_bucket_attribution": {
+            "summary": {
+                "flow_count": 4,
+                "complete_flow_count": 0,
+                "incomplete_flow_count": 4,
+                "join_contract_blocked": False,
+                "bundle_ev_tuning_state": "hold_sample",
+            },
+            "runtime_approval_candidates": [],
+            "code_improvement_workorders": [workorder],
+        }
+    }
+
+    report = mod._lifecycle_flow_bucket_handoff_status(
+        ldm,
+        {},
+        {},
+        {"orders": [{"order_id": order_id}]},
+    )
+
+    assert report["status"] == "warning"
+    assert report["missing"] == ["lifecycle_complete_flow_absent"]
+    assert report["warnings"] == ["lifecycle_complete_flow_absent_workorder_handoff"]
+
+
+def test_lifecycle_flow_handoff_keeps_adm_bridge_direct_zero_closure_fields():
+    ldm = {
+        "lifecycle_flow_bucket_attribution": {
+            "summary": {
+                "flow_count": 4,
+                "complete_flow_count": 1,
+                "direct_sim_record_complete_flow_count": 0,
+                "adm_bridge_complete_flow_count": 1,
+                "fallback_complete_flow_count": 0,
+                "incomplete_flow_count": 3,
+                "complete_flow_rate": 0.25,
+                "join_contract_blocked": False,
+                "direct_flow_zero_reason": "no_direct_complete_but_adm_bridge_complete",
+                "direct_flow_zero_closure_status": "closed_by_adm_bridge_complete",
+                "direct_flow_zero_followup_required": False,
+            },
+            "runtime_approval_candidates": [],
+            "code_improvement_workorders": [],
+        }
+    }
+
+    report = mod._lifecycle_flow_bucket_handoff_status(ldm, {}, {}, {"orders": []})
+
+    assert report["status"] == "pass"
+    assert report["direct_sim_record_complete_flow_count"] == 0
+    assert report["adm_bridge_complete_flow_count"] == 1
+    assert (
+        report["direct_flow_zero_reason"]
+        == "no_direct_complete_but_adm_bridge_complete"
+    )
+    assert report["direct_flow_zero_closure_status"] == "closed_by_adm_bridge_complete"
+    assert report["direct_flow_zero_followup_required"] is False
+
+
+def test_buy_funnel_submit_drought_handoff_fails_when_downstream_missing():
+    buy = {
+        "classification": {
+            "primary": "SUBMIT_DROUGHT_CRITICAL",
+            "matches": ["SUBMIT_DROUGHT_CRITICAL"],
+        }
+    }
+
+    report = mod._buy_funnel_submit_drought_handoff_status(
+        buy, {}, {}, {}, {"orders": []}
+    )
+
+    assert report["status"] == "fail"
+    assert report["critical"] is True
+    assert (
+        "code_improvement_workorder_entry_submit_drought_orders_missing"
+        in report["missing"]
+    )
+    assert (
+        "order_entry_submit_drought_auto_resolution"
+        in report["missing_workorder_order_ids"]
+    )
+    assert (
+        "order_entry_broker_receipt_contract_gap_review"
+        in report["missing_workorder_order_ids"]
+    )
+    assert "ldm_submit_bucket_attribution_missing" in report["missing"]
+
+
+def test_buy_funnel_submit_drought_handoff_warns_when_handoff_exists_but_downstream_missing():
+    buy = {
+        "classification": {
+            "primary": "SUBMIT_DROUGHT_CRITICAL",
+            "matches": ["SUBMIT_DROUGHT_CRITICAL"],
+        },
+        "entry_submit_drought_contract": {"critical": True},
+        "followup": {"route": "entry_submit_drought_auto_workorder"},
+    }
+
+    report = mod._buy_funnel_submit_drought_handoff_status(
+        buy, {}, {}, {}, {"orders": []}
+    )
+
+    assert report["status"] == "warning"
+    assert report["handoff_status"] == "pass"
+    assert report["downstream_closure_status"] == "fail"
+    assert (
+        "code_improvement_workorder_entry_submit_drought_orders_missing"
+        in report["missing"]
+    )
+    assert "ldm_submit_bucket_attribution_missing" in report["missing"]
+
+
+def test_buy_funnel_submit_drought_handoff_passes_when_surfaced():
+    buy = {
+        "classification": {
+            "primary": "SUBMIT_DROUGHT_CRITICAL",
+            "matches": ["SUBMIT_DROUGHT_CRITICAL"],
+            "submit_drought_root_cause": {
+                "latency_root_cause_counts": {"unknown_latency_reason": 11},
+                "unknown_latency_reason_count": 11,
+                "unknown_latency_workorder_required": True,
+            },
+        },
+        "entry_submit_drought_contract": {"critical": True},
+        "followup": {"route": "entry_submit_drought_auto_workorder"},
+    }
+    ldm = {"submit_bucket_attribution": {"summary": {"submit_rows": 3}}}
+    ev_report = {
+        "buy_funnel_sentinel": {"primary": "SUBMIT_DROUGHT_CRITICAL"},
+        "entry_funnel": {"entry_submit_drought_handoff_selected": True},
+    }
+    runtime_summary = {
+        "buy_funnel_sentinel": {"primary": "SUBMIT_DROUGHT_CRITICAL"},
+        "summary": {"entry_submit_drought_handoff_selected": True},
+    }
+    workorder = {
+        "orders": [
+            {"order_id": "order_entry_submit_drought_auto_resolution"},
+            {"order_id": "order_entry_post_submit_contract_gap_review"},
+            {"order_id": "order_entry_broker_receipt_contract_gap_review"},
+            {"order_id": "order_entry_fill_quality_contract_gap_review"},
+            {"order_id": "order_entry_telegram_post_submit_contract_gap_review"},
+            {"order_id": "order_entry_source_taxonomy_contract_gap_review"},
+        ]
+    }
+
+    report = mod._buy_funnel_submit_drought_handoff_status(
+        buy, ldm, ev_report, runtime_summary, workorder
+    )
+
+    assert report["status"] == "pass"
+    assert report["missing"] == []
+    assert report["handoff_status"] == "pass"
+    assert report["downstream_closure_status"] == "pass"
+    assert report["unresolved_root_cause_present"] is True
+    assert report["submit_drought_unknown_latency_reason_count"] == 11
+
+
+def test_buy_funnel_submit_drought_handoff_warns_when_quote_freshness_attribution_missing():
+    buy = {
+        "classification": {
+            "primary": "SUBMIT_DROUGHT_CRITICAL",
+            "matches": ["SUBMIT_DROUGHT_CRITICAL"],
+            "submit_drought_root_cause": {
+                "latency_root_cause_counts": {"quote_stale": 4},
+                "quote_freshness_attribution": {
+                    "refresh_attempted_count": 4,
+                    "refresh_applied_count": 0,
+                    "refresh_subreason_counts": {"ws_snapshot_refresh_failed_stale": 4},
+                },
+            },
+        },
+        "entry_submit_drought_contract": {"critical": True},
+        "followup": {"route": "entry_submit_drought_auto_workorder"},
+    }
+    ldm = {"submit_bucket_attribution": {"summary": {"submit_rows": 3}}}
+    ev_report = {
+        "buy_funnel_sentinel": {"primary": "SUBMIT_DROUGHT_CRITICAL"},
+        "entry_funnel": {"entry_submit_drought_handoff_selected": True},
+    }
+    runtime_summary = {
+        "buy_funnel_sentinel": {"primary": "SUBMIT_DROUGHT_CRITICAL"},
+        "summary": {"entry_submit_drought_handoff_selected": True},
+    }
+    workorder = {
+        "orders": [
+            {"order_id": "order_entry_submit_drought_auto_resolution"},
+            {"order_id": "order_entry_post_submit_contract_gap_review"},
+            {"order_id": "order_entry_broker_receipt_contract_gap_review"},
+            {"order_id": "order_entry_fill_quality_contract_gap_review"},
+            {"order_id": "order_entry_telegram_post_submit_contract_gap_review"},
+            {"order_id": "order_entry_source_taxonomy_contract_gap_review"},
+        ]
+    }
+
+    report = mod._buy_funnel_submit_drought_handoff_status(
+        buy, ldm, ev_report, runtime_summary, workorder
+    )
+
+    assert report["status"] == "warning"
+    assert report["handoff_status"] == "pass"
+    assert report["downstream_closure_status"] == "fail"
+    assert "ldm_submit_quote_freshness_attribution_missing" in report["missing"]
+    assert report["submit_drought_refresh_attempted_count"] == 4
+    assert report["ldm_submit_quote_freshness_attribution_present"] is False
+
+
+def test_code_improvement_workorder_contract_status_verifies_declared_contract():
+    report = mod._code_improvement_workorder_contract_status(
+        {
+            "summary": {
+                "duplicate_order_warnings": [],
+                "root_cause_followup_contract_required_count": 1,
+                "root_cause_followup_contract_complete_count": 1,
+                "root_cause_followup_contract_missing_order_ids": [],
+            },
+            "orders": [
+                {
+                    "order_id": "order_open",
+                    "root_cause_closure_status": "handoff_closed_root_cause_open",
+                    "root_cause_followup_contract": {
+                        "root_cause_signal": "conversion_lane:submit_drought:open",
+                        "acceptance_test": "new artifact closes the blocker",
+                        "next_repair_action": "collect the next trading-day sample",
+                        "closure_requires_new_evidence": True,
+                        "implementation_only_closure_allowed": False,
+                    },
+                }
+            ],
+        },
+        target_date="2026-07-31",
+    )
+
+    assert report["status"] == "pass"
+    assert report["contract_state"] == "declared_and_verified"
+    assert report["issues"] == []
+    assert report["root_cause_followup_contract_complete_count"] == 1
+
+
+def test_code_improvement_workorder_contract_status_fails_collision_and_gap():
+    report = mod._code_improvement_workorder_contract_status(
+        {
+            "summary": {
+                "duplicate_order_warnings": ["duplicate_order_id=order_open"],
+                "root_cause_followup_contract_required_count": 1,
+                "root_cause_followup_contract_complete_count": 1,
+                "root_cause_followup_contract_missing_order_ids": [],
+            },
+            "orders": [
+                {
+                    "order_id": "order_open",
+                    "root_cause_closure_status": "handoff_closed_root_cause_open",
+                    "root_cause_followup_contract": None,
+                },
+                {"order_id": "order_open"},
+            ],
+        },
+        target_date="2026-07-31",
+    )
+
+    assert report["status"] == "fail"
+    assert report["duplicate_order_ids"] == ["order_open"]
+    assert report["root_cause_followup_contract_missing_order_ids"] == ["order_open"]
+    assert set(report["issues"]) == {
+        "code_improvement_workorder_duplicate_order_id_present",
+        "code_improvement_workorder_duplicate_order_warning_present",
+        "code_improvement_workorder_root_cause_complete_count_mismatch",
+        "code_improvement_workorder_root_cause_followup_contract_incomplete",
+        "code_improvement_workorder_root_cause_missing_ids_mismatch",
+    }
+
+
+def test_code_improvement_workorder_contract_status_keeps_legacy_compatible():
+    report = mod._code_improvement_workorder_contract_status(
+        {"summary": {}, "orders": [{"order_id": "legacy_order"}]},
+        target_date="2026-05-12",
+    )
+
+    assert report["status"] == "pass"
+    assert report["contract_state"] == "legacy_not_declared"
+
+
+def test_code_improvement_workorder_contract_status_requires_new_declaration():
+    report = mod._code_improvement_workorder_contract_status(
+        {"summary": {}, "orders": [{"order_id": "new_order"}]},
+        target_date="2026-07-31",
+    )
+
+    assert report["status"] == "fail"
+    assert report["contract_state"] == "required_but_missing"
+    assert report["issues"] == [
+        "code_improvement_workorder_root_cause_followup_contract_not_declared"
+    ]
+
+
+def test_buy_funnel_submit_drought_handoff_closes_when_root_cause_is_fully_decomposed():
+    buy = {
+        "classification": {
+            "primary": "SUBMIT_DROUGHT_CRITICAL",
+            "matches": ["SUBMIT_DROUGHT_CRITICAL"],
+            "submit_drought_root_cause": {
+                "latency_root_cause_counts": {
+                    "quote_stale": 10,
+                    "spread_or_slippage_guard": 5,
+                    "observer_unhealthy": 2,
+                },
+                "unknown_latency_reason_count": 0,
+                "unknown_latency_workorder_required": False,
+                "quote_freshness_attribution": {
+                    "refresh_attempted_count": 7,
+                    "refresh_applied_count": 5,
+                    "latency_pass_recovered_count": 2,
+                },
+            },
+        },
+        "entry_submit_drought_contract": {"critical": True},
+        "followup": {"route": "entry_submit_drought_auto_workorder"},
+    }
+    ldm = {
+        "submit_bucket_attribution": {
+            "summary": {
+                "submit_rows": 3,
+                "quote_freshness_attribution_present": True,
+            }
+        }
+    }
+    ev_report = {
+        "buy_funnel_sentinel": {"primary": "SUBMIT_DROUGHT_CRITICAL"},
+        "entry_funnel": {"entry_submit_drought_handoff_selected": True},
+    }
+    runtime_summary = {
+        "buy_funnel_sentinel": {"primary": "SUBMIT_DROUGHT_CRITICAL"},
+        "summary": {"entry_submit_drought_handoff_selected": True},
+    }
+    workorder = {
+        "orders": [
+            {"order_id": "order_entry_submit_drought_auto_resolution"},
+            {"order_id": "order_entry_post_submit_contract_gap_review"},
+            {"order_id": "order_entry_broker_receipt_contract_gap_review"},
+            {"order_id": "order_entry_fill_quality_contract_gap_review"},
+            {"order_id": "order_entry_telegram_post_submit_contract_gap_review"},
+            {"order_id": "order_entry_source_taxonomy_contract_gap_review"},
+        ]
+    }
+
+    report = mod._buy_funnel_submit_drought_handoff_status(
+        buy, ldm, ev_report, runtime_summary, workorder
+    )
+
+    assert report["status"] == "pass"
+    assert report["handoff_status"] == "pass"
+    assert report["downstream_closure_status"] == "pass"
+    assert report["root_cause_closure_status"] == "closed"
+    assert report["root_cause_open_reasons"] == []
+    assert report["submit_drought_unknown_latency_reason_count"] == 0
+
+
+def test_buy_funnel_submit_drought_handoff_marks_artifact_regeneration_required_on_inconsistent_counts():
+    buy = {
+        "classification": {
+            "primary": "SUBMIT_DROUGHT_CRITICAL",
+            "matches": ["SUBMIT_DROUGHT_CRITICAL"],
+            "submit_drought_root_cause": {
+                "latency_root_cause_counts": {"quote_stale": 7},
+                "quote_freshness_attribution": {
+                    "refresh_attempted_count": 0,
+                    "refresh_applied_count": 0,
+                    "latency_pass_recovered_count": 2,
+                },
+            },
+        },
+        "entry_submit_drought_contract": {"critical": True},
+        "followup": {"route": "entry_submit_drought_auto_workorder"},
+    }
+    ldm = {"submit_bucket_attribution": {"summary": {"submit_rows": 3}}}
+    ev_report = {
+        "buy_funnel_sentinel": {"primary": "SUBMIT_DROUGHT_CRITICAL"},
+        "entry_funnel": {"entry_submit_drought_handoff_selected": True},
+    }
+    runtime_summary = {
+        "buy_funnel_sentinel": {"primary": "SUBMIT_DROUGHT_CRITICAL"},
+        "summary": {"entry_submit_drought_handoff_selected": True},
+    }
+    workorder = {
+        "orders": [
+            {"order_id": "order_entry_submit_drought_auto_resolution"},
+            {"order_id": "order_entry_post_submit_contract_gap_review"},
+            {"order_id": "order_entry_broker_receipt_contract_gap_review"},
+            {"order_id": "order_entry_fill_quality_contract_gap_review"},
+            {"order_id": "order_entry_telegram_post_submit_contract_gap_review"},
+            {"order_id": "order_entry_source_taxonomy_contract_gap_review"},
+        ]
+    }
+
+    report = mod._buy_funnel_submit_drought_handoff_status(
+        buy, ldm, ev_report, runtime_summary, workorder
+    )
+
+    assert report["status"] == "pass"
+    assert report["handoff_status"] == "pass"
+    assert report["root_cause_closure_status"] == "artifact_regeneration_required"
+    assert report["artifact_regeneration_required"] is True
+    assert report["quote_freshness_attribution_inconsistent"] is True
+
+
+def test_buy_funnel_submit_drought_handoff_surfaces_post_submit_join_gap():
+    buy = {
+        "classification": {
+            "primary": "SUBMIT_DROUGHT_CRITICAL",
+            "matches": ["SUBMIT_DROUGHT_CRITICAL"],
+        }
+    }
+    ldm = {
+        "submit_bucket_attribution": {
+            "summary": {
+                "submit_rows": 41,
+                "real_submitted_row_count": 17,
+                "missing_broker_order_key_count": 17,
+                "missing_broker_order_key_rate": 1.0,
+                "post_submit_provenance_join_gap": True,
+            }
+        }
+    }
+    ev_report = {
+        "buy_funnel_sentinel": {"primary": "SUBMIT_DROUGHT_CRITICAL"},
+        "entry_funnel": {"entry_submit_drought_handoff_selected": True},
+    }
+    runtime_summary = {
+        "buy_funnel_sentinel": {"primary": "SUBMIT_DROUGHT_CRITICAL"},
+        "summary": {"entry_submit_drought_handoff_selected": True},
+    }
+    workorder = {
+        "orders": [
+            {"order_id": "order_entry_submit_drought_auto_resolution"},
+            {"order_id": "order_entry_post_submit_contract_gap_review"},
+            {"order_id": "order_entry_broker_receipt_contract_gap_review"},
+            {"order_id": "order_entry_fill_quality_contract_gap_review"},
+            {"order_id": "order_entry_telegram_post_submit_contract_gap_review"},
+            {"order_id": "order_entry_source_taxonomy_contract_gap_review"},
+        ]
+    }
+
+    report = mod._buy_funnel_submit_drought_handoff_status(
+        buy, ldm, ev_report, runtime_summary, workorder
+    )
+
+    assert report["status"] == "pass"
+    assert report["ldm_submit_real_submitted_row_count"] == 17
+    assert report["ldm_submit_missing_broker_order_key_count"] == 17
+    assert report["ldm_submit_missing_broker_order_key_rate"] == 1.0
+    assert report["ldm_submit_post_submit_provenance_join_gap"] is True
+
+
+def test_warning_followup_submit_drought_reports_join_gap():
+    summary = mod._warning_followup_summary(
+        buy_funnel_submit_drought_handoff={
+            "status": "pass",
+            "critical": True,
+            "primary": "SUBMIT_DROUGHT_CRITICAL",
+            "matches": ["SUBMIT_DROUGHT_CRITICAL"],
+            "missing": [],
+            "ldm_submit_real_submitted_row_count": 17,
+            "ldm_submit_missing_broker_order_key_count": 17,
+            "ldm_submit_missing_broker_order_key_rate": 1.0,
+            "ldm_submit_post_submit_provenance_join_gap": True,
+        },
+        scalp_entry_adm={},
+        currentness_audit={},
+        pattern_lab_ai_review={},
+        discovery_report={},
+        runtime_apply_gap_audit={},
+        lifecycle_bucket_discovery_handoff={},
+    )
+
+    submit_item = summary["items"][0]
+
+    assert summary["status"] == "warning"
+    assert submit_item["decision"] == "post_submit_provenance_join_gap_open"
+    assert submit_item["evidence"]["ldm_submit_missing_broker_order_key_count"] == 17
+    assert "broker_order_no" in submit_item["next_action"]
+
+
+def test_warning_followup_submit_drought_reports_exact_bot_history_resolution():
+    summary = mod._warning_followup_summary(
+        buy_funnel_submit_drought_handoff={
+            "status": "pass",
+            "critical": True,
+            "primary": "SUBMIT_DROUGHT_CRITICAL",
+            "matches": ["SUBMIT_DROUGHT_CRITICAL"],
+            "missing": [],
+            "ldm_submit_real_submitted_row_count": 17,
+            "ldm_submit_missing_broker_order_key_count": 17,
+            "ldm_submit_missing_broker_order_key_rate": 1.0,
+            "ldm_submit_post_submit_provenance_join_gap_raw": True,
+            "ldm_submit_post_submit_provenance_join_gap": False,
+            "ldm_submit_bot_history_backfill_candidate_count": 17,
+            "ldm_submit_bot_history_backfill_full_coverage": True,
+            "ldm_submit_bot_history_exact_mapping_count": 17,
+            "ldm_submit_bot_history_exact_mapping_full_coverage": True,
+            "ldm_submit_post_submit_provenance_join_resolution": (
+                "resolved_by_exact_bot_history_submit_time_mapping"
+            ),
+        },
+        scalp_entry_adm={},
+        currentness_audit={},
+        pattern_lab_ai_review={},
+        discovery_report={},
+        runtime_apply_gap_audit={},
+        lifecycle_bucket_discovery_handoff={},
+    )
+
+    submit_item = summary["items"][0]
+
+    assert summary["status"] == "pass"
+    assert (
+        submit_item["decision"]
+        == "post_submit_provenance_join_gap_resolved_by_bot_history"
+    )
+    assert submit_item["evidence"]["ldm_submit_bot_history_exact_mapping_count"] == 17
+    assert "Exact same-stock" in submit_item["next_action"]
+
+
+def test_producer_gap_discovery_handoff_fails_ai_review_or_missing_workorder():
+    producer_gap = {
+        "status": "fail",
+        "summary": {
+            "ai_two_pass_review_status": "parse_rejected",
+            "audit_status": "correction_required",
+            "candidate_count": 1,
+            "workorder_count": 1,
+        },
+        "code_improvement_orders": [
+            {
+                "order_id": "order_producer_gap_discovery_time_window_policy_exception",
+                "producer_gap_priority": "high",
+            }
+        ],
+    }
+
+    report = mod._producer_gap_discovery_handoff_status(producer_gap, {"orders": []})
+
+    assert report["status"] == "fail"
+    assert "producer_gap_discovery_ai_review_failed" in report["missing"]
+    assert "producer_gap_discovery_ai_review_not_parsed" in report["missing"]
+    assert "producer_gap_discovery_ai_audit_not_pass" in report["missing"]
+    assert "code_improvement_workorder_producer_gap_orders_missing" in report["missing"]
+    assert report["missing_workorder_order_ids"] == [
+        "order_producer_gap_discovery_time_window_policy_exception"
+    ]
+
+
+def test_producer_gap_discovery_handoff_passes_when_ai_and_workorder_close():
+    producer_gap = {
+        "status": "warning",
+        "summary": {
+            "ai_two_pass_review_status": "parsed",
+            "audit_status": "pass",
+            "candidate_count": 1,
+            "workorder_count": 1,
+            "provider": "openai",
+            "model": "gpt-5.4",
+        },
+        "ai_two_pass_review": {
+            "provider": "openai",
+            "model": "gpt-5.4",
+            "provider_status": {
+                "provider": "openai",
+                "status": "success",
+                "model": "gpt-5.4",
+            },
+        },
+        "code_improvement_orders": [
+            {
+                "order_id": "order_producer_gap_discovery_scale_in",
+                "producer_gap_priority": "high",
+            }
+        ],
+    }
+    workorder = {"orders": [{"order_id": "order_producer_gap_discovery_scale_in"}]}
+
+    report = mod._producer_gap_discovery_handoff_status(producer_gap, workorder)
+
+    assert report["status"] == "pass"
+    assert report["missing"] == []
+
+
+def test_producer_gap_discovery_handoff_treats_parsed_followup_as_workorder_not_ai_failure():
+    followup_order_id = "order_producer_gap_discovery_ai_review_followup_20260526"
+    producer_gap = {
+        "status": "warning",
+        "summary": {
+            "ai_two_pass_review_status": "parsed",
+            "audit_status": "correction_required",
+            "ai_review_followup_required": True,
+            "ai_review_followup_reasons": ["audit_status=correction_required"],
+            "candidate_count": 1,
+            "workorder_count": 1,
+            "provider": "openai",
+            "model": "gpt-5.4-mini",
+        },
+        "ai_two_pass_review": {
+            "provider": "openai",
+            "model": "gpt-5.4-mini",
+            "provider_status": {
+                "provider": "openai",
+                "status": "success",
+                "model": "gpt-5.4-mini",
+            },
+        },
+        "code_improvement_orders": [
+            {
+                "order_id": followup_order_id,
+                "producer_gap_priority": "high",
+                "improvement_type": "ai_review_followup",
+            }
+        ],
+    }
+    workorder = {"orders": [{"order_id": followup_order_id}]}
+
+    report = mod._producer_gap_discovery_handoff_status(producer_gap, workorder)
+
+    assert report["status"] == "pass"
+    assert "producer_gap_discovery_ai_audit_not_pass" not in report["missing"]
+    assert report["ai_review_followup_required"] is True
+    assert report["missing_ai_review_followup_workorder_order_ids"] == []
+
+
+def test_producer_gap_discovery_handoff_fails_without_openai_tier2_review():
+    producer_gap = {
+        "status": "warning",
+        "summary": {
+            "ai_two_pass_review_status": "parsed",
+            "audit_status": "pass",
+            "candidate_count": 1,
+            "workorder_count": 1,
+            "provider": "none",
+            "model": None,
+        },
+        "ai_two_pass_review": {
+            "provider": "none",
+            "model": None,
+            "provider_status": {
+                "provider": "none",
+                "status": "provided_response",
+                "model": None,
+            },
+        },
+        "code_improvement_orders": [
+            {
+                "order_id": "order_producer_gap_discovery_scale_in",
+                "producer_gap_priority": "high",
+            }
+        ],
+    }
+    workorder = {"orders": [{"order_id": "order_producer_gap_discovery_scale_in"}]}
+
+    report = mod._producer_gap_discovery_handoff_status(producer_gap, workorder)
+
+    assert report["status"] == "fail"
+    assert "producer_gap_discovery_tier2_provider_review_missing" in report["missing"]
+
+
+def test_stage_hook_handoff_treats_parsed_followup_as_workorder_not_ai_failure():
+    followup_order_id = (
+        "order_stage_hook_workorder_discovery_ai_review_followup_20260526"
+    )
+    stage_hook = {
+        "status": "warning",
+        "summary": {
+            "ai_two_pass_review_status": "parsed",
+            "audit_status": "correction_required",
+            "ai_review_followup_required": True,
+            "ai_review_followup_reasons": ["forbidden_use_violation"],
+            "candidate_count": 1,
+            "workorder_count": 1,
+            "provider": "openai",
+        },
+        "ai_two_pass_review": {
+            "provider": "openai",
+            "provider_status": {
+                "provider": "openai",
+                "status": "success",
+                "model": "gpt-5.4-mini",
+            },
+        },
+        "code_improvement_orders": [
+            {
+                "order_id": followup_order_id,
+                "stage_hook_priority": "high",
+                "improvement_type": "ai_review_followup",
+            }
+        ],
+        "context": {"consumed_candidate_ids": []},
+    }
+    workorder = {"orders": [{"order_id": followup_order_id}]}
+
+    report = mod._stage_hook_workorder_handoff_status(stage_hook, {}, workorder)
+
+    assert report["status"] == "pass"
+    assert "stage_hook_workorder_discovery_ai_audit_not_pass" not in report["missing"]
+    assert report["ai_review_followup_required"] is True
+    assert report["missing_ai_review_followup_workorder_order_ids"] == []
+
+
+def test_ai_correction_status_reads_current_provider_status_key(tmp_path, monkeypatch):
+    project_root = tmp_path
+    report_dir = project_root / "data" / "report"
+    monkeypatch.setattr(mod, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(mod, "REPORT_DIR", report_dir)
+    review_dir = report_dir / "threshold_cycle_ai_review"
+    calibration_dir = report_dir / "threshold_cycle_calibration"
+    review_dir.mkdir(parents=True)
+    calibration_dir.mkdir(parents=True)
+    (review_dir / "threshold_cycle_ai_review_2026-05-26_postclose.json").write_text(
+        json.dumps(
+            {
+                "ai_status": "parsed",
+                "ai_provider_status": {
+                    "provider": "openai",
+                    "status": "success",
+                    "schema_name": "threshold_ai_correction_v1",
+                },
+                "parse_warnings": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (
+        calibration_dir / "threshold_cycle_calibration_2026-05-26_postclose.json"
+    ).write_text(
+        json.dumps({"calibration_candidates": []}),
+        encoding="utf-8",
+    )
+
+    report = mod._ai_correction_status("2026-05-26")
+
+    assert report["status"] == "pass"
+    assert report["provider_status"]["provider"] == "openai"
+
+
+def test_producer_gap_discovery_handoff_fails_sim_first_coverage_gap_without_workorder():
+    producer_gap = {
+        "status": "warning",
+        "summary": {
+            "ai_two_pass_review_status": "parsed",
+            "audit_status": "pass",
+            "candidate_count": 1,
+            "workorder_count": 0,
+            "sim_first_coverage_status": "warning",
+        },
+        "producer_gap_candidates": [
+            {
+                "candidate_id": "producer_gap_sim_first_coverage_gap",
+                "pattern_type": "sim_first_coverage_gap",
+                "ai_priority": "high",
+            }
+        ],
+        "code_improvement_orders": [],
+    }
+
+    report = mod._producer_gap_discovery_handoff_status(producer_gap, {"orders": []})
+
+    assert report["status"] == "fail"
+    assert (
+        "producer_gap_discovery_sim_first_coverage_handoff_missing" in report["missing"]
+    )
+    assert report["missing_workorder_order_ids"] == [
+        "order_producer_gap_discovery_producer_gap_sim_first_coverage_gap"
+    ]
+
+
+def test_bottom_rebound_sim_handoff_passes_when_persisted():
+    sim_report = {
+        "source_quality": {
+            "bottom_rebound_source": {"status": "ok"},
+            "bottom_rebound_source_rows": 3,
+        },
+        "summary": {
+            "bottom_rebound_selected_candidate_count": 3,
+            "bottom_rebound_arm_count": 9,
+            "bottom_rebound_persisted_candidate_count": 3,
+            "bottom_rebound_persisted_arm_count": 9,
+        },
+        "persist_summary": {"candidate_rows": 3, "arm_rows": 9},
+    }
+
+    report = mod._bottom_rebound_sim_handoff_status(sim_report)
+
+    assert report["status"] == "pass"
+    assert report["included"] is True
+    assert report["missing"] == []
+
+
+def test_bottom_rebound_sim_handoff_fails_when_included_but_not_persisted():
+    sim_report = {
+        "source_quality": {
+            "bottom_rebound_source": {"status": "ok"},
+            "bottom_rebound_source_rows": 2,
+        },
+        "summary": {
+            "bottom_rebound_selected_candidate_count": 2,
+            "bottom_rebound_arm_count": 6,
+            "bottom_rebound_persisted_candidate_count": 0,
+            "bottom_rebound_persisted_arm_count": 0,
+        },
+        "persist_summary": {"candidate_rows": 0, "arm_rows": 0},
+    }
+
+    report = mod._bottom_rebound_sim_handoff_status(sim_report)
+
+    assert report["status"] == "fail"
+    assert "bottom_rebound_persisted_candidates_missing" in report["missing"]
+    assert "bottom_rebound_persisted_arms_missing" in report["missing"]
+
+
+def test_bottom_rebound_sim_handoff_not_applicable_when_source_absent():
+    report = mod._bottom_rebound_sim_handoff_status(
+        {
+            "source_quality": {
+                "bottom_rebound_source": {"status": "disabled"},
+                "bottom_rebound_source_rows": 0,
+            },
+            "summary": {},
+            "persist_summary": {"candidate_rows": 5, "arm_rows": 30},
+        }
+    )
+
+    assert report["status"] == "not_applicable"
+    assert report["included"] is False
+
+
+def test_active_sim_priority_handoff_passes_with_matching_preopen_and_runtime(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        mod,
+        "_iter_pipeline_event_fields",
+        lambda target_date: [
+            {
+                "active_seed_id": "active_seed_test",
+                "actual_order_submitted": False,
+                "broker_order_forbidden": True,
+            }
+        ],
+    )
+
+    status = mod._active_sim_priority_handoff_status(
+        target_date="2026-06-01",
+        discovery={
+            "active_sim_priority_seeds": [
+                {
+                    "active_seed_id": "active_seed_test",
+                    "source_parent_bucket_id": "parent_positive",
+                    "status": "active",
+                }
+            ]
+        },
+        scalp_catalog={
+            "schema_version": "scalp_sim_policy_catalog_v1",
+            "active_sim_priority_seeds": [
+                {
+                    "active_seed_id": "active_seed_test",
+                    "source_parent_bucket_id": "parent_positive",
+                    "status": "active",
+                    "observable_prefix": {
+                        "entry_score_parent": "score_watch_recovery",
+                        "entry_source_parent": "entry_source_blocked_ai_score",
+                    },
+                    "actual_order_submitted": False,
+                    "broker_order_forbidden": True,
+                    "runtime_effect": False,
+                }
+            ],
+        },
+        swing_catalog={
+            "schema_version": "swing_sim_policy_catalog_v1",
+            "active_arm_priority_policies": [
+                {
+                    "priority_policy_id": "priority_arm05",
+                    "priority_arm_id": "arm05_breakout_conf_trailing",
+                    "source_report_date": "2026-06-01",
+                    "status": "active",
+                    "actual_order_submitted": False,
+                    "broker_order_forbidden": True,
+                    "runtime_effect": False,
+                }
+            ],
+        },
+        preopen_apply={
+            "selected": [
+                {
+                    "family": "scalp_sim_auto_approval",
+                    "selected": True,
+                    "active_sim_priority_seed_ids": ["active_seed_test"],
+                },
+                {
+                    "family": "swing_sim_auto_approval",
+                    "selected": True,
+                    "active_arm_priority_policy_ids": ["priority_arm05"],
+                },
+            ]
+        },
+        swing_sim_report={"summary": {"active_arm_priority_arm_count": 1}},
+    )
+
+    assert status["status"] == "pass"
+    assert status["active_seed_ids"] == ["active_seed_test"]
+    assert status["active_swing_priority_policy_ids"] == ["priority_arm05"]
+
+
+def test_active_sim_priority_handoff_does_not_require_cooldown_only_producer_catalog(
+    monkeypatch,
+):
+    monkeypatch.setattr(mod, "_iter_pipeline_event_fields", lambda target_date: [])
+
+    status = mod._active_sim_priority_handoff_status(
+        target_date="2026-06-01",
+        discovery={
+            "active_sim_priority_seeds": [
+                {
+                    "active_seed_id": "active_seed_cooldown",
+                    "source_parent_bucket_id": "parent_no_longer_eligible",
+                    "status": "cooldown",
+                }
+            ]
+        },
+        scalp_catalog={
+            "schema_version": "scalp_sim_policy_catalog_v1",
+            "active_sim_priority_seeds": [],
+        },
+        swing_catalog={},
+        preopen_apply={},
+        swing_sim_report={},
+    )
+
+    assert status["status"] == "not_applicable"
+    assert status["missing"] == []
+    assert status["active_producer_seed_ids"] == []
+    assert status["inactive_producer_seed_ids"] == ["active_seed_cooldown"]
+
+
+def test_active_sim_priority_handoff_parses_python_list_runtime_provenance(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        mod,
+        "_iter_pipeline_event_fields",
+        lambda target_date: [
+            {
+                "active_seed_matched_ids": "['active_seed_test']",
+                "actual_order_submitted": False,
+                "broker_order_forbidden": True,
+            }
+        ],
+    )
+
+    status = mod._active_sim_priority_handoff_status(
+        target_date="2026-06-01",
+        discovery={},
+        scalp_catalog={
+            "schema_version": "scalp_sim_policy_catalog_v1",
+            "active_sim_priority_seeds": [
+                {
+                    "active_seed_id": "active_seed_test",
+                    "source_parent_bucket_id": "parent_positive",
+                    "status": "active",
+                    "observable_prefix": {
+                        "entry_score_parent": "score_watch_recovery",
+                        "entry_source_parent": "entry_source_blocked_ai_score",
+                    },
+                    "actual_order_submitted": False,
+                    "broker_order_forbidden": True,
+                    "runtime_effect": False,
+                }
+            ],
+        },
+        swing_catalog={},
+        preopen_apply={
+            "selected": [
+                {
+                    "family": "scalp_sim_auto_approval",
+                    "selected": True,
+                    "active_sim_priority_seed_ids": ["active_seed_test"],
+                }
+            ]
+        },
+        swing_sim_report={},
+    )
+
+    assert status["status"] == "pass"
+    assert status["observed_seed_ids"] == ["active_seed_test"]
+    assert status["unknown_consumed_ids"] == []
+
+
+def test_active_sim_priority_shared_prefix_credits_all_runtime_seed_lineages(
+    monkeypatch, tmp_path
+):
+    prefix = {
+        "entry_score_parent": "score_watch_recovery",
+        "entry_source_parent": "entry_source_wait6579",
+    }
+    runtime_catalog = tmp_path / "scalp_sim_policy_catalog_2026-06-01.json"
+    runtime_catalog.write_text(
+        json.dumps(
+            {
+                "schema_version": "scalp_sim_policy_catalog_v1",
+                "active_sim_priority_seeds": [
+                    {
+                        "active_seed_id": "active_seed_lifecycle",
+                        "status": "active",
+                        "observable_prefix": prefix,
+                    },
+                    {
+                        "active_seed_id": "active_seed_rising_prior",
+                        "status": "active",
+                        "observable_prefix": prefix,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        mod,
+        "_iter_pipeline_event_fields",
+        lambda target_date: [
+            {
+                "active_seed_id": "active_seed_rising_prior",
+                "scalp_sim_active_priority_seed_matched": True,
+                "active_seed_candidate_observable_prefix": json.dumps(
+                    prefix, sort_keys=True
+                ),
+                "actual_order_submitted": False,
+                "broker_order_forbidden": True,
+                "scalp_sim_auto_policy_file": str(runtime_catalog),
+            }
+        ],
+    )
+
+    status = mod._active_sim_priority_handoff_status(
+        target_date="2026-06-02",
+        discovery={},
+        scalp_catalog={
+            "schema_version": "scalp_sim_policy_catalog_v1",
+            "active_sim_priority_seeds": [
+                {
+                    "active_seed_id": "active_seed_lifecycle",
+                    "source_parent_bucket_id": "parent_lifecycle",
+                    "status": "active",
+                    "observable_prefix": prefix,
+                    "actual_order_submitted": False,
+                    "broker_order_forbidden": True,
+                    "runtime_effect": False,
+                }
+            ],
+        },
+        swing_catalog={},
+        preopen_apply={
+            "selected": [
+                {
+                    "family": "scalp_sim_auto_approval",
+                    "selected": True,
+                    "active_sim_priority_seed_ids": ["active_seed_lifecycle"],
+                }
+            ]
+        },
+        swing_sim_report={},
+    )
+
+    assert status["status"] == "pass"
+    assert status["observed_seed_ids"] == [
+        "active_seed_lifecycle",
+        "active_seed_rising_prior",
+    ]
+    assert status["referenced_runtime_seed_ids"] == [
+        "active_seed_lifecycle",
+        "active_seed_rising_prior",
+    ]
+    assert "active_sim_priority_runtime_observation_missing" not in status["warnings"]
+
+
+def test_active_sim_priority_handoff_fails_unknown_runtime_key(monkeypatch):
+    monkeypatch.setattr(
+        mod,
+        "_iter_pipeline_event_fields",
+        lambda target_date: [
+            {
+                "active_seed_id": "active_seed_unknown",
+                "actual_order_submitted": False,
+                "broker_order_forbidden": True,
+            }
+        ],
+    )
+
+    status = mod._active_sim_priority_handoff_status(
+        target_date="2026-06-01",
+        discovery={},
+        scalp_catalog={
+            "schema_version": "scalp_sim_policy_catalog_v1",
+            "active_sim_priority_seeds": [
+                {
+                    "active_seed_id": "active_seed_test",
+                    "source_parent_bucket_id": "parent_positive",
+                    "status": "active",
+                    "observable_prefix": {
+                        "entry_score_parent": "score_watch_recovery",
+                        "entry_source_parent": "entry_source_blocked_ai_score",
+                    },
+                    "actual_order_submitted": False,
+                    "broker_order_forbidden": True,
+                    "runtime_effect": False,
+                }
+            ],
+        },
+        swing_catalog={},
+        preopen_apply={
+            "selected": [
+                {
+                    "family": "scalp_sim_auto_approval",
+                    "selected": True,
+                    "active_sim_priority_seed_ids": ["active_seed_test"],
+                }
+            ]
+        },
+        swing_sim_report={},
+    )
+
+    assert status["status"] == "fail"
+    assert "active_sim_priority_unknown_key_observed" in status["missing"]
+    assert status["unknown_consumed_ids"] == ["active_seed_unknown"]
+
+
+def test_active_sim_priority_handoff_reports_inactive_consumed_ids(monkeypatch):
+    monkeypatch.setattr(
+        mod,
+        "_iter_pipeline_event_fields",
+        lambda target_date: [
+            {
+                "active_seed_id": "active_seed_cooldown",
+                "actual_order_submitted": False,
+                "broker_order_forbidden": True,
+            }
+        ],
+    )
+
+    status = mod._active_sim_priority_handoff_status(
+        target_date="2026-06-01",
+        discovery={},
+        scalp_catalog={
+            "schema_version": "scalp_sim_policy_catalog_v1",
+            "active_sim_priority_seeds": [
+                {
+                    "active_seed_id": "active_seed_cooldown",
+                    "source_parent_bucket_id": "parent_positive",
+                    "status": "cooldown",
+                    "observable_prefix": {
+                        "entry_score_parent": "score_watch_recovery",
+                        "entry_source_parent": "entry_source_blocked_ai_score",
+                    },
+                    "actual_order_submitted": False,
+                    "broker_order_forbidden": True,
+                    "runtime_effect": False,
+                }
+            ],
+        },
+        swing_catalog={},
+        preopen_apply={},
+        swing_sim_report={},
+    )
+
+    assert status["status"] == "fail"
+    assert "active_sim_priority_inactive_key_consumed" in status["missing"]
+    assert status["inactive_consumed_ids"] == ["active_seed_cooldown"]
+
+
+def test_active_sim_priority_accepts_runtime_referenced_preopen_catalog(
+    monkeypatch, tmp_path
+):
+    runtime_catalog = tmp_path / "scalp_sim_policy_catalog_2026-06-02.json"
+    runtime_catalog.write_text(
+        json.dumps(
+            {
+                "schema_version": "scalp_sim_policy_catalog_v1",
+                "active_sim_priority_seeds": [
+                    {
+                        "active_seed_id": "active_seed_runtime",
+                        "source_parent_bucket_id": "parent_runtime",
+                        "status": "active",
+                        "observable_prefix": {
+                            "entry_score_parent": "score_mid_recovery",
+                            "entry_source_parent": "entry_source_blocked_ai_score",
+                        },
+                        "actual_order_submitted": False,
+                        "broker_order_forbidden": True,
+                        "runtime_effect": False,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        mod,
+        "_iter_pipeline_event_fields",
+        lambda target_date: [
+            {
+                "active_seed_id": "active_seed_runtime",
+                "actual_order_submitted": False,
+                "broker_order_forbidden": True,
+                "scalp_sim_auto_policy_file": str(runtime_catalog),
+            }
+        ],
+    )
+
+    status = mod._active_sim_priority_handoff_status(
+        target_date="2026-06-04",
+        discovery={},
+        scalp_catalog={
+            "schema_version": "scalp_sim_policy_catalog_v1",
+            "active_sim_priority_seeds": [],
+        },
+        swing_catalog={},
+        preopen_apply={},
+        swing_sim_report={},
+    )
+
+    assert status["status"] == "not_applicable"
+    assert status["referenced_runtime_seed_ids"] == ["active_seed_runtime"]
+    assert "active_sim_priority_unknown_key_observed" not in status["missing"]
+
+
+def test_active_sim_priority_uses_runtime_catalog_before_current_postclose_status(
+    monkeypatch, tmp_path
+):
+    runtime_catalog = tmp_path / "scalp_sim_policy_catalog_2026-06-15.json"
+    runtime_catalog.write_text(
+        json.dumps(
+            {
+                "schema_version": "scalp_sim_policy_catalog_v1",
+                "active_sim_priority_seeds": [
+                    {
+                        "active_seed_id": "active_seed_runtime",
+                        "source_parent_bucket_id": "parent_runtime",
+                        "status": "active",
+                        "observable_prefix": {
+                            "entry_score_parent": "score_mid_recovery",
+                            "entry_source_parent": "entry_source_blocked_ai_score",
+                        },
+                        "actual_order_submitted": False,
+                        "broker_order_forbidden": True,
+                        "runtime_effect": False,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        mod,
+        "_iter_pipeline_event_fields",
+        lambda target_date: [
+            {
+                "active_seed_id": "active_seed_runtime",
+                "actual_order_submitted": False,
+                "broker_order_forbidden": True,
+                "scalp_sim_auto_policy_file": str(runtime_catalog),
+            }
+        ],
+    )
+
+    status = mod._active_sim_priority_handoff_status(
+        target_date="2026-06-16",
+        discovery={},
+        scalp_catalog={
+            "schema_version": "scalp_sim_policy_catalog_v1",
+            "active_sim_priority_seeds": [
+                {
+                    "active_seed_id": "active_seed_runtime",
+                    "source_parent_bucket_id": "parent_runtime",
+                    "status": "cooldown",
+                    "observable_prefix": {
+                        "entry_score_parent": "score_mid_recovery",
+                        "entry_source_parent": "entry_source_blocked_ai_score",
+                    },
+                    "actual_order_submitted": False,
+                    "broker_order_forbidden": True,
+                    "runtime_effect": False,
+                }
+            ],
+        },
+        swing_catalog={},
+        preopen_apply={},
+        swing_sim_report={},
+    )
+
+    assert "active_sim_priority_inactive_key_consumed" not in status["missing"]
+    assert status["inactive_consumed_ids"] == []
+    assert status["referenced_runtime_seed_ids"] == ["active_seed_runtime"]
+
+
+def test_active_sim_priority_uses_preopen_ids_before_current_postclose_status(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        mod,
+        "_iter_pipeline_event_fields",
+        lambda target_date: [
+            {
+                "active_seed_id": "active_seed_preopen",
+                "actual_order_submitted": False,
+                "broker_order_forbidden": True,
+            }
+        ],
+    )
+
+    status = mod._active_sim_priority_handoff_status(
+        target_date="2026-06-25",
+        discovery={},
+        scalp_catalog={
+            "schema_version": "scalp_sim_policy_catalog_v1",
+            "active_sim_priority_seeds": [
+                {
+                    "active_seed_id": "active_seed_preopen",
+                    "source_parent_bucket_id": "parent_runtime",
+                    "status": "cooldown",
+                    "observable_prefix": {
+                        "entry_score_parent": "score_mid_recovery",
+                        "entry_source_parent": "entry_source_blocked_ai_score",
+                    },
+                    "actual_order_submitted": False,
+                    "broker_order_forbidden": True,
+                    "runtime_effect": False,
+                }
+            ],
+        },
+        swing_catalog={},
+        preopen_apply={
+            "selected": [
+                {
+                    "family": "scalp_sim_auto_approval",
+                    "selected": True,
+                    "active_sim_priority_seed_ids": ["active_seed_preopen"],
+                }
+            ]
+        },
+        swing_sim_report={},
+    )
+
+    assert "active_sim_priority_inactive_key_consumed" not in status["missing"]
+    assert status["inactive_consumed_ids"] == []
+    assert status["referenced_runtime_seed_ids"] == ["active_seed_preopen"]
+
+
+def test_active_sim_priority_warns_stale_seed_alias_when_same_prefix_active_exists(
+    monkeypatch, tmp_path
+):
+    runtime_catalog = tmp_path / "scalp_sim_policy_catalog_2026-06-24.json"
+    runtime_catalog.write_text(
+        json.dumps(
+            {
+                "schema_version": "scalp_sim_policy_catalog_v1",
+                "active_sim_priority_seeds": [
+                    {
+                        "active_seed_id": "active_seed_current",
+                        "source_parent_bucket_id": "parent_current",
+                        "status": "active",
+                        "observable_prefix": {
+                            "entry_score_parent": "score_watch_recovery",
+                            "entry_source_parent": "entry_source_wait6579",
+                        },
+                        "actual_order_submitted": False,
+                        "broker_order_forbidden": True,
+                        "runtime_effect": False,
+                    },
+                    {
+                        "active_seed_id": "active_seed_stale",
+                        "source_parent_bucket_id": "parent_old",
+                        "status": "cooldown",
+                        "observable_prefix": {
+                            "entry_score_parent": "score_watch_recovery",
+                            "entry_source_parent": "entry_source_wait6579",
+                        },
+                        "actual_order_submitted": False,
+                        "broker_order_forbidden": True,
+                        "runtime_effect": False,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        mod,
+        "_iter_pipeline_event_fields",
+        lambda target_date: [
+            {
+                "active_seed_id": "active_seed_stale",
+                "scalp_sim_active_priority_seed_matched": True,
+                "active_seed_candidate_observable_prefix": json.dumps(
+                    {
+                        "entry_score_parent": "score_watch_recovery",
+                        "entry_source_parent": "entry_source_wait6579",
+                    },
+                    sort_keys=True,
+                ),
+                "actual_order_submitted": False,
+                "broker_order_forbidden": True,
+                "scalp_sim_auto_policy_file": str(runtime_catalog),
+            }
+        ],
+    )
+
+    status = mod._active_sim_priority_handoff_status(
+        target_date="2026-06-25",
+        discovery={},
+        scalp_catalog={
+            "schema_version": "scalp_sim_policy_catalog_v1",
+            "active_sim_priority_seeds": [
+                {
+                    "active_seed_id": "active_seed_current",
+                    "source_parent_bucket_id": "parent_current",
+                    "status": "active",
+                    "observable_prefix": {
+                        "entry_score_parent": "score_watch_recovery",
+                        "entry_source_parent": "entry_source_wait6579",
+                    },
+                    "actual_order_submitted": False,
+                    "broker_order_forbidden": True,
+                    "runtime_effect": False,
+                },
+                {
+                    "active_seed_id": "active_seed_stale",
+                    "source_parent_bucket_id": "parent_old",
+                    "status": "cooldown",
+                    "observable_prefix": {
+                        "entry_score_parent": "score_watch_recovery",
+                        "entry_source_parent": "entry_source_wait6579",
+                    },
+                    "actual_order_submitted": False,
+                    "broker_order_forbidden": True,
+                    "runtime_effect": False,
+                },
+            ],
+        },
+        swing_catalog={},
+        preopen_apply={
+            "selected": [
+                {
+                    "family": "scalp_sim_auto_approval",
+                    "selected": True,
+                    "active_sim_priority_seed_ids": ["active_seed_current"],
+                }
+            ]
+        },
+        swing_sim_report={},
+    )
+
+    assert "active_sim_priority_inactive_key_consumed" not in status["missing"]
+    assert "active_sim_priority_stale_seed_alias_consumed" in status["warnings"]
+    assert status["stale_alias_consumed_ids"] == ["active_seed_stale"]
+
+
+def test_active_sim_priority_handoff_fails_unknown_runtime_key_when_catalog_empty(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        mod,
+        "_iter_pipeline_event_fields",
+        lambda target_date: [
+            {
+                "active_seed_id": "active_seed_unknown",
+                "actual_order_submitted": False,
+                "broker_order_forbidden": True,
+            },
+            {"priority_policy_id": "priority_unknown"},
+        ],
+    )
+
+    status = mod._active_sim_priority_handoff_status(
+        target_date="2026-06-01",
+        discovery={},
+        scalp_catalog={
+            "schema_version": "scalp_sim_policy_catalog_v1",
+            "active_sim_priority_seeds": [],
+        },
+        swing_catalog={
+            "schema_version": "swing_sim_policy_catalog_v1",
+            "active_arm_priority_policies": [],
+        },
+        preopen_apply={},
+        swing_sim_report={},
+    )
+
+    assert status["status"] == "fail"
+    assert "active_sim_priority_unknown_key_observed" in status["missing"]
+
+
+def test_active_sim_priority_zero_match_gets_absence_diagnosis(monkeypatch):
+    monkeypatch.setattr(
+        mod,
+        "_iter_pipeline_event_fields",
+        lambda target_date: [
+            {
+                "scalp_sim_active_priority_seed_matched": "False",
+                "active_seed_candidate_observable_prefix": json.dumps(
+                    {
+                        "entry_score_parent": "score_watch_recovery",
+                        "entry_source_parent": "entry_source_observed_other",
+                    }
+                ),
+                "actual_order_submitted": "False",
+                "broker_order_forbidden": "True",
+            }
+        ],
+    )
+
+    status = mod._active_sim_priority_handoff_status(
+        target_date="2026-06-01",
+        discovery={},
+        scalp_catalog={
+            "schema_version": "scalp_sim_policy_catalog_v1",
+            "active_sim_priority_seeds": [
+                {
+                    "active_seed_id": "active_seed_test",
+                    "source_parent_bucket_id": "parent_positive",
+                    "status": "active",
+                    "observable_prefix": {
+                        "entry_score_parent": "score_watch_recovery",
+                        "entry_source_parent": "entry_source_action_decision",
+                    },
+                    "actual_order_submitted": False,
+                    "broker_order_forbidden": True,
+                    "runtime_effect": False,
+                }
+            ],
+        },
+        swing_catalog={},
+        preopen_apply={
+            "selected": [
+                {
+                    "family": "scalp_sim_auto_approval",
+                    "selected": True,
+                    "active_sim_priority_seed_ids": ["active_seed_test"],
+                }
+            ]
+        },
+        swing_sim_report={},
+    )
+
+    assert status["status"] == "warning"
+    assert "active_sim_priority_runtime_observation_missing" in status["warnings"]
+    assert (
+        status["active_priority_match_absence_diagnosis"]["diagnosis"]
+        == "active_prefix_too_narrow"
+    )
+    assert status["active_priority_match_absence_diagnosis"]["status"] == "warning"
+
+
+def test_active_sim_priority_pending_preopen_does_not_require_runtime_observation(
+    monkeypatch,
+):
+    monkeypatch.setattr(mod, "_iter_pipeline_event_fields", lambda target_date: [])
+
+    status = mod._active_sim_priority_handoff_status(
+        target_date="2026-06-02",
+        discovery={},
+        scalp_catalog={
+            "schema_version": "scalp_sim_policy_catalog_v1",
+            "active_sim_priority_seeds": [
+                {
+                    "active_seed_id": "active_seed_next",
+                    "source_parent_bucket_id": "parent_positive_next",
+                    "status": "active",
+                    "observable_prefix": {
+                        "entry_score_parent": "score_watch_recovery",
+                        "entry_source_parent": "entry_source_action_decision",
+                    },
+                    "actual_order_submitted": False,
+                    "broker_order_forbidden": True,
+                    "runtime_effect": False,
+                }
+            ],
+        },
+        swing_catalog={
+            "schema_version": "swing_sim_policy_catalog_v1",
+            "active_arm_priority_policies": [
+                {
+                    "priority_policy_id": "active_arm_next",
+                    "priority_arm_id": "arm05_breakout_conf_trailing",
+                    "source_report_date": "2026-06-02",
+                    "status": "active",
+                    "actual_order_submitted": False,
+                    "broker_order_forbidden": True,
+                    "runtime_effect": False,
+                }
+            ],
+        },
+        preopen_apply={},
+        swing_sim_report={},
+    )
+
+    assert status["status"] == "pass"
+    assert "active_sim_priority_preopen_handoff_pending" not in status["warnings"]
+    assert (
+        "active_sim_priority_preopen_handoff_pending" in status["next_preopen_pending"]
+    )
+    assert "active_sim_priority_runtime_observation_missing" not in status["warnings"]
+    assert (
+        "swing_active_arm_priority_runtime_observation_missing"
+        not in status["warnings"]
+    )
+
+
+def test_active_sim_priority_current_preopen_only_requires_due_prior_source_seeds(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        mod,
+        "_iter_pipeline_event_fields",
+        lambda target_date: [
+            {
+                "active_seed_id": "active_seed_prior",
+                "scalp_sim_auto_policy_file": "",
+                "actual_order_submitted": "False",
+                "broker_order_forbidden": "True",
+            }
+        ],
+    )
+
+    status = mod._active_sim_priority_handoff_status(
+        target_date="2026-06-26",
+        discovery={},
+        scalp_catalog={
+            "schema_version": "scalp_sim_policy_catalog_v1",
+            "active_sim_priority_seeds": [
+                {
+                    "active_seed_id": "active_seed_prior",
+                    "source_parent_bucket_id": "parent_positive_prior",
+                    "status": "active",
+                    "observable_prefix": {
+                        "entry_score_parent": "score_watch_recovery",
+                        "entry_source_parent": "entry_source_wait6579",
+                    },
+                    "actual_order_submitted": False,
+                    "broker_order_forbidden": True,
+                    "runtime_effect": False,
+                },
+                {
+                    "active_seed_id": "active_seed_new_postclose",
+                    "source_parent_bucket_id": "parent_positive_new",
+                    "status": "active",
+                    "observable_prefix": {
+                        "entry_score_parent": "score_mid_recovery",
+                        "entry_source_parent": "entry_source_blocked_ai_score",
+                    },
+                    "actual_order_submitted": False,
+                    "broker_order_forbidden": True,
+                    "runtime_effect": False,
+                },
+            ],
+        },
+        swing_catalog={},
+        preopen_apply={
+            "source_date": "2026-06-25",
+            "selected": [
+                {
+                    "family": "scalp_sim_auto_approval",
+                    "selected": True,
+                    "active_sim_priority_seed_ids": ["active_seed_prior"],
+                }
+            ],
+        },
+        swing_sim_report={},
+    )
+
+    assert status["status"] == "pass"
+    assert "active_sim_priority_preopen_handoff_missing" not in status["missing"]
+    assert "active_sim_priority_preopen_handoff_pending" not in status["warnings"]
+    assert (
+        "active_sim_priority_preopen_handoff_pending" in status["next_preopen_pending"]
+    )
+    assert "active_sim_priority_runtime_observation_missing" not in status["warnings"]
+
+
+def test_active_sim_priority_handoff_fails_when_preopen_apply_omits_active_seed(
+    monkeypatch,
+):
+    monkeypatch.setattr(mod, "_iter_pipeline_event_fields", lambda target_date: [])
+
+    status = mod._active_sim_priority_handoff_status(
+        target_date="2026-06-22",
+        discovery={},
+        scalp_catalog={
+            "schema_version": "scalp_sim_policy_catalog_v1",
+            "active_sim_priority_seeds": [
+                {
+                    "active_seed_id": "active_seed_missing_from_preopen",
+                    "source_parent_bucket_id": "parent_positive",
+                    "status": "active",
+                    "observable_prefix": {
+                        "entry_score_parent": "score_watch_recovery",
+                        "entry_source_parent": "entry_source_blocked_ai_score",
+                    },
+                    "actual_order_submitted": False,
+                    "broker_order_forbidden": True,
+                    "runtime_effect": False,
+                }
+            ],
+        },
+        swing_catalog={},
+        preopen_apply={
+            "selected": [
+                {
+                    "family": "scalp_sim_auto_approval",
+                    "selected": True,
+                    "active_sim_priority_seed_ids": [],
+                }
+            ]
+        },
+        swing_sim_report={},
+    )
+
+    assert status["status"] == "fail"
+    assert "active_sim_priority_preopen_handoff_missing" in status["missing"]
+    assert "active_sim_priority_preopen_handoff_pending" not in status["warnings"]
+
+
+def test_active_sim_priority_zero_match_prioritizes_posterior_dimension_diagnosis(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        mod,
+        "_iter_pipeline_event_fields",
+        lambda target_date: [
+            {
+                "scalp_sim_active_priority_seed_matched": "False",
+                "active_seed_candidate_observable_prefix": json.dumps(
+                    {
+                        "entry_score_parent": "score_watch_recovery",
+                        "entry_source_parent": "entry_source_observed_other",
+                    }
+                ),
+                "actual_order_submitted": "False",
+                "broker_order_forbidden": "True",
+            }
+        ],
+    )
+
+    status = mod._active_sim_priority_handoff_status(
+        target_date="2026-06-01",
+        discovery={},
+        scalp_catalog={
+            "schema_version": "scalp_sim_policy_catalog_v1",
+            "active_sim_priority_seeds": [
+                {
+                    "active_seed_id": "active_seed_test",
+                    "source_parent_bucket_id": "parent_positive",
+                    "status": "active",
+                    "observable_prefix": {
+                        "entry_score_parent": "score_watch_recovery",
+                        "entry_source_parent": "entry_source_action_decision",
+                        "exit_outcome_parent": "posterior_positive",
+                    },
+                    "actual_order_submitted": False,
+                    "broker_order_forbidden": True,
+                    "runtime_effect": False,
+                }
+            ],
+        },
+        swing_catalog={},
+        preopen_apply={
+            "selected": [
+                {
+                    "family": "scalp_sim_auto_approval",
+                    "selected": True,
+                    "active_sim_priority_seed_ids": ["active_seed_test"],
+                }
+            ]
+        },
+        swing_sim_report={},
+    )
+
+    assert status["status"] == "fail"
+    assert (
+        "active_sim_priority_seed_observable_prefix_forbidden_dimension"
+        in status["missing"]
+    )
+    assert (
+        status["active_priority_match_absence_diagnosis"]["diagnosis"]
+        == "posterior_dimension_leaked_into_priority"
+    )
+    assert status["active_priority_match_absence_diagnosis"]["status"] == "fail"
+
+
+def test_ldm_refinement_consumption_fails_when_lifecycle_ledger_missing():
+    status = mod._ldm_refinement_consumption_status(
+        {
+            "refinement_inputs": [
+                {
+                    "refinement_input_id": "ref_input_1",
+                    "soft_hypothesis_id": "ldm_hypothesis_test",
+                    "classification": "taxonomy_gap_candidate",
+                }
+            ]
+        },
+        {},
+    )
+
+    assert status["status"] == "fail"
+    assert "ldm_refinement_consumption_ledger_missing" in status["missing"]
+
+
+def test_ldm_refinement_consumption_warns_when_hypothesis_contract_drift_suppresses_matches(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        mod,
+        "_iter_pipeline_event_fields",
+        lambda target_date: iter(
+            [
+                {
+                    "ldm_hypothesis_matched": "False",
+                    "ldm_hypothesis_candidate_features": json.dumps(
+                        {
+                            "entry_score_parent": "score_watch_recovery",
+                            "entry_source_parent": "entry_source_wait6579",
+                            "submit_quality_parent": "submit_revalidation_ok",
+                        }
+                    ),
+                }
+            ]
+        ),
+    )
+
+    status = mod._ldm_refinement_consumption_status(
+        {"refinement_inputs": []},
+        {},
+        target_date="2026-06-19",
+        scalp_catalog={
+            "schema_version": "scalp_sim_policy_catalog_v1",
+            "hypothesis_observation_plan": {
+                "schema_version": "ldm_hypothesis_observation_plan_v1",
+                "hypotheses": [
+                    {
+                        "soft_hypothesis_id": "ldm_hypothesis_legacy",
+                        "observable_requirements": [
+                            {
+                                "field": "entry_score_parent",
+                                "op": "eq",
+                                "value": "score_watch_recovery",
+                            },
+                            {
+                                "field": "entry_source_parent",
+                                "op": "eq",
+                                "value": "entry_source_wait6579",
+                            },
+                            {
+                                "field": "submit_quality_parent",
+                                "op": "eq",
+                                "value": "submit_revalidation_ok",
+                            },
+                        ],
+                        "runtime_effect": False,
+                        "allowed_runtime_apply": False,
+                        "actual_order_submitted": False,
+                        "broker_order_forbidden": True,
+                        "forbidden_uses": [
+                            "buy_sell_hold_live_rule",
+                            "threshold_apply",
+                            "provider_route_change",
+                            "bot_restart",
+                            "position_cap_release",
+                            "broker_order",
+                            "hard_safety_bypass",
+                        ],
+                    }
+                ],
+            },
+        },
+    )
+
+    assert status["status"] == "warning"
+    assert "ldm_hypothesis_contract_drift" in status["warnings"]
+    assert status["contract_drift"]["recomputable_match_count"] == 1
+    assert status["contract_drift"]["runtime_matched_event_count"] == 0
+    assert status["contract_drift"]["recomputable_hypothesis_ids"] == [
+        "ldm_hypothesis_legacy"
+    ]
+
+
+def test_ldm_contract_drift_reads_gzip_pipeline_events(tmp_path, monkeypatch):
+    root = tmp_path
+    event_dir = root / "data" / "pipeline_events"
+    event_dir.mkdir(parents=True)
+    with gzip.open(
+        event_dir / "pipeline_events_2026-06-15.jsonl.gz", "wt", encoding="utf-8"
+    ) as fh:
+        fh.write(
+            json.dumps(
+                {
+                    "fields": {
+                        "ldm_hypothesis_matched": "False",
+                        "ldm_hypothesis_candidate_features": json.dumps(
+                            {
+                                "entry_score_parent": "score_watch_recovery",
+                                "entry_source_parent": "entry_source_wait6579",
+                            }
+                        ),
+                    }
+                }
+            )
+            + "\n"
+        )
+    monkeypatch.setattr(mod, "PROJECT_ROOT", root)
+
+    drift = mod._ldm_hypothesis_contract_drift_status(
+        "2026-06-15",
+        {
+            "hypothesis_observation_plan": {
+                "schema_version": "ldm_hypothesis_observation_plan_v1",
+                "hypotheses": [
+                    {
+                        "soft_hypothesis_id": "ldm_hypothesis_legacy",
+                        "observable_requirements": [
+                            {
+                                "field": "entry_score_parent",
+                                "op": "eq",
+                                "value": "score_watch_recovery",
+                            },
+                            {
+                                "field": "entry_source_parent",
+                                "op": "eq",
+                                "value": "entry_source_wait6579",
+                            },
+                        ],
+                        "runtime_effect": False,
+                        "allowed_runtime_apply": False,
+                        "actual_order_submitted": False,
+                        "broker_order_forbidden": True,
+                        "forbidden_uses": [
+                            "buy_sell_hold_live_rule",
+                            "threshold_apply",
+                            "provider_route_change",
+                            "bot_restart",
+                            "position_cap_release",
+                            "broker_order",
+                            "hard_safety_bypass",
+                        ],
+                    }
+                ],
+            }
+        },
+    )
+
+    assert drift["candidate_feature_event_count"] == 1
+    assert drift["recomputable_match_count"] == 1
+    assert drift["runtime_matched_event_count"] == 0
+
+
+def test_ldm_refinement_consumption_accepts_derived_contract_drift_recompute(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        mod,
+        "_iter_pipeline_event_fields",
+        lambda target_date: iter(
+            [
+                {
+                    "ldm_hypothesis_matched": "False",
+                    "ldm_hypothesis_candidate_features": json.dumps(
+                        {
+                            "entry_score_parent": "score_watch_recovery",
+                            "entry_source_parent": "entry_source_wait6579",
+                        }
+                    ),
+                }
+            ]
+        ),
+    )
+
+    status = mod._ldm_refinement_consumption_status(
+        {
+            "refinement_inputs": [
+                {
+                    "refinement_input_id": "ref_input_derived",
+                    "soft_hypothesis_id": "ldm_hypothesis_legacy",
+                    "classification": "parent_support",
+                    "match_count": 1,
+                    "derived_from_contract_drift": True,
+                }
+            ]
+        },
+        {
+            "ldm_refinement_pressure_consumption": {
+                "status": "pass",
+                "input_count": 1,
+                "consumed_count": 1,
+                "entries": [
+                    {
+                        "refinement_input_id": "ref_input_derived",
+                        "closure_status": "absorbed_into_existing_parent",
+                        "derived_from_contract_drift": True,
+                    }
+                ],
+            }
+        },
+        target_date="2026-06-19",
+        scalp_catalog={
+            "hypothesis_observation_plan": {
+                "schema_version": "ldm_hypothesis_observation_plan_v1",
+                "hypotheses": [
+                    {
+                        "soft_hypothesis_id": "ldm_hypothesis_legacy",
+                        "observable_requirements": [
+                            {
+                                "field": "entry_score_parent",
+                                "op": "eq",
+                                "value": "score_watch_recovery",
+                            },
+                            {
+                                "field": "entry_source_parent",
+                                "op": "eq",
+                                "value": "entry_source_wait6579",
+                            },
+                        ],
+                        "runtime_effect": False,
+                        "allowed_runtime_apply": False,
+                        "actual_order_submitted": False,
+                        "broker_order_forbidden": True,
+                        "forbidden_uses": [
+                            "buy_sell_hold_live_rule",
+                            "threshold_apply",
+                            "provider_route_change",
+                            "bot_restart",
+                            "position_cap_release",
+                            "broker_order",
+                            "hard_safety_bypass",
+                        ],
+                    }
+                ],
+            }
+        },
+    )
+
+    assert status["status"] == "pass"
+    assert "ldm_hypothesis_contract_drift" not in status["warnings"]
+    assert status["derived_refinement_input_count"] == 1
+    assert status["derived_refinement_consumed_count"] == 1
+    assert status["derived_contract_drift_recompute_consumed"] is True
+
+
+def test_ldm_refinement_consumption_keeps_noop_pass_without_hypothesis_candidate(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        mod, "_iter_pipeline_event_fields", lambda target_date: iter([])
+    )
+
+    status = mod._ldm_refinement_consumption_status(
+        {"refinement_inputs": []},
+        {},
+        target_date="2026-06-19",
+        scalp_catalog={
+            "schema_version": "scalp_sim_policy_catalog_v1",
+            "hypothesis_observation_plan": {
+                "schema_version": "ldm_hypothesis_observation_plan_v1",
+                "hypotheses": [
+                    {
+                        "soft_hypothesis_id": "ldm_hypothesis_no_candidate",
+                        "observable_requirements": [
+                            {
+                                "field": "entry_score_parent",
+                                "op": "eq",
+                                "value": "score_watch_recovery",
+                            },
+                        ],
+                        "runtime_effect": False,
+                        "allowed_runtime_apply": False,
+                        "actual_order_submitted": False,
+                        "broker_order_forbidden": True,
+                        "forbidden_uses": [
+                            "buy_sell_hold_live_rule",
+                            "threshold_apply",
+                            "provider_route_change",
+                            "bot_restart",
+                            "sizing_formula_runtime_apply_without_guard",
+                            "broker_order",
+                            "hard_safety_bypass",
+                        ],
+                    }
+                ],
+            },
+        },
+    )
+
+    assert status["status"] == "pass"
+    assert status["warnings"] == []
+    assert status["contract_drift"]["candidate_feature_event_count"] == 0
+
+
+def test_ldm_refinement_consumption_fails_when_lifecycle_ledger_failed():
+    status = mod._ldm_refinement_consumption_status(
+        {
+            "refinement_inputs": [
+                {
+                    "refinement_input_id": "ref_input_1",
+                    "soft_hypothesis_id": "ldm_hypothesis_test",
+                    "classification": "taxonomy_gap_candidate",
+                }
+            ]
+        },
+        {
+            "ldm_refinement_pressure_consumption": {
+                "status": "fail",
+                "input_count": 1,
+                "consumed_count": 0,
+                "contract_issues": ["ldm_refinement_date_mismatch"],
+                "entries": [],
+            }
+        },
+    )
+
+    assert status["status"] == "fail"
+    assert "ldm_refinement_consumption_ledger_failed" in status["missing"]
+
+
+def test_ldm_refinement_consumption_ignores_stale_artifact_when_stage_disabled():
+    status = mod._ldm_refinement_consumption_status(
+        {
+            "refinement_inputs": [
+                {
+                    "refinement_input_id": "ref_input_stale",
+                    "soft_hypothesis_id": "ldm_hypothesis_stale",
+                    "classification": "taxonomy_gap_candidate",
+                }
+            ]
+        },
+        {},
+        disabled=True,
+    )
+
+    assert status["status"] == "disabled"
+    assert status["missing"] == []
+    assert (
+        status["disabled_reason"] == "ldm_hypothesis_parent_refinement_stage_disabled"
+    )
+
+
+def test_ldm_refinement_consumption_warns_for_all_needs_more_sample_with_reason():
+    status = mod._ldm_refinement_consumption_status(
+        {
+            "refinement_inputs": [
+                {
+                    "refinement_input_id": "ref_input_1",
+                    "soft_hypothesis_id": "ldm_hypothesis_test",
+                    "classification": "taxonomy_gap_candidate",
+                }
+            ]
+        },
+        {
+            "ldm_refinement_pressure_consumption": {
+                "input_count": 1,
+                "entries": [
+                    {
+                        "refinement_input_id": "ref_input_1",
+                        "closure_status": "needs_more_contrastive_sample",
+                        "closure_reason": "contrary_sample_needed_before_parent_structure_change",
+                    }
+                ],
+            }
+        },
+    )
+
+    assert status["status"] == "warning"
+    assert "ldm_refinement_all_needs_more_contrastive_sample" in status["warnings"]
+
+
+def test_ldm_refinement_consumption_warns_repeated_taxonomy_gap_unresolved():
+    status = mod._ldm_refinement_consumption_status(
+        {
+            "refinement_inputs": [
+                {
+                    "refinement_input_id": "ref_input_1",
+                    "soft_hypothesis_id": "ldm_hypothesis_test",
+                    "classification": "taxonomy_gap_candidate",
+                    "repeated_gap_count": 2,
+                }
+            ]
+        },
+        {
+            "ldm_refinement_pressure_consumption": {
+                "input_count": 1,
+                "entries": [
+                    {
+                        "refinement_input_id": "ref_input_1",
+                        "closure_status": "needs_more_contrastive_sample",
+                        "closure_reason": "still_collecting_opposite_sample",
+                    }
+                ],
+            }
+        },
+    )
+
+    assert status["status"] == "warning"
+    assert "ldm_refinement_repeated_taxonomy_gap_unresolved" in status["warnings"]
+
+
+def test_ldm_refinement_consumption_fails_repeated_status_without_diagnosis():
+    status = mod._ldm_refinement_consumption_status(
+        {
+            "refinement_inputs": [
+                {
+                    "refinement_input_id": "ref_input_1",
+                    "soft_hypothesis_id": "ldm_hypothesis_test",
+                    "classification": "parent_support",
+                    "retry_count": 3,
+                }
+            ]
+        },
+        {
+            "ldm_refinement_pressure_consumption": {
+                "input_count": 1,
+                "entries": [
+                    {
+                        "refinement_input_id": "ref_input_1",
+                        "closure_status": "needs_more_contrastive_sample",
+                        "closure_reason": "still_collecting_opposite_sample",
+                    }
+                ],
+            }
+        },
+    )
+
+    assert status["status"] == "fail"
+    assert "ldm_refinement_repeated_status_diagnosis_missing_fail" in status["missing"]
+
+
+def test_ldm_refinement_consumption_accepts_repeated_status_with_forced_closure():
+    status = mod._ldm_refinement_consumption_status(
+        {
+            "refinement_inputs": [
+                {
+                    "refinement_input_id": "ref_input_1",
+                    "soft_hypothesis_id": "ldm_hypothesis_test",
+                    "classification": "taxonomy_gap_candidate",
+                    "repeated_gap_count": 2,
+                    "retry_count": 2,
+                    "diagnosed_status": "taxonomy_gap_candidate",
+                    "repeated_status_diagnosis": {
+                        "diagnosed_status": "taxonomy_gap_candidate",
+                        "retry_count": 2,
+                        "recommended_closure_bias": "new_parent_candidate_created",
+                    },
+                }
+            ]
+        },
+        {
+            "ldm_refinement_pressure_consumption": {
+                "input_count": 1,
+                "closure_counts": {"new_parent_candidate_created": 1},
+                "entries": [
+                    {
+                        "refinement_input_id": "ref_input_1",
+                        "closure_status": "new_parent_candidate_created",
+                        "closure_reason": "parent_not_found",
+                    }
+                ],
+            }
+        },
+    )
+
+    assert status["status"] == "pass"
+    assert status["diagnosed_repeated_input_ids"] == ["ref_input_1"]
+
+
+def test_ldm_refinement_consumption_fails_runtime_authority_violation_even_with_closure():
+    status = mod._ldm_refinement_consumption_status(
+        {
+            "refinement_inputs": [
+                {
+                    "refinement_input_id": "ref_input_authority",
+                    "soft_hypothesis_id": "ldm_hypothesis_authority",
+                    "classification": "source_quality_gap",
+                    "forbidden_contract_violation_count": 1,
+                    "diagnosed_status": "contract_or_handoff_gap",
+                    "diagnosis_reason": "matched_hypothesis_or_runtime_authority_contract_gap",
+                    "recommended_closure_bias": "contract_handoff_gap_created",
+                    "repeated_status_diagnosis": {
+                        "diagnosed_status": "contract_or_handoff_gap",
+                        "diagnosis_reason": "matched_hypothesis_or_runtime_authority_contract_gap",
+                        "recommended_closure_bias": "contract_handoff_gap_created",
+                    },
+                }
+            ]
+        },
+        {
+            "ldm_refinement_pressure_consumption": {
+                "input_count": 1,
+                "closure_counts": {"contract_handoff_gap_created": 1},
+                "entries": [
+                    {
+                        "refinement_input_id": "ref_input_authority",
+                        "closure_status": "contract_handoff_gap_created",
+                        "closure_reason": "matched_hypothesis_or_runtime_authority_contract_gap",
+                    }
+                ],
+            }
+        },
+    )
+
+    assert status["status"] == "fail"
+    assert "ldm_refinement_runtime_authority_violation_fail" in status["missing"]
+    assert status["runtime_authority_violation_input_ids"] == ["ref_input_authority"]
+
+
+def test_postclose_markdown_surfaces_ldm_and_active_priority_diagnosis():
+    markdown = mod._render_markdown(
+        {
+            "date": "2026-06-01",
+            "status": "warning",
+            "ldm_hypothesis_parent_refinement_consumption": {
+                "status": "fail",
+                "input_count": 1,
+                "consumed_count": 1,
+                "closure_counts": {"contract_handoff_gap_created": 1},
+                "missing": ["ldm_refinement_runtime_authority_violation_fail"],
+                "warnings": [],
+                "diagnosis_missing_warning_input_ids": ["ref_warn"],
+                "diagnosis_missing_fail_input_ids": ["ref_fail"],
+                "diagnosed_repeated_input_ids": ["ref_diag"],
+                "runtime_authority_violation_input_ids": ["ref_auth"],
+            },
+            "active_sim_priority_handoff": {
+                "status": "fail",
+                "active_seed_ids": ["active_seed_bad"],
+                "observed_seed_ids": [],
+                "missing": [
+                    "active_sim_priority_seed_observable_prefix_forbidden_dimension"
+                ],
+                "warnings": [],
+                "active_priority_match_absence_diagnosis": {
+                    "diagnosis": "posterior_dimension_leaked_into_priority",
+                    "reason": "active_prefix_contains_non_runtime_observable_dimension",
+                    "candidate_prefix_count": 3,
+                    "top_candidate_prefixes": [["{}", 3]],
+                },
+            },
+            "smoothing_source_only_path_journal": {
+                "status": "pass",
+                "issues": [],
+                "rolling_decision_status": "pass",
+            },
+        }
+    )
+
+    assert "runtime_authority_violation_input_ids: `['ref_auth']`" in markdown
+    assert "## Active Sim Priority Handoff" in markdown
+    assert (
+        "match_absence_diagnosis: `posterior_dimension_leaked_into_priority`"
+        in markdown
+    )
+    assert "smoothing_source_only_rolling_decision: `pass`" in markdown
+
+
+def test_swing_entry_bottleneck_handoff_fails_when_downstream_missing():
+    matrix = {
+        "input_contract": {"swing_daily_simulation_consumed": False},
+        "swing_entry_bottleneck": {
+            "primary": "SWING_ENTRY_DROUGHT_CRITICAL",
+            "matches": ["GATEKEEPER_PULLBACK_WAIT", "SUBMIT_ZERO"],
+        },
+    }
+
+    report = mod._swing_lifecycle_handoff_status(matrix, {}, {}, {}, {"orders": []})
+
+    assert report["status"] == "fail"
+    assert report["swing_entry_bottleneck_critical"] is True
+    assert "swing_entry_bottleneck_handoff_missing" in report["missing"]
+    assert (
+        "order_swing_entry_bottleneck_auto_resolution"
+        in report["missing_workorder_order_ids"]
+    )
+
+
+def test_swing_entry_bottleneck_handoff_passes_when_surfaced():
+    matrix = {
+        "input_contract": {"swing_daily_simulation_consumed": False},
+        "swing_entry_bottleneck": {
+            "primary": "SWING_ENTRY_DROUGHT_CRITICAL",
+            "matches": ["GATEKEEPER_PULLBACK_WAIT", "SUBMIT_ZERO"],
+        },
+    }
+    discovery = {
+        "surfaced_candidate_ids": [
+            "swing_entry_bottleneck_swing_entry_drought_critical"
+        ],
+    }
+    ev_report = {
+        "swing_lifecycle_decision_matrix": {
+            "swing_entry_bottleneck_primary": "SWING_ENTRY_DROUGHT_CRITICAL",
+        },
+        "swing_lifecycle_bucket_discovery": discovery,
+    }
+    runtime_summary = {
+        "swing_lifecycle_decision_matrix": {
+            "swing_entry_bottleneck_primary": "SWING_ENTRY_DROUGHT_CRITICAL",
+        },
+        "swing_lifecycle_bucket_discovery": discovery,
+    }
+    workorder = {
+        "orders": [{"order_id": "order_swing_entry_bottleneck_auto_resolution"}]
+    }
+
+    report = mod._swing_lifecycle_handoff_status(
+        matrix, discovery, ev_report, runtime_summary, workorder
+    )
+
+    assert report["status"] == "pass"
+    assert report["missing"] == []
+
+
+def test_swing_lifecycle_handoff_uses_hashed_long_workorder_ids():
+    long_bucket_key = "selection_discovery_arm_attribution_" + ("long_dimension_" * 10)
+    matrix_workorder = {
+        "lifecycle_stage": "entry",
+        "bucket_type": "source_quality",
+        "bucket_key": long_bucket_key,
+    }
+    discovery_bucket_id = "swing_bucket_" + ("long_dimension_" * 10)
+    matrix = {
+        "input_contract": {"swing_daily_simulation_consumed": False},
+        "discovery_arm_attribution": {
+            "code_improvement_workorders": [matrix_workorder],
+        },
+    }
+    discovery = {
+        "summary": {"ai_two_pass_review_status": "parsed", "ai_fail_closed": False},
+        "code_improvement_workorders": [{"bucket_id": discovery_bucket_id}],
+    }
+    workorder = {
+        "orders": [
+            {"order_id": mod._swing_ldm_order_id(matrix_workorder)},
+            {
+                "order_id": (
+                    "order_swing_lifecycle_bucket_discovery_"
+                    f"{mod._slug_with_hash(discovery_bucket_id)}"
+                )
+            },
+        ]
+    }
+
+    report = mod._swing_lifecycle_handoff_status(matrix, discovery, {}, {}, workorder)
+
+    assert report["status"] == "pass"
+    assert report["missing_workorder_order_ids"] == []
+
+
+def test_swing_parent_flow_handoff_passes_when_ev_and_runtime_include_candidate():
+    candidate = {
+        "candidate_id": "swing_ldm_lifecycle_flow_combo_parent",
+        "bucket_id": "swing_ldm_lifecycle_flow_combo_parent",
+    }
+    matrix = {
+        "input_contract": {"swing_daily_simulation_consumed": False},
+        "swing_lifecycle_flow_bucket_attribution": {
+            "runtime_approval_candidates": [candidate],
+            "sim_auto_approval_candidates": [candidate],
+        },
+    }
+    discovery = {
+        "summary": {"ai_two_pass_review_status": "parsed", "ai_fail_closed": False},
+        "surfaced_candidate_ids": ["swing_ldm_lifecycle_flow_combo_parent"],
+    }
+    ev_report = {
+        "swing_lifecycle_decision_matrix": {
+            "sim_auto_candidate_ids": ["swing_ldm_lifecycle_flow_combo_parent"],
+        },
+        "swing_lifecycle_bucket_discovery": discovery,
+    }
+    runtime_summary = {
+        "swing_lifecycle_decision_matrix": {
+            "sim_auto_candidate_ids": ["swing_ldm_lifecycle_flow_combo_parent"],
+        },
+        "swing_lifecycle_bucket_discovery": discovery,
+    }
+
+    report = mod._swing_lifecycle_handoff_status(
+        matrix, discovery, ev_report, runtime_summary, {"orders": []}
+    )
+
+    assert report["status"] == "pass"
+    assert report["missing"] == []
+
+
+def test_swing_lifecycle_handoff_ignores_discovery_source_only_extras_for_required_handoff():
+    candidate = {
+        "candidate_id": "swing_ldm_lifecycle_flow_combo_parent",
+        "bucket_id": "swing_ldm_lifecycle_flow_combo_parent",
+    }
+    matrix = {
+        "input_contract": {"swing_daily_simulation_consumed": False},
+        "swing_lifecycle_flow_bucket_attribution": {
+            "runtime_approval_candidates": [candidate],
+            "sim_auto_approval_candidates": [candidate],
+        },
+    }
+    discovery = {
+        "summary": {"ai_two_pass_review_status": "missing", "ai_fail_closed": True},
+        "surfaced_candidates": [
+            candidate,
+            {
+                "candidate_id": "swing_bucket_entry_source_only_extra",
+                "bucket_id": "swing_bucket_entry_source_only_extra",
+                "stage": "entry",
+                "lifecycle_stage": "entry",
+                "classification_state": "source_only_keep_collecting",
+            },
+        ],
+        "warnings": ["ai_two_pass_review_missing_fail_closed"],
+    }
+    ev_report = {
+        "swing_lifecycle_decision_matrix": {
+            "sim_auto_candidate_ids": ["swing_ldm_lifecycle_flow_combo_parent"],
+        },
+    }
+    runtime_summary = {
+        "swing_lifecycle_decision_matrix": {
+            "sim_auto_candidate_ids": ["swing_ldm_lifecycle_flow_combo_parent"],
+        },
+    }
+
+    report = mod._swing_lifecycle_handoff_status(
+        matrix, discovery, ev_report, runtime_summary, {"orders": []}
+    )
+
+    assert report["status"] == "warning"
+    assert report["missing"] == []
+    assert report["expected_candidate_ids"] == ["swing_ldm_lifecycle_flow_combo_parent"]
+    assert (
+        "swing_lifecycle_bucket_discovery:ai_two_pass_review_missing_fail_closed"
+        in report["warnings"]
+    )
+
+
+def test_swing_lifecycle_handoff_requires_non_flow_matrix_approval_candidate():
+    candidate = {
+        "candidate_id": "swing_ldm_entry_policy_candidate",
+        "bucket_id": "swing_ldm_entry_policy_candidate",
+        "stage": "entry",
+        "lifecycle_stage": "entry",
+    }
+    matrix = {
+        "input_contract": {"swing_daily_simulation_consumed": False},
+        "entry_bucket_attribution": {
+            "sim_auto_approval_candidates": [candidate],
+        },
+    }
+    discovery = {
+        "summary": {"ai_two_pass_review_status": "parsed", "ai_fail_closed": False},
+        "surfaced_candidates": [candidate],
+    }
+    ev_report = {
+        "swing_lifecycle_decision_matrix": {
+            "sim_auto_candidate_ids": ["swing_ldm_entry_policy_candidate"],
+        },
+    }
+    runtime_summary = {
+        "swing_lifecycle_decision_matrix": {
+            "sim_auto_candidate_ids": ["swing_ldm_entry_policy_candidate"],
+        },
+    }
+
+    report = mod._swing_lifecycle_handoff_status(
+        matrix, discovery, ev_report, runtime_summary, {"orders": []}
+    )
+
+    assert report["status"] == "pass"
+    assert report["missing"] == []
+    assert report["required_matrix_candidate_ids"] == [
+        "swing_ldm_entry_policy_candidate"
+    ]
+    assert report["expected_candidate_ids"] == ["swing_ldm_entry_policy_candidate"]
+
+
+def test_swing_lifecycle_handoff_fails_when_matrix_candidate_missing_from_discovery():
+    matrix = {
+        "input_contract": {"swing_daily_simulation_consumed": False},
+        "swing_lifecycle_flow_bucket_attribution": {
+            "sim_auto_approval_candidates": [
+                {
+                    "candidate_id": "swing_ldm_lifecycle_flow_combo_parent",
+                    "bucket_id": "swing_ldm_lifecycle_flow_combo_parent",
+                }
+            ],
+        },
+    }
+    discovery = {
+        "summary": {"ai_two_pass_review_status": "parsed", "ai_fail_closed": False},
+        "surfaced_candidate_ids": ["swing_ldm_lifecycle_flow_renamed"],
+    }
+    ev_report = {
+        "swing_lifecycle_decision_matrix": {
+            "sim_auto_candidate_ids": ["swing_ldm_lifecycle_flow_combo_parent"],
+        },
+        "swing_lifecycle_bucket_discovery": discovery,
+    }
+    runtime_summary = {
+        "swing_lifecycle_decision_matrix": {
+            "sim_auto_candidate_ids": ["swing_ldm_lifecycle_flow_combo_parent"],
+        },
+        "swing_lifecycle_bucket_discovery": discovery,
+    }
+
+    report = mod._swing_lifecycle_handoff_status(
+        matrix, discovery, ev_report, runtime_summary, {"orders": []}
+    )
+
+    assert report["status"] == "fail"
+    assert (
+        "swing_lifecycle_matrix_to_discovery_candidate_handoff_missing"
+        in report["missing"]
+    )
+    assert report["missing_matrix_to_discovery_candidate_ids"] == [
+        "swing_ldm_lifecycle_flow_combo_parent"
+    ]
+
+
+def test_swing_lifecycle_handoff_warns_on_ai_two_pass_missing():
+    matrix = {
+        "input_contract": {"swing_daily_simulation_consumed": False},
+        "entry_bucket_attribution": {"buckets": []},
+    }
+    discovery = {
+        "summary": {
+            "ai_two_pass_review_status": "missing",
+            "ai_fail_closed": True,
+            "ai_review_blocker_state": "provider_disabled",
+            "pre_review_sim_auto_candidate_count": 1,
+            "deterministic_proposal_count": 1,
+            "ai_tier2_proposal_count": 0,
+        },
+        "surfaced_candidate_ids": [],
+        "warnings": ["ai_two_pass_review_missing_fail_closed"],
+    }
+
+    report = mod._swing_lifecycle_handoff_status(
+        matrix, discovery, {}, {}, {"orders": []}
+    )
+
+    assert report["status"] == "warning"
+    assert report["missing"] == []
+    assert report["ai_two_pass_review_status"] == "missing"
+    assert report["ai_review_blocker_state"] == "provider_disabled"
+    assert report["pre_review_sim_auto_candidate_count"] == 1
+    assert (
+        "swing_lifecycle_bucket_discovery:ai_two_pass_review_fail_closed_sim_auto_blocked"
+        in report["warnings"]
+    )
+
+
+def test_swing_lifecycle_handoff_warns_on_discovery_stage_unknown():
+    matrix = {
+        "input_contract": {"swing_daily_simulation_consumed": False},
+        "entry_bucket_attribution": {"buckets": []},
+    }
+    discovery = {
+        "summary": {"ai_two_pass_review_status": "parsed", "ai_fail_closed": False},
+        "surfaced_candidates": [
+            {"candidate_id": "swing:unknown-stage", "bucket_id": "swing:unknown-stage"}
+        ],
+        "surfaced_candidate_ids": [],
+        "warnings": [],
+    }
+    ev_report = {"swing_lifecycle_bucket_discovery": discovery}
+    runtime_summary = {"swing_lifecycle_bucket_discovery": discovery}
+
+    report = mod._swing_lifecycle_handoff_status(
+        matrix, discovery, ev_report, runtime_summary, {"orders": []}
+    )
+
+    assert report["status"] == "warning"
+    assert report["stage_unknown_candidate_ids"] == ["swing:unknown-stage"]
+    assert "swing_lifecycle_bucket_discovery:stage_unknown" in report["warnings"]
+
+
+def test_swing_lifecycle_handoff_warns_on_low_ldm_event_coverage():
+    matrix = {
+        "input_contract": {"swing_daily_simulation_consumed": False},
+        "summary": {
+            "raw_swing_event_count": 1200,
+            "ldm_consumed_event_count": 5,
+            "ldm_event_coverage_rate": 0.004167,
+            "unmapped_swing_stage_counts": {"swing_custom_event": 1195},
+        },
+        "entry_bucket_attribution": {"buckets": []},
+    }
+    discovery = {
+        "summary": {"ai_two_pass_review_status": "parsed", "ai_fail_closed": False},
+        "surfaced_candidate_ids": [],
+        "warnings": [],
+    }
+
+    report = mod._swing_lifecycle_handoff_status(
+        matrix, discovery, {}, {}, {"orders": []}
+    )
+
+    assert report["status"] == "warning"
+    assert report["raw_swing_event_count"] == 1200
+    assert report["ldm_consumed_event_count"] == 5
+    assert report["ldm_event_coverage_rate"] == 0.004167
+    assert report["unmapped_swing_stage_counts"] == {"swing_custom_event": 1195}
+    assert "swing_lifecycle_decision_matrix:low_event_coverage" in report["warnings"]
+
+
+def test_swing_lifecycle_handoff_warns_on_nan_ldm_event_coverage():
+    matrix = {
+        "input_contract": {"swing_daily_simulation_consumed": False},
+        "summary": {
+            "raw_swing_event_count": 1200,
+            "ldm_consumed_event_count": 5,
+            "ldm_event_coverage_rate": "nan",
+            "unmapped_swing_stage_counts": {"swing_custom_event": 1195},
+        },
+        "entry_bucket_attribution": {"buckets": []},
+    }
+    discovery = {
+        "summary": {"ai_two_pass_review_status": "parsed", "ai_fail_closed": False},
+        "surfaced_candidate_ids": [],
+        "warnings": [],
+    }
+
+    report = mod._swing_lifecycle_handoff_status(
+        matrix, discovery, {}, {}, {"orders": []}
+    )
+
+    assert report["status"] == "warning"
+    assert report["ldm_event_coverage_rate"] == 0.0
+    assert "swing_lifecycle_decision_matrix:low_event_coverage" in report["warnings"]
+
+
+def test_swing_lifecycle_handoff_passes_without_ai_warning_when_parsed():
+    matrix = {
+        "input_contract": {"swing_daily_simulation_consumed": False},
+        "entry_bucket_attribution": {"buckets": []},
+    }
+    discovery = {
+        "summary": {
+            "ai_two_pass_review_status": "parsed",
+            "ai_fail_closed": False,
+            "ai_review_blocker_state": "none",
+            "pre_review_sim_auto_candidate_count": 1,
+            "deterministic_proposal_count": 1,
+            "ai_tier2_proposal_count": 1,
+        },
+        "surfaced_candidate_ids": [],
+        "warnings": [],
+    }
+
+    report = mod._swing_lifecycle_handoff_status(
+        matrix, discovery, {}, {}, {"orders": []}
+    )
+
+    assert report["status"] == "pass"
+    assert report["missing"] == []
+    assert report["warnings"] == []
+    assert report["ai_review_blocker_state"] == "none"
+
+
+def test_swing_lifecycle_provider_mismatch_warning_uses_done_marker_provider():
+    values = mod._parse_marker_values(
+        "[DONE] threshold-cycle postclose target_date=2026-05-12 "
+        "swing_lifecycle_bucket_discovery_ai_provider=responses"
+    )
+    assert values["swing_lifecycle_bucket_discovery_ai_provider"] == "responses"
+
+    warning = mod._swing_lifecycle_provider_mismatch_warning(
+        "[DONE] threshold-cycle postclose target_date=2026-05-12 "
+        "swing_lifecycle_bucket_discovery_ai_provider=openai",
+        {"ai_two_pass_review": {"provider": "none"}},
+    )
+
+    assert warning == (
+        "swing_lifecycle_bucket_discovery:ai_provider_mismatch:"
+        "done_marker=openai:artifact=none"
+    )
+
+
+def test_consumer_stale_detects_generated_at_ordering():
+    consumer = {"generated_at": "2026-05-12T21:20:00+09:00"}
+    source = {"generated_at": "2026-05-12T21:21:00+09:00"}
+
+    assert mod._consumer_stale(consumer, source) is True
+    assert mod._consumer_stale(source, consumer) is False
+
+
+def test_consumer_stale_normalizes_legacy_naive_kst_timestamp():
+    consumer = {"generated_at": "2026-05-12 21:20:00"}
+    source = {"generated_at": "2026-05-12T21:21:00+09:00"}
+
+    assert mod._consumer_stale(consumer, source) is True
+    assert mod._consumer_stale(source, consumer) is False
+
+
+def test_postclose_verifier_does_not_flag_ev_stale_when_ev_is_newer_than_tail_sources(
+    tmp_path, monkeypatch
+):
+    project_root = tmp_path
+    report_dir = project_root / "data" / "report"
+    log_path = project_root / "logs" / "threshold_cycle_postclose_cron.log"
+    (project_root / "logs").mkdir(parents=True)
+    (project_root / "docs" / "checklists").mkdir(parents=True)
+    (
+        project_root / "docs" / "checklists" / "2026-05-13-stage2-todo-checklist.md"
+    ).write_text(
+        "# next\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(mod, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(mod, "REPORT_DIR", report_dir)
+    monkeypatch.setattr(mod, "LOG_PATH", log_path)
+    monkeypatch.setattr(
+        mod, "VERIFY_DIR", report_dir / "threshold_cycle_postclose_verification"
+    )
+    monkeypatch.setattr(mod, "_next_krx_trading_day", lambda target_date: "2026-05-13")
+
+    for label, path in mod._artifact_paths("2026-05-12").items():
+        if label == "next_stage2_checklist":
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"report_type": label, "generated_at": "2026-05-12T17:00:00+09:00"}
+        if label == "threshold_cycle_ev":
+            payload.update(
+                {
+                    "generated_at": "2026-05-12T18:00:00+09:00",
+                    "sources": {
+                        "code_improvement_workorder": "code_improvement_workorder_2026-05-12.json",
+                        "pattern_lab_currentness_audit": "pattern_lab_currentness_audit_2026-05-12.json",
+                        "pattern_lab_ai_review": "pattern_lab_ai_review_2026-05-12.json",
+                        "producer_gap_discovery": "producer_gap_discovery_2026-05-12.json",
+                        "pattern_lab_propagation_audit": "pattern_lab_propagation_audit_2026-05-12.json",
+                        "scalp_entry_action_decision_matrix": "scalp_entry_action_decision_matrix_2026-05-12.json",
+                        "lifecycle_decision_matrix": "lifecycle_decision_matrix_2026-05-12.json",
+                    },
+                }
+            )
+        elif label == "runtime_approval_summary":
+            payload.update(
+                {
+                    "generated_at": "2026-05-12T18:00:05+09:00",
+                    "sources": {
+                        "threshold_cycle_ev": "threshold_cycle_ev_2026-05-12.json",
+                        "pattern_lab_propagation_audit": "pattern_lab_propagation_audit_2026-05-12.json",
+                        "pattern_lab_ai_review": "pattern_lab_ai_review_2026-05-12.json",
+                        "scalp_entry_action_decision_matrix": "scalp_entry_action_decision_matrix_2026-05-12.json",
+                        "lifecycle_decision_matrix": "lifecycle_decision_matrix_2026-05-12.json",
+                    },
+                }
+            )
+        elif label == "code_improvement_workorder":
+            payload.update(
+                {
+                    "generated_at": "2026-05-12T17:59:55+09:00",
+                    "generation_id": "g1",
+                    "source_hash": "h1",
+                    "lineage": {"previous_exists": False},
+                    "orders": [],
+                }
+            )
+        elif label in {
+            "pattern_lab_currentness_audit",
+            "pattern_lab_ai_review",
+            "producer_gap_discovery",
+            "pattern_lab_propagation_audit",
+        }:
+            payload["generated_at"] = "2026-05-12T17:59:50+09:00"
+        elif label in {"lifecycle_decision_matrix", "lifecycle_bucket_discovery"}:
+            payload["summary"] = {"status": "pass"}
+        elif label == "runtime_apply_gap_audit":
+            payload.update(
+                {
+                    "status": "pass",
+                    "summary": {
+                        "critical_failure_count": 0,
+                        "ai_review_retry_pending": False,
+                    },
+                }
+            )
+        elif label == "swing_strategy_discovery_sim":
+            payload.update(
+                {
+                    "source_quality": {"bottom_rebound_source": {"status": "disabled"}},
+                    "persist_summary": {},
+                }
+            )
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    log_path.write_text(
+        "[START] threshold-cycle postclose target_date=2026-05-12 started_at=2026-05-12T17:00:00+0900\n"
+        "[DONE] threshold-cycle postclose target_date=2026-05-12 swing_lifecycle=true pattern_labs=false "
+        "deepseek_swing_lab=false pattern_lab_currentness_audit=true pattern_lab_ai_review=true "
+        "pattern_lab_propagation_audit=true scalp_entry_adm=true lifecycle_decision_matrix=true "
+        "runtime_apply_bridge=true code_improvement_workorder=true daily_ev=true runtime_approval_summary=true "
+        "runtime_apply_gap_audit=true next_stage2_checklist=true producer_gap_discovery=true "
+        "finished_at=2026-05-12T18:30:00+0900\n",
+        encoding="utf-8",
+    )
+
+    report = mod.build_threshold_cycle_postclose_verification("2026-05-12")
+
+    assert report["stale_downstream_links"] == []
+
+
+def test_postclose_verifier_warns_when_ev_runtime_stale_before_ldm_sources(
+    tmp_path, monkeypatch
+):
+    project_root = tmp_path
+    report_dir = project_root / "data" / "report"
+    log_path = project_root / "logs" / "threshold_cycle_postclose_cron.log"
+    (project_root / "logs").mkdir(parents=True)
+    (project_root / "docs" / "checklists").mkdir(parents=True)
+    (
+        project_root / "docs" / "checklists" / "2026-05-13-stage2-todo-checklist.md"
+    ).write_text(
+        "# next\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(mod, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(mod, "REPORT_DIR", report_dir)
+    monkeypatch.setattr(mod, "LOG_PATH", log_path)
+    monkeypatch.setattr(
+        mod, "VERIFY_DIR", report_dir / "threshold_cycle_postclose_verification"
+    )
+    monkeypatch.setattr(mod, "_next_krx_trading_day", lambda target_date: "2026-05-13")
+
+    for label, path in mod._artifact_paths("2026-05-12").items():
+        if label == "next_stage2_checklist":
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"report_type": label, "generated_at": "2026-05-12T17:00:00+09:00"}
+        if label == "threshold_cycle_ev":
+            payload["sources"] = {
+                "code_improvement_workorder": "code_improvement_workorder_2026-05-12.json",
+                "pattern_lab_currentness_audit": "pattern_lab_currentness_audit_2026-05-12.json",
+                "pattern_lab_ai_review": "pattern_lab_ai_review_2026-05-12.json",
+                "producer_gap_discovery": "producer_gap_discovery_2026-05-12.json",
+                "stage_hook_workorder_discovery": "stage_hook_workorder_discovery_2026-05-12.json",
+                "stage_hook_runtime_scaffold": "stage_hook_runtime_scaffold_2026-05-12.json",
+                "pattern_lab_propagation_audit": "pattern_lab_propagation_audit_2026-05-12.json",
+                "scalp_entry_action_decision_matrix": "scalp_entry_action_decision_matrix_2026-05-12.json",
+                "lifecycle_decision_matrix": "lifecycle_decision_matrix_2026-05-12.json",
+                "swing_lifecycle_decision_matrix": "swing_lifecycle_decision_matrix_2026-05-12.json",
+                "swing_lifecycle_bucket_discovery": "swing_lifecycle_bucket_discovery_2026-05-12.json",
+            }
+        elif label == "runtime_approval_summary":
+            payload["sources"] = {
+                "threshold_cycle_ev": "threshold_cycle_ev_2026-05-12.json",
+                "scalp_entry_action_decision_matrix": "scalp_entry_action_decision_matrix_2026-05-12.json",
+                "lifecycle_decision_matrix": "lifecycle_decision_matrix_2026-05-12.json",
+                "swing_lifecycle_decision_matrix": "swing_lifecycle_decision_matrix_2026-05-12.json",
+                "swing_lifecycle_bucket_discovery": "swing_lifecycle_bucket_discovery_2026-05-12.json",
+                "pattern_lab_propagation_audit": "pattern_lab_propagation_audit_2026-05-12.json",
+                "pattern_lab_ai_review": "pattern_lab_ai_review_2026-05-12.json",
+            }
+        elif label in {
+            "lifecycle_decision_matrix",
+            "lifecycle_bucket_discovery",
+            "swing_lifecycle_decision_matrix",
+            "swing_lifecycle_bucket_discovery",
+        }:
+            payload["generated_at"] = "2026-05-12T18:00:00+09:00"
+            payload["runtime_effect"] = False
+            payload["actual_order_submitted"] = False
+            payload["broker_order_forbidden"] = True
+            payload["allowed_runtime_apply"] = False
+            payload["summary"] = {"status": "pass"}
+        elif label == "runtime_apply_gap_audit":
+            payload.update(
+                {
+                    "status": "pass",
+                    "summary": {
+                        "critical_failure_count": 0,
+                        "ai_review_retry_pending": False,
+                    },
+                }
+            )
+        elif label == "code_improvement_workorder":
+            payload.update(
+                {
+                    "generation_id": "g1",
+                    "source_hash": "h1",
+                    "lineage": {"previous_exists": False},
+                    "orders": [],
+                }
+            )
+        elif label == "swing_strategy_discovery_sim":
+            payload.update(
+                {
+                    "source_quality": {"bottom_rebound_source": {"status": "disabled"}},
+                    "persist_summary": {},
+                }
+            )
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    log_path.write_text(
+        "[START] threshold-cycle postclose target_date=2026-05-12 started_at=2026-05-12T17:00:00+0900\n"
+        "[DONE] threshold-cycle postclose target_date=2026-05-12 swing_lifecycle=true pattern_labs=false "
+        "deepseek_swing_lab=false pattern_lab_currentness_audit=false pattern_lab_ai_review=false "
+        "pattern_lab_propagation_audit=true scalp_entry_adm=true lifecycle_decision_matrix=true "
+        "runtime_apply_bridge=true code_improvement_workorder=true daily_ev=true runtime_approval_summary=true "
+        "runtime_apply_gap_audit=true next_stage2_checklist=true swing_strategy_discovery=true "
+        "swing_lifecycle_matrix=true swing_lifecycle_bucket_discovery=true producer_gap_discovery=false "
+        "stage_hook_workorder_discovery=false stage_hook_runtime_scaffold=false finished_at=2026-05-12T18:30:00+0900\n",
+        encoding="utf-8",
+    )
+
+    report = mod.build_threshold_cycle_postclose_verification("2026-05-12")
+
+    assert (
+        "threshold_cycle_ev_stale_before_swing_lifecycle_decision_matrix"
+        in report["source_generation_warnings"]
+    )
+    assert (
+        "runtime_approval_summary_stale_before_lifecycle_bucket_discovery"
+        in report["handoff_warnings"]
+    )
+    assert report["stale_downstream_links"] == []
+
+
+def _write_adm_artifact(report_dir: Path, target_date: str = "2026-05-12") -> Path:
+    path = (
+        report_dir
+        / "scalp_entry_action_decision_matrix"
+        / f"scalp_entry_action_decision_matrix_{target_date}.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"report_type": "scalp_entry_action_decision_matrix"}),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_lifecycle_artifact(
+    report_dir: Path, target_date: str = "2026-05-12"
+) -> Path:
+    path = (
+        report_dir
+        / "lifecycle_decision_matrix"
+        / f"lifecycle_decision_matrix_{target_date}.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"report_type": "lifecycle_decision_matrix"}), encoding="utf-8"
+    )
+    return path
+
+
+def _write_swing_discovery_sim_artifact(
+    report_dir: Path, target_date: str = "2026-05-12"
+) -> Path:
+    path = (
+        report_dir
+        / "swing_strategy_discovery_sim"
+        / f"swing_strategy_discovery_sim_{target_date}.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "report_type": "swing_strategy_discovery_sim",
+                "source_quality": {
+                    "bottom_rebound_source": {"status": "disabled"},
+                    "bottom_rebound_source_rows": 0,
+                },
+                "summary": {},
+                "persist_summary": {"candidate_rows": 0, "arm_rows": 0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_build_threshold_cycle_postclose_verification_prefers_workorder_lineage(
+    tmp_path, monkeypatch
+):
+    project_root = tmp_path
+    report_dir = project_root / "data" / "report"
+    (project_root / "logs").mkdir(parents=True)
+    (report_dir / "threshold_cycle_ev").mkdir(parents=True)
+    (report_dir / "code_improvement_workorder").mkdir(parents=True)
+    (report_dir / "runtime_approval_summary").mkdir(parents=True)
+    (report_dir / "pattern_lab_currentness_audit").mkdir(parents=True)
+    (report_dir / "pattern_lab_propagation_audit").mkdir(parents=True)
+    (report_dir / "market_panic_breadth").mkdir(parents=True)
+    (report_dir / "panic_sell_defense").mkdir(parents=True)
+    (report_dir / "swing_daily_simulation").mkdir(parents=True)
+    (report_dir / "swing_strategy_discovery_sim").mkdir(parents=True)
+    (report_dir / "swing_lifecycle_audit").mkdir(parents=True)
+    (project_root / "docs").mkdir(parents=True)
+    adm_path = _write_adm_artifact(report_dir)
+    lifecycle_path = _write_lifecycle_artifact(report_dir)
+
+    log_path = project_root / "logs" / "threshold_cycle_postclose_cron.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "[START] threshold-cycle postclose target_date=2026-05-12 started_at=2026-05-12T21:00:00+0900",
+                "[threshold-cycle] artifact ready label=swing_daily_simulation.json path=/tmp/a waited=0s json_valid=true",
+                "[threshold-cycle] artifact ready label=threshold_cycle_ev_pre_workorder.json path=/tmp/b waited=0s json_valid=true",
+                "[DONE] threshold-cycle postclose target_date=2026-05-12 swing_lifecycle=true pattern_labs=true deepseek_swing_lab=true pattern_lab_currentness_audit=true pattern_lab_propagation_audit=true scalp_entry_adm=true lifecycle_decision_matrix=true code_improvement_workorder=true daily_ev=true runtime_approval_summary=true next_stage2_checklist=true finished_at=2026-05-12T21:30:00+0900",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    (
+        report_dir / "threshold_cycle_ev" / "threshold_cycle_ev_2026-05-12.json"
+    ).write_text(
+        json.dumps(
+            {
+                "sources": {
+                    "code_improvement_workorder": str(
+                        report_dir
+                        / "code_improvement_workorder"
+                        / "code_improvement_workorder_2026-05-12.json"
+                    ),
+                    "pattern_lab_currentness_audit": str(
+                        report_dir
+                        / "pattern_lab_currentness_audit"
+                        / "pattern_lab_currentness_audit_2026-05-12.json"
+                    ),
+                    "pattern_lab_propagation_audit": str(
+                        report_dir
+                        / "pattern_lab_propagation_audit"
+                        / "pattern_lab_propagation_audit_2026-05-12.json"
+                    ),
+                    "scalp_entry_action_decision_matrix": str(adm_path),
+                    "lifecycle_decision_matrix": str(lifecycle_path),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (
+        report_dir
+        / "code_improvement_workorder"
+        / "code_improvement_workorder_2026-05-12.json"
+    ).write_text(
+        json.dumps(
+            {
+                "generation_id": "2026-05-12-newhash",
+                "source_hash": "newhash",
+                "summary": {
+                    "new_selected_order_count": 1,
+                    "removed_selected_order_count": 0,
+                    "decision_changed_order_count": 0,
+                    "repeat_unresolved_structural_blocker_count": 1,
+                    "repeat_unresolved_structural_blocker_order_ids": ["order_new"],
+                    "selected_terminal_non_implement_longstanding_count": 2,
+                    "selected_terminal_non_implement_longstanding_order_ids": [
+                        "order_old_a",
+                        "order_old_b",
+                    ],
+                },
+                "lineage": {
+                    "previous_exists": True,
+                    "previous_generation_id": "2026-05-12-oldhash",
+                    "previous_source_hash": "oldhash",
+                    "new_order_ids": ["order_new"],
+                    "removed_order_ids": [],
+                    "decision_changed_order_ids": [],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (
+        report_dir
+        / "runtime_approval_summary"
+        / "runtime_approval_summary_2026-05-12.json"
+    ).write_text(
+        json.dumps(
+            {
+                "sources": {
+                    "threshold_cycle_ev": str(
+                        report_dir
+                        / "threshold_cycle_ev"
+                        / "threshold_cycle_ev_2026-05-12.json"
+                    ),
+                    "pattern_lab_propagation_audit": str(
+                        report_dir
+                        / "pattern_lab_propagation_audit"
+                        / "pattern_lab_propagation_audit_2026-05-12.json"
+                    ),
+                    "scalp_entry_action_decision_matrix": str(adm_path),
+                    "lifecycle_decision_matrix": str(lifecycle_path),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (
+        report_dir
+        / "pattern_lab_currentness_audit"
+        / "pattern_lab_currentness_audit_2026-05-12.json"
+    ).write_text(
+        json.dumps({"report_type": "pattern_lab_currentness_audit"}),
+        encoding="utf-8",
+    )
+    (
+        report_dir
+        / "pattern_lab_propagation_audit"
+        / "pattern_lab_propagation_audit_2026-05-12.json"
+    ).write_text(
+        json.dumps({"report_type": "pattern_lab_propagation_audit"}),
+        encoding="utf-8",
+    )
+    (
+        report_dir / "market_panic_breadth" / "market_panic_breadth_2026-05-12.json"
+    ).write_text(
+        json.dumps({"report_type": "market_panic_breadth"}),
+        encoding="utf-8",
+    )
+    (
+        report_dir / "panic_sell_defense" / "panic_sell_defense_2026-05-12.json"
+    ).write_text(
+        json.dumps({"report_type": "panic_sell_defense"}),
+        encoding="utf-8",
+    )
+    (
+        report_dir / "swing_daily_simulation" / "swing_daily_simulation_2026-05-12.json"
+    ).write_text("{}", encoding="utf-8")
+    (
+        report_dir / "swing_lifecycle_audit" / "swing_lifecycle_audit_2026-05-12.json"
+    ).write_text("{}", encoding="utf-8")
+    _write_swing_discovery_sim_artifact(report_dir)
+    (project_root / "docs" / "checklists").mkdir(parents=True)
+    (
+        project_root / "docs" / "checklists" / "2026-05-13-stage2-todo-checklist.md"
+    ).write_text(
+        "# next\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(mod, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(mod, "REPORT_DIR", report_dir)
+    monkeypatch.setattr(
+        mod, "VERIFY_DIR", report_dir / "threshold_cycle_postclose_verification"
+    )
+    monkeypatch.setattr(mod, "LOG_PATH", log_path)
+    monkeypatch.setattr(mod, "_next_krx_trading_day", lambda target_date: "2026-05-13")
+
+    report = mod.build_threshold_cycle_postclose_verification("2026-05-12")
+
+    assert report["status"] == "pass"
+    assert report["predecessor_integrity"]["wait_count"] == 0
+    assert report["workorder_snapshot"]["status"] == "source_changed_with_lineage"
+    assert report["workorder_snapshot"]["new_order_ids"] == ["order_new"]
+    assert (
+        report["workorder_snapshot"]["repeat_unresolved_structural_blocker_count"] == 1
+    )
+    assert (
+        report["workorder_snapshot"][
+            "selected_terminal_non_implement_longstanding_count"
+        ]
+        == 2
+    )
+    assert report["downstream_links"]["runtime_approval_summary_sources_ev"].endswith(
+        "threshold_cycle_ev_2026-05-12.json"
+    )
+    assert report["downstream_links"][
+        "threshold_cycle_ev_sources_pattern_lab_currentness_audit"
+    ].endswith("pattern_lab_currentness_audit_2026-05-12.json")
+    artifact_labels = {item["label"] for item in report["artifact_status"]}
+    assert "quote_consistency" not in artifact_labels
+    assert "quote_consistency" not in report
+    assert {
+        "market_panic_breadth",
+        "panic_sell_defense",
+        "one_share_threshold_opportunity",
+    }.issubset(artifact_labels)
+
+    log_path.write_text(
+        "\n".join(
+            [
+                "[START] threshold-cycle postclose target_date=2026-05-12 started_at=2026-05-12T21:00:00+0900",
+                "[threshold-cycle] artifact ready label=swing_daily_simulation.json path=/tmp/a waited=0s json_valid=true",
+                "[threshold-cycle] artifact ready label=threshold_cycle_ev_pre_workorder.json path=/tmp/b waited=0s json_valid=true",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    pending_report = mod.build_threshold_cycle_postclose_verification(
+        "2026-05-12",
+        require_done_marker=False,
+    )
+
+    assert pending_report["status"] == "pass_with_pending_done_marker"
+    assert pending_report["execution_profile"]["status"] == "pending_done_marker"
+    assert pending_report["execution_profile"]["pending_done_marker"] is True
+    assert (
+        pending_report["predecessor_integrity"]["status"] == "pass_pending_done_marker"
+    )
+    assert (
+        "postclose_done_marker_missing"
+        not in pending_report["predecessor_integrity"]["log_issues"]
+    )
+
+    strict_missing_report = mod.build_threshold_cycle_postclose_verification(
+        "2026-05-12"
+    )
+
+    assert strict_missing_report["status"] == "fail"
+    assert (
+        "postclose_done_marker_missing"
+        in strict_missing_report["predecessor_integrity"]["log_issues"]
+    )
+
+    log_path.write_text(
+        "\n".join(
+            [
+                "[START] threshold-cycle postclose target_date=2026-05-12 started_at=2026-05-12T21:00:00+0900",
+                "[DONE] threshold-cycle postclose target_date=2026-05-12 recovery_action=marker_reconciliation full_wrapper_rerun=false finished_at=2026-05-12T21:30:00+0900",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    reconciled_report = mod.build_threshold_cycle_postclose_verification("2026-05-12")
+
+    assert reconciled_report["status"] == "pass"
+    assert reconciled_report["execution_profile"]["marker_reconciliation_done"] is True
+    assert reconciled_report["execution_profile"]["recovery_done"] is True
+    assert (
+        reconciled_report["execution_profile"]["recovery_action"]
+        == "marker_reconciliation"
+    )
+    assert reconciled_report["execution_profile"]["required_flags_checked"] is False
+    assert reconciled_report["execution_profile"]["missing_required_flags"] == []
+    assert (
+        "marker_reconciliation"
+        in reconciled_report["execution_profile"]["interpretation"]
+    )
+
+    log_path.write_text(
+        "\n".join(
+            [
+                "[START] threshold-cycle postclose target_date=2026-05-12 started_at=2026-05-12T21:00:00+0900",
+                "[DONE] threshold-cycle postclose target_date=2026-05-12 swing_lifecycle=false swing_strategy_discovery=false swing_lifecycle_matrix=false swing_lifecycle_bucket_discovery=false finished_at=2026-05-12T21:09:00+0900",
+                "[FAIL] threshold-cycle postclose target_date=2026-05-12 reason=command_failed failed_at=2026-05-12T21:10:00+0900",
+                "[DONE] threshold-cycle postclose target_date=2026-05-12 recovery_action=tail_repair_done_reconciliation full_wrapper_rerun=false finished_at=2026-05-12T21:35:00+0900",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    tail_repair_report = mod.build_threshold_cycle_postclose_verification("2026-05-12")
+
+    assert tail_repair_report["status"] == "warning"
+    assert (
+        tail_repair_report["execution_profile"]["status"] == "recovered_partial_profile"
+    )
+    assert (
+        tail_repair_report["execution_profile"]["marker_reconciliation_done"] is False
+    )
+    assert tail_repair_report["execution_profile"]["recovery_done"] is True
+    assert (
+        tail_repair_report["execution_profile"]["recovery_action"]
+        == "tail_repair_done_reconciliation"
+    )
+    assert tail_repair_report["execution_profile"]["required_flags_checked"] is False
+    assert tail_repair_report["execution_profile"]["missing_required_flags"] == []
+    assert set(tail_repair_report["execution_profile"]["disabled_stage_flags"]) >= {
+        "swing_lifecycle",
+        "swing_strategy_discovery",
+        "swing_lifecycle_matrix",
+        "swing_lifecycle_bucket_discovery",
+    }
+    assert (
+        "swing_daily_simulation" not in tail_repair_report["missing_required_artifacts"]
+    )
+    assert (
+        "swing_lifecycle_audit" not in tail_repair_report["missing_required_artifacts"]
+    )
+    assert (
+        "postclose_fail_marker_present"
+        not in tail_repair_report["predecessor_integrity"]["log_issues"]
+    )
+    assert (
+        "tail_repair_done_reconciliation"
+        in tail_repair_report["execution_profile"]["interpretation"]
+    )
+
+    strict_report = mod.build_threshold_cycle_postclose_verification("2026-05-12")
+
+    assert strict_report["status"] == "warning"
+
+
+def test_build_threshold_cycle_postclose_verification_warns_on_predecessor_wait(
+    tmp_path, monkeypatch
+):
+    project_root = tmp_path
+    report_dir = project_root / "data" / "report"
+    (project_root / "logs").mkdir(parents=True)
+    (report_dir / "threshold_cycle_ev").mkdir(parents=True)
+    (report_dir / "code_improvement_workorder").mkdir(parents=True)
+    (report_dir / "runtime_approval_summary").mkdir(parents=True)
+    (report_dir / "pattern_lab_currentness_audit").mkdir(parents=True)
+    (report_dir / "pattern_lab_propagation_audit").mkdir(parents=True)
+    (report_dir / "market_panic_breadth").mkdir(parents=True)
+    (report_dir / "panic_sell_defense").mkdir(parents=True)
+    (report_dir / "swing_daily_simulation").mkdir(parents=True)
+    (report_dir / "swing_strategy_discovery_sim").mkdir(parents=True)
+    (report_dir / "swing_lifecycle_audit").mkdir(parents=True)
+    (project_root / "docs").mkdir(parents=True)
+    adm_path = _write_adm_artifact(report_dir)
+    lifecycle_path = _write_lifecycle_artifact(report_dir)
+
+    log_path = project_root / "logs" / "threshold_cycle_postclose_cron.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "[START] threshold-cycle postclose target_date=2026-05-12 started_at=2026-05-12T21:00:00+0900",
+                "[threshold-cycle] artifact ready label=swing_daily_simulation.json path=/tmp/a waited=5s json_valid=true",
+                "[DONE] threshold-cycle postclose target_date=2026-05-12 swing_lifecycle=true pattern_labs=true deepseek_swing_lab=true pattern_lab_currentness_audit=true pattern_lab_propagation_audit=true scalp_entry_adm=true lifecycle_decision_matrix=true code_improvement_workorder=true daily_ev=true runtime_approval_summary=true next_stage2_checklist=true finished_at=2026-05-12T21:30:00+0900",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    for rel in (
+        "threshold_cycle_ev/threshold_cycle_ev_2026-05-12.json",
+        "code_improvement_workorder/code_improvement_workorder_2026-05-12.json",
+        "runtime_approval_summary/runtime_approval_summary_2026-05-12.json",
+        "pattern_lab_currentness_audit/pattern_lab_currentness_audit_2026-05-12.json",
+        "pattern_lab_propagation_audit/pattern_lab_propagation_audit_2026-05-12.json",
+        "market_panic_breadth/market_panic_breadth_2026-05-12.json",
+        "panic_sell_defense/panic_sell_defense_2026-05-12.json",
+        "swing_daily_simulation/swing_daily_simulation_2026-05-12.json",
+        "swing_strategy_discovery_sim/swing_strategy_discovery_sim_2026-05-12.json",
+        "swing_lifecycle_audit/swing_lifecycle_audit_2026-05-12.json",
+        "lifecycle_decision_matrix/lifecycle_decision_matrix_2026-05-12.json",
+    ):
+        path = report_dir / rel
+        path.write_text("{}", encoding="utf-8")
+    (
+        report_dir / "threshold_cycle_ev" / "threshold_cycle_ev_2026-05-12.json"
+    ).write_text(
+        json.dumps(
+            {
+                "sources": {
+                    "code_improvement_workorder": str(
+                        report_dir
+                        / "code_improvement_workorder"
+                        / "code_improvement_workorder_2026-05-12.json"
+                    ),
+                    "pattern_lab_currentness_audit": str(
+                        report_dir
+                        / "pattern_lab_currentness_audit"
+                        / "pattern_lab_currentness_audit_2026-05-12.json"
+                    ),
+                    "pattern_lab_propagation_audit": str(
+                        report_dir
+                        / "pattern_lab_propagation_audit"
+                        / "pattern_lab_propagation_audit_2026-05-12.json"
+                    ),
+                    "scalp_entry_action_decision_matrix": str(adm_path),
+                    "lifecycle_decision_matrix": str(lifecycle_path),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (
+        report_dir
+        / "code_improvement_workorder"
+        / "code_improvement_workorder_2026-05-12.json"
+    ).write_text(
+        json.dumps(
+            {
+                "generation_id": "2026-05-12-source",
+                "source_hash": "source",
+                "lineage": {"previous_exists": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (
+        report_dir
+        / "runtime_approval_summary"
+        / "runtime_approval_summary_2026-05-12.json"
+    ).write_text(
+        json.dumps(
+            {
+                "sources": {
+                    "threshold_cycle_ev": str(
+                        report_dir
+                        / "threshold_cycle_ev"
+                        / "threshold_cycle_ev_2026-05-12.json"
+                    ),
+                    "pattern_lab_propagation_audit": str(
+                        report_dir
+                        / "pattern_lab_propagation_audit"
+                        / "pattern_lab_propagation_audit_2026-05-12.json"
+                    ),
+                    "scalp_entry_action_decision_matrix": str(adm_path),
+                    "lifecycle_decision_matrix": str(lifecycle_path),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (project_root / "docs" / "checklists").mkdir(parents=True)
+    (
+        project_root / "docs" / "checklists" / "2026-05-13-stage2-todo-checklist.md"
+    ).write_text(
+        "# next\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(mod, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(mod, "REPORT_DIR", report_dir)
+    monkeypatch.setattr(
+        mod, "VERIFY_DIR", report_dir / "threshold_cycle_postclose_verification"
+    )
+    monkeypatch.setattr(mod, "LOG_PATH", log_path)
+    monkeypatch.setattr(mod, "_next_krx_trading_day", lambda target_date: "2026-05-13")
+
+    report = mod.build_threshold_cycle_postclose_verification("2026-05-12")
+
+    assert report["status"] == "warning"
+    assert report["predecessor_integrity"]["wait_count"] == 1
+
+    (
+        report_dir
+        / "code_improvement_workorder"
+        / "code_improvement_workorder_2026-05-12.json"
+    ).write_text(
+        "{}",
+        encoding="utf-8",
+    )
+
+    missing_snapshot_report = mod.build_threshold_cycle_postclose_verification(
+        "2026-05-12"
+    )
+
+    assert missing_snapshot_report["status"] == "fail"
+    assert (
+        missing_snapshot_report["workorder_snapshot"]["status"]
+        == "missing_snapshot_identity"
+    )
+
+
+def test_build_threshold_cycle_postclose_verification_warns_on_recovery_profile(
+    tmp_path, monkeypatch
+):
+    project_root = tmp_path
+    report_dir = project_root / "data" / "report"
+    (project_root / "logs").mkdir(parents=True)
+    for folder in (
+        "threshold_cycle_ev",
+        "code_improvement_workorder",
+        "runtime_approval_summary",
+        "pattern_lab_currentness_audit",
+        "pattern_lab_propagation_audit",
+        "scalp_entry_action_decision_matrix",
+        "lifecycle_decision_matrix",
+        "market_panic_breadth",
+        "panic_sell_defense",
+        "swing_daily_simulation",
+        "swing_lifecycle_audit",
+    ):
+        (report_dir / folder).mkdir(parents=True)
+    (project_root / "docs" / "checklists").mkdir(parents=True)
+
+    log_path = project_root / "logs" / "threshold_cycle_postclose_cron.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "[START] threshold-cycle postclose target_date=2026-05-12 started_at=2026-05-12T21:00:00+0900",
+                "[DONE] threshold-cycle postclose target_date=2026-05-12 swing_lifecycle=false pattern_labs=false deepseek_swing_lab=false pattern_lab_currentness_audit=false pattern_lab_propagation_audit=false ai_decision_action_outcome_calibration=false scalp_entry_adm=true lifecycle_decision_matrix=false code_improvement_workorder=true daily_ev=true runtime_approval_summary=true next_stage2_checklist=true finished_at=2026-05-12T21:30:00+0900",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    for rel in (
+        "threshold_cycle_ev/threshold_cycle_ev_2026-05-12.json",
+        "code_improvement_workorder/code_improvement_workorder_2026-05-12.json",
+        "runtime_approval_summary/runtime_approval_summary_2026-05-12.json",
+        "scalp_entry_action_decision_matrix/scalp_entry_action_decision_matrix_2026-05-12.json",
+        "market_panic_breadth/market_panic_breadth_2026-05-12.json",
+        "panic_sell_defense/panic_sell_defense_2026-05-12.json",
+        "swing_daily_simulation/swing_daily_simulation_2026-05-12.json",
+        "swing_lifecycle_audit/swing_lifecycle_audit_2026-05-12.json",
+    ):
+        (report_dir / rel).write_text(
+            json.dumps(
+                {"generation_id": "g", "source_hash": "h"}
+                if "code_improvement" in rel
+                else {}
+            ),
+            encoding="utf-8",
+        )
+    (
+        report_dir / "threshold_cycle_ev" / "threshold_cycle_ev_2026-05-12.json"
+    ).write_text(
+        json.dumps(
+            {
+                "sources": {
+                    "code_improvement_workorder": str(
+                        report_dir
+                        / "code_improvement_workorder"
+                        / "code_improvement_workorder_2026-05-12.json"
+                    ),
+                    "scalp_entry_action_decision_matrix": str(
+                        report_dir
+                        / "scalp_entry_action_decision_matrix"
+                        / "scalp_entry_action_decision_matrix_2026-05-12.json"
+                    ),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (
+        report_dir
+        / "runtime_approval_summary"
+        / "runtime_approval_summary_2026-05-12.json"
+    ).write_text(
+        json.dumps(
+            {
+                "sources": {
+                    "threshold_cycle_ev": str(
+                        report_dir
+                        / "threshold_cycle_ev"
+                        / "threshold_cycle_ev_2026-05-12.json"
+                    ),
+                    "scalp_entry_action_decision_matrix": str(
+                        report_dir
+                        / "scalp_entry_action_decision_matrix"
+                        / "scalp_entry_action_decision_matrix_2026-05-12.json"
+                    ),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (
+        project_root / "docs" / "checklists" / "2026-05-13-stage2-todo-checklist.md"
+    ).write_text(
+        "# next\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(mod, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(mod, "REPORT_DIR", report_dir)
+    monkeypatch.setattr(
+        mod, "VERIFY_DIR", report_dir / "threshold_cycle_postclose_verification"
+    )
+    monkeypatch.setattr(mod, "LOG_PATH", log_path)
+    monkeypatch.setattr(mod, "_next_krx_trading_day", lambda target_date: "2026-05-13")
+
+    report = mod.build_threshold_cycle_postclose_verification("2026-05-12")
+
+    assert report["status"] == "warning"
+    assert report["execution_profile"]["status"] == "recovered_partial_profile"
+    assert report["execution_profile"]["disabled_stage_flags"] == [
+        "swing_lifecycle",
+        "pattern_labs",
+        "deepseek_swing_lab",
+        "pattern_lab_currentness_audit",
+        "pattern_lab_propagation_audit",
+        "lifecycle_decision_matrix",
+    ]
+    assert (
+        "ai_decision_action_outcome_calibration"
+        not in report["missing_required_artifacts"]
+    )
+
+    log_path.write_text(
+        "[START] threshold-cycle postclose target_date=2026-05-12 "
+        "started_at=2026-05-12T21:00:00+0900\n",
+        encoding="utf-8",
+    )
+    pending_report = mod.build_threshold_cycle_postclose_verification(
+        "2026-05-12",
+        require_done_marker=False,
+        disabled_stages={
+            "swing_lifecycle",
+            "swing_strategy_discovery",
+            "swing_lifecycle_matrix",
+            "swing_lifecycle_bucket_discovery",
+            "deepseek_swing_lab",
+        },
+    )
+    assert set(pending_report["execution_profile"]["disabled_stage_flags"]) == {
+        "swing_lifecycle",
+        "swing_strategy_discovery",
+        "swing_lifecycle_matrix",
+        "swing_lifecycle_bucket_discovery",
+        "deepseek_swing_lab",
+    }
+    assert "swing_daily_simulation" not in pending_report["missing_required_artifacts"]
+    assert "swing_lifecycle_audit" not in pending_report["missing_required_artifacts"]
+    assert (
+        "swing_lifecycle_handoff_missing"
+        not in pending_report["predecessor_integrity"]["log_issues"]
+    )
+
+
+def test_explicit_disabled_stage_rejects_non_swing_verifier_bypass():
+    with pytest.raises(ValueError, match="runtime_approval_summary"):
+        mod.build_threshold_cycle_postclose_verification(
+            "2026-05-12",
+            require_done_marker=False,
+            disabled_stages={"runtime_approval_summary"},
+        )
+
+
+def test_build_threshold_cycle_postclose_verification_fails_on_unavailable_ai_correction(
+    tmp_path, monkeypatch
+):
+    project_root = tmp_path
+    report_dir = project_root / "data" / "report"
+    (project_root / "logs").mkdir(parents=True)
+    for folder in (
+        "threshold_cycle_ev",
+        "threshold_cycle_calibration",
+        "threshold_cycle_ai_review",
+        "code_improvement_workorder",
+        "runtime_approval_summary",
+        "pattern_lab_currentness_audit",
+        "pattern_lab_propagation_audit",
+        "market_panic_breadth",
+        "panic_sell_defense",
+        "swing_daily_simulation",
+        "swing_lifecycle_audit",
+    ):
+        (report_dir / folder).mkdir(parents=True)
+    (project_root / "docs" / "checklists").mkdir(parents=True)
+    adm_path = _write_adm_artifact(report_dir)
+    lifecycle_path = _write_lifecycle_artifact(report_dir)
+
+    log_path = project_root / "logs" / "threshold_cycle_postclose_cron.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "[START] threshold-cycle postclose target_date=2026-05-12 started_at=2026-05-12T21:00:00+0900",
+                "[DONE] threshold-cycle postclose target_date=2026-05-12 swing_lifecycle=true pattern_labs=true deepseek_swing_lab=true pattern_lab_currentness_audit=true pattern_lab_propagation_audit=true scalp_entry_adm=true lifecycle_decision_matrix=true code_improvement_workorder=true daily_ev=true runtime_approval_summary=true next_stage2_checklist=true finished_at=2026-05-12T21:30:00+0900",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    ev_path = report_dir / "threshold_cycle_ev" / "threshold_cycle_ev_2026-05-12.json"
+    workorder_path = (
+        report_dir
+        / "code_improvement_workorder"
+        / "code_improvement_workorder_2026-05-12.json"
+    )
+    propagation_path = (
+        report_dir
+        / "pattern_lab_propagation_audit"
+        / "pattern_lab_propagation_audit_2026-05-12.json"
+    )
+    currentness_path = (
+        report_dir
+        / "pattern_lab_currentness_audit"
+        / "pattern_lab_currentness_audit_2026-05-12.json"
+    )
+    ev_path.write_text(
+        json.dumps(
+            {
+                "sources": {
+                    "code_improvement_workorder": str(workorder_path),
+                    "pattern_lab_currentness_audit": str(currentness_path),
+                    "pattern_lab_propagation_audit": str(propagation_path),
+                    "scalp_entry_action_decision_matrix": str(adm_path),
+                    "lifecycle_decision_matrix": str(lifecycle_path),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    workorder_path.write_text(
+        json.dumps({"generation_id": "g", "source_hash": "h", "lineage": {}}),
+        encoding="utf-8",
+    )
+    (
+        report_dir
+        / "runtime_approval_summary"
+        / "runtime_approval_summary_2026-05-12.json"
+    ).write_text(
+        json.dumps(
+            {
+                "sources": {
+                    "threshold_cycle_ev": str(ev_path),
+                    "pattern_lab_propagation_audit": str(propagation_path),
+                    "scalp_entry_action_decision_matrix": str(adm_path),
+                    "lifecycle_decision_matrix": str(lifecycle_path),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    for path in (
+        currentness_path,
+        propagation_path,
+        report_dir / "market_panic_breadth" / "market_panic_breadth_2026-05-12.json",
+        report_dir / "panic_sell_defense" / "panic_sell_defense_2026-05-12.json",
+        report_dir
+        / "swing_daily_simulation"
+        / "swing_daily_simulation_2026-05-12.json",
+        report_dir / "swing_lifecycle_audit" / "swing_lifecycle_audit_2026-05-12.json",
+    ):
+        path.write_text("{}", encoding="utf-8")
+    (
+        project_root / "docs" / "checklists" / "2026-05-13-stage2-todo-checklist.md"
+    ).write_text(
+        "# next\n",
+        encoding="utf-8",
+    )
+    (
+        report_dir
+        / "threshold_cycle_ai_review"
+        / "threshold_cycle_ai_review_2026-05-12_postclose.json"
+    ).write_text(
+        json.dumps(
+            {
+                "ai_status": "unavailable",
+                "provider_status": "timeout",
+                "parse_warnings": ["ai correction response not provided"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (
+        report_dir
+        / "threshold_cycle_calibration"
+        / "threshold_cycle_calibration_2026-05-12_postclose.json"
+    ).write_text(
+        json.dumps(
+            {
+                "calibration_candidates": [
+                    {
+                        "family": "lifecycle_decision_matrix_runtime",
+                        "calibration_state": "adjust_up",
+                        "allowed_runtime_apply": True,
+                        "human_approval_required": False,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(mod, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(mod, "REPORT_DIR", report_dir)
+    monkeypatch.setattr(
+        mod, "VERIFY_DIR", report_dir / "threshold_cycle_postclose_verification"
+    )
+    monkeypatch.setattr(mod, "LOG_PATH", log_path)
+    monkeypatch.setattr(mod, "_next_krx_trading_day", lambda target_date: "2026-05-13")
+
+    report = mod.build_threshold_cycle_postclose_verification("2026-05-12")
+
+    assert report["status"] == "fail"
+    assert report["ai_correction"]["status"] == "fail"
+    assert report["ai_correction"]["blocking_runtime_candidate_families"] == [
+        "lifecycle_decision_matrix_runtime"
+    ]
+    assert (
+        "ai_correction_unavailable_blocks_runtime_candidates"
+        in report["predecessor_integrity"]["log_issues"]
+    )
+
+
+def test_build_threshold_cycle_postclose_verification_not_yet_due_before_postclose(
+    tmp_path, monkeypatch
+):
+    project_root = tmp_path
+    report_dir = project_root / "data" / "report"
+    (project_root / "logs").mkdir(parents=True)
+    log_path = project_root / "logs" / "threshold_cycle_postclose_cron.log"
+    log_path.write_text("", encoding="utf-8")
+
+    class FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 5, 12, 15, 59, 0)
+
+    monkeypatch.setattr(mod, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(mod, "REPORT_DIR", report_dir)
+    monkeypatch.setattr(
+        mod, "VERIFY_DIR", report_dir / "threshold_cycle_postclose_verification"
+    )
+    monkeypatch.setattr(mod, "LOG_PATH", log_path)
+    monkeypatch.setattr(mod, "_next_krx_trading_day", lambda target_date: "2026-05-13")
+    monkeypatch.setattr(mod, "datetime", FakeDateTime)
+
+    report = mod.build_threshold_cycle_postclose_verification("2026-05-12")
+
+    assert report["status"] == "not_yet_due"
+    assert report["predecessor_integrity"]["status"] == "not_yet_due"
+    assert report["predecessor_integrity"]["log_issues"] == []
+
+
+def test_entry_bucket_handoff_uses_collision_safe_workorder_ids():
+    common_prefix = "entry_spot_score:score_unknown:source:scalp_sim_entry_ai_price_skip_order:stale:stale_not_available:"
+    source_workorders = [
+        {"bucket_type": "combo", "bucket_key": f"{common_prefix}first"},
+        {"bucket_type": "combo", "bucket_key": f"{common_prefix}second"},
+    ]
+    expected_order_ids = [
+        mod._entry_bucket_order_id(item) for item in source_workorders
+    ]
+
+    assert len(set(expected_order_ids)) == 2
+    report = mod._entry_bucket_handoff_status(
+        {
+            "entry_bucket_attribution": {
+                "code_improvement_workorders": source_workorders
+            }
+        },
+        {},
+        {},
+        {"orders": [{"order_id": order_id} for order_id in expected_order_ids]},
+    )
+
+    assert report["status"] == "pass"
+    assert report["missing_workorder_order_ids"] == []
+
+
+def test_build_threshold_cycle_postclose_verification_fails_on_ldm_entry_bucket_handoff_drop(
+    tmp_path, monkeypatch
+):
+    project_root = tmp_path
+    report_dir = project_root / "data" / "report"
+    (project_root / "logs").mkdir(parents=True)
+    for folder in (
+        "threshold_cycle_ev",
+        "code_improvement_workorder",
+        "runtime_approval_summary",
+        "pattern_lab_currentness_audit",
+        "pattern_lab_propagation_audit",
+        "market_panic_breadth",
+        "panic_sell_defense",
+        "swing_daily_simulation",
+        "swing_lifecycle_audit",
+    ):
+        (report_dir / folder).mkdir(parents=True)
+    (project_root / "docs" / "checklists").mkdir(parents=True)
+    adm_path = _write_adm_artifact(report_dir)
+    lifecycle_path = (
+        report_dir
+        / "lifecycle_decision_matrix"
+        / "lifecycle_decision_matrix_2026-05-12.json"
+    )
+    lifecycle_path.parent.mkdir(parents=True, exist_ok=True)
+    lifecycle_path.write_text(
+        json.dumps(
+            {
+                "entry_bucket_attribution": {
+                    "runtime_approval_candidates": [
+                        {
+                            "candidate_id": "entry_bucket_1",
+                            "bucket_type": "score_band",
+                            "bucket_key": "score_66_69",
+                        }
+                    ],
+                    "code_improvement_workorders": [
+                        {
+                            "bucket_type": "liquidity_bucket",
+                            "bucket_key": "liquidity_unknown",
+                        }
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    log_path = project_root / "logs" / "threshold_cycle_postclose_cron.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "[START] threshold-cycle postclose target_date=2026-05-12 started_at=2026-05-12T21:00:00+0900",
+                "[DONE] threshold-cycle postclose target_date=2026-05-12 swing_lifecycle=true pattern_labs=true deepseek_swing_lab=true pattern_lab_currentness_audit=true pattern_lab_propagation_audit=true scalp_entry_adm=true lifecycle_decision_matrix=true code_improvement_workorder=true daily_ev=true runtime_approval_summary=true next_stage2_checklist=true finished_at=2026-05-12T21:30:00+0900",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    workorder_path = (
+        report_dir
+        / "code_improvement_workorder"
+        / "code_improvement_workorder_2026-05-12.json"
+    )
+    ev_path = report_dir / "threshold_cycle_ev" / "threshold_cycle_ev_2026-05-12.json"
+    propagation_path = (
+        report_dir
+        / "pattern_lab_propagation_audit"
+        / "pattern_lab_propagation_audit_2026-05-12.json"
+    )
+    currentness_path = (
+        report_dir
+        / "pattern_lab_currentness_audit"
+        / "pattern_lab_currentness_audit_2026-05-12.json"
+    )
+    ev_path.write_text(
+        json.dumps(
+            {
+                "sources": {
+                    "code_improvement_workorder": str(workorder_path),
+                    "pattern_lab_currentness_audit": str(currentness_path),
+                    "pattern_lab_propagation_audit": str(propagation_path),
+                    "scalp_entry_action_decision_matrix": str(adm_path),
+                    "lifecycle_decision_matrix": str(lifecycle_path),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    workorder_path.write_text(
+        json.dumps({"generation_id": "g", "source_hash": "h", "orders": []}),
+        encoding="utf-8",
+    )
+    (
+        report_dir
+        / "runtime_approval_summary"
+        / "runtime_approval_summary_2026-05-12.json"
+    ).write_text(
+        json.dumps(
+            {
+                "sources": {
+                    "threshold_cycle_ev": str(ev_path),
+                    "pattern_lab_propagation_audit": str(propagation_path),
+                    "scalp_entry_action_decision_matrix": str(adm_path),
+                    "lifecycle_decision_matrix": str(lifecycle_path),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    for path in (
+        currentness_path,
+        propagation_path,
+        report_dir / "market_panic_breadth" / "market_panic_breadth_2026-05-12.json",
+        report_dir / "panic_sell_defense" / "panic_sell_defense_2026-05-12.json",
+        report_dir
+        / "swing_daily_simulation"
+        / "swing_daily_simulation_2026-05-12.json",
+        report_dir / "swing_lifecycle_audit" / "swing_lifecycle_audit_2026-05-12.json",
+    ):
+        path.write_text("{}", encoding="utf-8")
+    (
+        project_root / "docs" / "checklists" / "2026-05-13-stage2-todo-checklist.md"
+    ).write_text(
+        "# next\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(mod, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(mod, "REPORT_DIR", report_dir)
+    monkeypatch.setattr(
+        mod, "VERIFY_DIR", report_dir / "threshold_cycle_postclose_verification"
+    )
+    monkeypatch.setattr(mod, "LOG_PATH", log_path)
+    monkeypatch.setattr(mod, "_next_krx_trading_day", lambda target_date: "2026-05-13")
+
+    report = mod.build_threshold_cycle_postclose_verification("2026-05-12")
+
+    assert report["status"] == "fail"
+    assert report["entry_bucket_handoff"]["status"] == "fail"
+    assert report["entry_bucket_handoff"]["missing_ev_candidate_ids"] == [
+        "entry_bucket_1"
+    ]
+    assert report["entry_bucket_handoff"]["missing_runtime_summary_candidate_ids"] == [
+        "entry_bucket_1"
+    ]
+    assert report["entry_bucket_handoff"]["missing_workorder_order_ids"] == [
+        "order_lifecycle_entry_bucket_liquidity_bucket_liquidity_unknown"
+    ]
+    assert (
+        "ldm_entry_bucket_handoff_missing"
+        in report["predecessor_integrity"]["log_issues"]
+    )
+
+
+def test_build_threshold_cycle_postclose_verification_fails_on_ldm_scale_in_bucket_handoff_drop(
+    tmp_path, monkeypatch
+):
+    project_root = tmp_path
+    report_dir = project_root / "data" / "report"
+    (project_root / "logs").mkdir(parents=True)
+    for folder in (
+        "threshold_cycle_ev",
+        "code_improvement_workorder",
+        "runtime_approval_summary",
+        "pattern_lab_currentness_audit",
+        "pattern_lab_propagation_audit",
+        "market_panic_breadth",
+        "panic_sell_defense",
+        "swing_daily_simulation",
+        "swing_lifecycle_audit",
+    ):
+        (report_dir / folder).mkdir(parents=True)
+    (project_root / "docs" / "checklists").mkdir(parents=True)
+    adm_path = _write_adm_artifact(report_dir)
+    lifecycle_path = (
+        report_dir
+        / "lifecycle_decision_matrix"
+        / "lifecycle_decision_matrix_2026-05-12.json"
+    )
+    lifecycle_path.parent.mkdir(parents=True, exist_ok=True)
+    lifecycle_path.write_text(
+        json.dumps(
+            {
+                "sources": {"scale_in_attribution": {"rows": 12}},
+                "scale_in_bucket_attribution": {
+                    "runtime_approval_candidates": [
+                        {
+                            "candidate_id": "scale_in_bucket_1",
+                            "bucket_type": "arm",
+                            "bucket_key": "PYRAMID",
+                        }
+                    ],
+                    "code_improvement_workorders": [
+                        {
+                            "bucket_type": "blocker_namespace",
+                            "bucket_key": "PRICE_GUARD",
+                        }
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    log_path = project_root / "logs" / "threshold_cycle_postclose_cron.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "[START] threshold-cycle postclose target_date=2026-05-12 started_at=2026-05-12T21:00:00+0900",
+                "[DONE] threshold-cycle postclose target_date=2026-05-12 swing_lifecycle=true pattern_labs=true deepseek_swing_lab=true pattern_lab_currentness_audit=true pattern_lab_propagation_audit=true scalp_entry_adm=true lifecycle_decision_matrix=true code_improvement_workorder=true daily_ev=true runtime_approval_summary=true next_stage2_checklist=true finished_at=2026-05-12T21:30:00+0900",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    workorder_path = (
+        report_dir
+        / "code_improvement_workorder"
+        / "code_improvement_workorder_2026-05-12.json"
+    )
+    ev_path = report_dir / "threshold_cycle_ev" / "threshold_cycle_ev_2026-05-12.json"
+    propagation_path = (
+        report_dir
+        / "pattern_lab_propagation_audit"
+        / "pattern_lab_propagation_audit_2026-05-12.json"
+    )
+    currentness_path = (
+        report_dir
+        / "pattern_lab_currentness_audit"
+        / "pattern_lab_currentness_audit_2026-05-12.json"
+    )
+    ev_path.write_text(
+        json.dumps(
+            {
+                "sources": {
+                    "code_improvement_workorder": str(workorder_path),
+                    "pattern_lab_currentness_audit": str(currentness_path),
+                    "pattern_lab_propagation_audit": str(propagation_path),
+                    "scalp_entry_action_decision_matrix": str(adm_path),
+                    "lifecycle_decision_matrix": str(lifecycle_path),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    workorder_path.write_text(
+        json.dumps({"generation_id": "g", "source_hash": "h", "orders": []}),
+        encoding="utf-8",
+    )
+    (
+        report_dir
+        / "runtime_approval_summary"
+        / "runtime_approval_summary_2026-05-12.json"
+    ).write_text(
+        json.dumps(
+            {
+                "sources": {
+                    "threshold_cycle_ev": str(ev_path),
+                    "pattern_lab_propagation_audit": str(propagation_path),
+                    "scalp_entry_action_decision_matrix": str(adm_path),
+                    "lifecycle_decision_matrix": str(lifecycle_path),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    for path in (
+        currentness_path,
+        propagation_path,
+        report_dir / "market_panic_breadth" / "market_panic_breadth_2026-05-12.json",
+        report_dir / "panic_sell_defense" / "panic_sell_defense_2026-05-12.json",
+        report_dir
+        / "swing_daily_simulation"
+        / "swing_daily_simulation_2026-05-12.json",
+        report_dir / "swing_lifecycle_audit" / "swing_lifecycle_audit_2026-05-12.json",
+    ):
+        path.write_text("{}", encoding="utf-8")
+    (
+        project_root / "docs" / "checklists" / "2026-05-13-stage2-todo-checklist.md"
+    ).write_text(
+        "# next\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(mod, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(mod, "REPORT_DIR", report_dir)
+    monkeypatch.setattr(
+        mod, "VERIFY_DIR", report_dir / "threshold_cycle_postclose_verification"
+    )
+    monkeypatch.setattr(mod, "LOG_PATH", log_path)
+    monkeypatch.setattr(mod, "_next_krx_trading_day", lambda target_date: "2026-05-13")
+
+    report = mod.build_threshold_cycle_postclose_verification("2026-05-12")
+
+    assert report["status"] == "fail"
+    assert report["scale_in_bucket_handoff"]["status"] == "fail"
+    assert report["scale_in_bucket_handoff"]["missing_ev_candidate_ids"] == [
+        "scale_in_bucket_1"
+    ]
+    assert report["scale_in_bucket_handoff"][
+        "missing_runtime_summary_candidate_ids"
+    ] == ["scale_in_bucket_1"]
+    assert report["scale_in_bucket_handoff"]["missing_workorder_order_ids"] == [
+        "order_lifecycle_scale_in_bucket_blocker_namespace_price_guard"
+    ]
+    assert (
+        "ldm_scale_in_bucket_handoff_missing"
+        in report["predecessor_integrity"]["log_issues"]
+    )
+
+
+def test_scale_in_policy_contract_passes_with_source_link_and_reopen_trigger():
+    candidate_id = "scale_in_bucket_runtime_policy_v1:2026-05-12"
+    status = mod._scale_in_policy_contract_status(
+        scale_in_source_present=True,
+        bridge_report={
+            "candidates": [
+                {
+                    "candidate_id": candidate_id,
+                    "family": "scale_in_bucket_runtime_policy_v1",
+                    "stage": "scale_in",
+                    "bridge_candidate_state": "blocked_incremental_ev_runtime_authority",
+                    "allowed_runtime_apply": False,
+                    "runtime_effect": False,
+                    "live_auto_apply": False,
+                    "target_env_keys": [],
+                    "explicit_runtime_exclusion": True,
+                    "runtime_exclusion_reason": "paired_add_lifecycle_replay_or_final_label_missing",
+                    "source_link": {
+                        "source_section": "scale_in_bucket_attribution",
+                        "source_bucket_keys": ["PYRAMID", "AVG_DOWN"],
+                    },
+                    "reopen_conditions": ["paired_add_lifecycle_replay_implemented"],
+                }
+            ]
+        },
+        runtime_apply_gap_audit={
+            "candidate_route_ledger": [
+                {
+                    "candidate_id": candidate_id,
+                    "family": "scale_in_bucket_runtime_policy_v1",
+                    "explicit_runtime_exclusion": True,
+                    "runtime_exclusion_reason": "paired_add_lifecycle_replay_or_final_label_missing",
+                    "final_disposition": "source_only_explicit_exclusion",
+                }
+            ]
+        },
+    )
+
+    assert status["status"] == "pass"
+    assert status["source_only_blocked"] is True
+    assert status["missing"] == []
+    assert status["interpretation"] == (
+        "Scale-in policy contract closed as source-only; runtime remains disabled and reopen trigger is preserved."
+    )
+
+
+def test_scale_in_policy_contract_fails_when_bridge_candidate_lacks_contract():
+    status = mod._scale_in_policy_contract_status(
+        scale_in_source_present=True,
+        bridge_report={
+            "candidates": [
+                {
+                    "candidate_id": "scale_in_bucket_runtime_policy_v1:2026-05-12",
+                    "family": "scale_in_bucket_runtime_policy_v1",
+                    "stage": "scale_in",
+                    "bridge_candidate_state": "blocked_incremental_ev_runtime_authority",
+                    "allowed_runtime_apply": False,
+                    "runtime_effect": False,
+                    "live_auto_apply": False,
+                    "target_env_keys": [],
+                }
+            ]
+        },
+        runtime_apply_gap_audit={"candidate_route_ledger": []},
+    )
+
+    assert status["status"] == "fail"
+    assert "scale_in_policy_explicit_exclusion_missing" in status["missing"]
+    assert "scale_in_policy_source_link_missing" in status["missing"]
+    assert "scale_in_policy_reopen_conditions_missing" in status["missing"]
+    assert "scale_in_policy_runtime_gap_ledger_missing" in status["missing"]
+
+
+def test_scale_in_policy_contract_fails_when_source_bucket_keys_are_blank():
+    candidate_id = "scale_in_bucket_runtime_policy_v1:2026-05-12"
+    status = mod._scale_in_policy_contract_status(
+        scale_in_source_present=True,
+        bridge_report={
+            "candidates": [
+                {
+                    "candidate_id": candidate_id,
+                    "family": "scale_in_bucket_runtime_policy_v1",
+                    "stage": "scale_in",
+                    "bridge_candidate_state": "blocked_incremental_ev_runtime_authority",
+                    "allowed_runtime_apply": False,
+                    "runtime_effect": False,
+                    "live_auto_apply": False,
+                    "target_env_keys": [],
+                    "explicit_runtime_exclusion": True,
+                    "runtime_exclusion_reason": "paired_add_lifecycle_replay_or_final_label_missing",
+                    "source_link": {
+                        "source_section": "scale_in_bucket_attribution",
+                        "source_bucket_keys": ["", "  "],
+                    },
+                    "reopen_conditions": ["paired_add_lifecycle_replay_implemented"],
+                }
+            ]
+        },
+        runtime_apply_gap_audit={
+            "candidate_route_ledger": [
+                {
+                    "candidate_id": candidate_id,
+                    "family": "scale_in_bucket_runtime_policy_v1",
+                    "explicit_runtime_exclusion": True,
+                    "runtime_exclusion_reason": "paired_add_lifecycle_replay_or_final_label_missing",
+                    "final_disposition": "source_only_explicit_exclusion",
+                }
+            ]
+        },
+    )
+
+    assert status["status"] == "fail"
+    assert "scale_in_policy_source_link_missing" in status["missing"]
+
+
+def test_build_threshold_cycle_postclose_verification_fails_when_scale_in_source_lacks_attribution(
+    tmp_path, monkeypatch
+):
+    project_root = tmp_path
+    report_dir = project_root / "data" / "report"
+    (project_root / "logs").mkdir(parents=True)
+    for folder in (
+        "threshold_cycle_ev",
+        "code_improvement_workorder",
+        "runtime_approval_summary",
+        "pattern_lab_currentness_audit",
+        "pattern_lab_propagation_audit",
+        "market_panic_breadth",
+        "panic_sell_defense",
+        "swing_daily_simulation",
+        "swing_lifecycle_audit",
+    ):
+        (report_dir / folder).mkdir(parents=True)
+    (project_root / "docs" / "checklists").mkdir(parents=True)
+    adm_path = _write_adm_artifact(report_dir)
+    lifecycle_path = (
+        report_dir
+        / "lifecycle_decision_matrix"
+        / "lifecycle_decision_matrix_2026-05-12.json"
+    )
+    lifecycle_path.parent.mkdir(parents=True, exist_ok=True)
+    lifecycle_path.write_text(
+        json.dumps(
+            {
+                "sources": {"scale_in_attribution": {"rows": 3}},
+                "summary": {"stage_counts": {"scale_in": 3}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    log_path = project_root / "logs" / "threshold_cycle_postclose_cron.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "[START] threshold-cycle postclose target_date=2026-05-12 started_at=2026-05-12T21:00:00+0900",
+                "[DONE] threshold-cycle postclose target_date=2026-05-12 swing_lifecycle=true pattern_labs=true deepseek_swing_lab=true pattern_lab_currentness_audit=true pattern_lab_propagation_audit=true scalp_entry_adm=true lifecycle_decision_matrix=true code_improvement_workorder=true daily_ev=true runtime_approval_summary=true next_stage2_checklist=true finished_at=2026-05-12T21:30:00+0900",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    workorder_path = (
+        report_dir
+        / "code_improvement_workorder"
+        / "code_improvement_workorder_2026-05-12.json"
+    )
+    ev_path = report_dir / "threshold_cycle_ev" / "threshold_cycle_ev_2026-05-12.json"
+    propagation_path = (
+        report_dir
+        / "pattern_lab_propagation_audit"
+        / "pattern_lab_propagation_audit_2026-05-12.json"
+    )
+    currentness_path = (
+        report_dir
+        / "pattern_lab_currentness_audit"
+        / "pattern_lab_currentness_audit_2026-05-12.json"
+    )
+    ev_path.write_text(
+        json.dumps(
+            {
+                "sources": {
+                    "code_improvement_workorder": str(workorder_path),
+                    "pattern_lab_currentness_audit": str(currentness_path),
+                    "pattern_lab_propagation_audit": str(propagation_path),
+                    "scalp_entry_action_decision_matrix": str(adm_path),
+                    "lifecycle_decision_matrix": str(lifecycle_path),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    workorder_path.write_text(
+        json.dumps({"generation_id": "g", "source_hash": "h", "orders": []}),
+        encoding="utf-8",
+    )
+    (
+        report_dir
+        / "runtime_approval_summary"
+        / "runtime_approval_summary_2026-05-12.json"
+    ).write_text(
+        json.dumps(
+            {
+                "sources": {
+                    "threshold_cycle_ev": str(ev_path),
+                    "pattern_lab_propagation_audit": str(propagation_path),
+                    "scalp_entry_action_decision_matrix": str(adm_path),
+                    "lifecycle_decision_matrix": str(lifecycle_path),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    for path in (
+        currentness_path,
+        propagation_path,
+        report_dir / "market_panic_breadth" / "market_panic_breadth_2026-05-12.json",
+        report_dir / "panic_sell_defense" / "panic_sell_defense_2026-05-12.json",
+        report_dir
+        / "swing_daily_simulation"
+        / "swing_daily_simulation_2026-05-12.json",
+        report_dir / "swing_lifecycle_audit" / "swing_lifecycle_audit_2026-05-12.json",
+    ):
+        path.write_text("{}", encoding="utf-8")
+    (
+        project_root / "docs" / "checklists" / "2026-05-13-stage2-todo-checklist.md"
+    ).write_text(
+        "# next\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(mod, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(mod, "REPORT_DIR", report_dir)
+    monkeypatch.setattr(
+        mod, "VERIFY_DIR", report_dir / "threshold_cycle_postclose_verification"
+    )
+    monkeypatch.setattr(mod, "LOG_PATH", log_path)
+    monkeypatch.setattr(mod, "_next_krx_trading_day", lambda target_date: "2026-05-13")
+
+    report = mod.build_threshold_cycle_postclose_verification("2026-05-12")
+
+    assert report["status"] == "fail"
+    assert report["scale_in_source_present"] is True
+    assert report["scale_in_bucket_attribution_present"] is False
+    assert (
+        "ldm_scale_in_bucket_attribution_missing"
+        in report["predecessor_integrity"]["log_issues"]
+    )

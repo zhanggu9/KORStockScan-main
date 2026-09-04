@@ -1,0 +1,2061 @@
+import gzip
+import json
+
+import pytest
+
+from src.engine import threshold_cycle_ev_report as mod
+
+
+def test_warning_contract_dedupes_and_classifies_disabled_sources():
+    active, contract = mod._warning_contract(
+        [
+            "lifecycle_bucket_discovery:source_contract_drift_warning",
+            "lifecycle_bucket_discovery:source_contract_drift_warning",
+            "swing_strategy_discovery_ev_missing",
+            "producer_gap_discovery_missing",
+            "trade_review_missing",
+        ],
+        disabled_sources={"swing_strategy_discovery_ev", "producer_gap_discovery"},
+    )
+
+    assert active == [
+        "lifecycle_bucket_discovery:source_contract_drift_warning",
+        "trade_review_missing",
+    ]
+    assert contract["raw_warning_count"] == 5
+    assert contract["unique_warning_count"] == 4
+    assert contract["active_warning_count"] == 2
+    assert contract["disabled_not_applicable"] == [
+        "swing_strategy_discovery_ev_missing",
+        "producer_gap_discovery_missing",
+    ]
+    assert contract["required_missing"] == ["trade_review_missing"]
+
+
+def test_warning_contract_rejects_unknown_or_prefix_collision_suppression():
+    active, contract = mod._warning_contract(
+        [
+            "source_quality_blocked_contract_gap",
+            "producer_gap_discovery_missing",
+            "producer_gap_discovery_unrelated_warning",
+        ],
+        disabled_sources={
+            "source_quality_blocked_contract_gap",
+            "producer_gap_discovery",
+        },
+    )
+
+    assert active == [
+        "source_quality_blocked_contract_gap",
+        "producer_gap_discovery_unrelated_warning",
+    ]
+    assert contract["disabled_not_applicable"] == ["producer_gap_discovery_missing"]
+    assert contract["rejected_disabled_sources"] == [
+        "source_quality_blocked_contract_gap"
+    ]
+
+
+def test_load_json_and_daily_sources_accept_gzip_snapshots(tmp_path, monkeypatch):
+    monitor_dir = tmp_path / "monitor_snapshots"
+    monitor_dir.mkdir()
+    for source in ("trade_review", "performance_tuning"):
+        path = monitor_dir / f"{source}_2026-07-31.json.gz"
+        with gzip.open(path, "wt", encoding="utf-8") as handle:
+            json.dump({"metrics": {"source": source}}, handle)
+
+    monkeypatch.setattr(mod, "MONITOR_SNAPSHOT_DIR", monitor_dir)
+
+    trade_path = mod.existing_or_gzip_path(monitor_dir / "trade_review_2026-07-31.json")
+    performance_path = mod.existing_or_gzip_path(
+        monitor_dir / "performance_tuning_2026-07-31.json"
+    )
+
+    assert mod._load_json(trade_path)["metrics"]["source"] == "trade_review"
+    assert mod._load_json(performance_path)["metrics"]["source"] == "performance_tuning"
+
+
+def test_scale_in_split_order_summary_preserves_runtime_three_leg_count(
+    tmp_path, monkeypatch
+):
+    target_date = "2026-07-07"
+    report_dir = tmp_path / "scale_in_split_order_plan"
+    report_dir.mkdir(parents=True)
+    (report_dir / f"scale_in_split_order_plan_{target_date}.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "scale_in_split_order_plan_v1",
+                "source_quality": {"status": "pass", "tuning_input_allowed": True},
+                "input_summary": {
+                    "runtime_three_leg_candidate_count": 1,
+                    "diagnostic_three_leg_candidate_count": 0,
+                },
+                "candidate_grid": [],
+                "recommended_policy": {
+                    "runtime_apply_allowed": True,
+                    "policy_file": "/tmp/scale-in-policy.json",
+                    "policy_version": "scale_in_split_order_plan:test-three-leg",
+                    "candidates": [
+                        {"policy_mode": "bounded_three_leg_tick_band", "leg_count": 3}
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(mod, "SCALE_IN_SPLIT_ORDER_PLAN_DIR", report_dir)
+
+    summary, _path, warnings = mod._scale_in_split_order_plan_summary(target_date)
+
+    assert warnings == []
+    assert summary["runtime_three_leg_candidate_count"] == 1
+    assert summary["recommended_policy_candidate_count"] == 1
+
+
+def test_runtime_apply_bridge_summary_preserves_post_apply_provenance():
+    manifest = {
+        "runtime_apply_bridge": {
+            "request_report": "data/report/runtime_apply_bridge/runtime_apply_bridge_2026-05-21.json",
+            "artifacts": {
+                "scale_in_bucket_runtime_policy_v1": (
+                    "data/threshold_cycle/approvals/ldm_scale_in_runtime_bridge_2026-05-21.json"
+                )
+            },
+            "candidate_count": 2,
+            "approved": 1,
+            "blocked": [],
+            "selected": [
+                {
+                    "family": "scale_in_bucket_runtime_policy_v1",
+                    "stage": "scale_in",
+                    "approval_id": "scale-approval",
+                    "runtime_apply_bridge_family": "scale_in_bucket_runtime_policy_v1",
+                    "bridge_candidate_id": "scale_in_bucket_runtime_policy_v1:2026-05-21",
+                    "source_bucket_key": "PYRAMID,AVG_DOWN",
+                    "actual_runtime_effect": "bounded_scale_in_policy_tighten_live_auto",
+                }
+            ],
+            "decisions": [
+                {
+                    "family": "scale_in_bucket_runtime_policy_v1",
+                    "stage": "scale_in",
+                    "selected": True,
+                    "decision_reason": "lifecycle_bucket_discovery_live_auto_apply",
+                    "approval_id": "scale-approval",
+                    "bridge_candidate_id": "scale_in_bucket_runtime_policy_v1:2026-05-21",
+                    "actual_runtime_effect": "bounded_scale_in_policy_tighten_live_auto",
+                }
+            ],
+        }
+    }
+
+    assert mod._selected_families(manifest) == ["scale_in_bucket_runtime_policy_v1"]
+    summary = mod._runtime_apply_bridge_summary(manifest)
+    assert summary["selected_count"] == 1
+    assert summary["selected"][0]["approval_id"] == "scale-approval"
+    assert summary["selected"][0]["source_bucket_key"] == "PYRAMID,AVG_DOWN"
+    assert (
+        summary["selected"][0]["actual_runtime_effect"]
+        == "bounded_scale_in_policy_tighten_live_auto"
+    )
+
+
+def test_runtime_apply_bridge_summary_does_not_select_entry_metadata():
+    manifest = {
+        "runtime_apply_bridge": {
+            "candidate_count": 1,
+            "approved": 0,
+            "metadata": [
+                {
+                    "family": "entry_wait6579_score66_69_recovery_gate_v1",
+                    "candidate_id": "entry_wait6579_score66_69_recovery_gate_v1:2026-05-21",
+                    "state": "entry_only_bridge_metadata",
+                    "reason": "entry_only_bridge_metadata_not_live_candidate",
+                    "allowed_runtime_apply": False,
+                    "target_env_keys": [],
+                    "runtime_effect": False,
+                }
+            ],
+            "selected": [],
+            "decisions": [],
+        }
+    }
+
+    assert mod._selected_families(manifest) == []
+    summary = mod._runtime_apply_bridge_summary(manifest)
+    assert summary["approved"] == 0
+    assert summary["selected_count"] == 0
+    assert summary["selected"] == []
+
+
+def test_calibration_path_does_not_fallback_to_intraday_artifact(tmp_path, monkeypatch):
+    calibration_dir = tmp_path / "threshold_cycle_calibration"
+    calibration_dir.mkdir(parents=True)
+    monkeypatch.setattr(mod, "CALIBRATION_REPORT_DIR", calibration_dir)
+
+    intraday = calibration_dir / "threshold_cycle_calibration_2026-05-22_intraday.json"
+    postclose = (
+        calibration_dir / "threshold_cycle_calibration_2026-05-22_postclose.json"
+    )
+    intraday.write_text(json.dumps({"run_phase": "intraday"}), encoding="utf-8")
+
+    assert mod._calibration_path("2026-05-22") == postclose
+
+
+def test_scalp_entry_adm_summary_preserves_unknown_bucket_summary(
+    tmp_path, monkeypatch
+):
+    adm_dir = tmp_path / "entry_adm"
+    adm_dir.mkdir(parents=True)
+    adm_path = adm_dir / "scalp_entry_action_decision_matrix_2026-05-22.json"
+    adm_path.write_text(
+        json.dumps(
+            {
+                "status": "warning",
+                "runtime_effect": False,
+                "decision_authority": "entry_advisory_prompt_context_only",
+                "primary_decision_metric": "source_quality_adjusted_ev_pct",
+                "summary": {
+                    "total_candidates": 10,
+                    "joined_sample": 2,
+                    "sample_floor": 20,
+                    "prompt_applied_count": 1,
+                    "unknown_bucket_summary": {
+                        "affected_rows": 4,
+                        "source_quality_gate": "source_quality_blocker",
+                    },
+                    "outcome_join_diagnostic": {
+                        "status": "no_candidate_key_overlap",
+                        "zero_join_reason": "entry_adm_candidate_keys_do_not_overlap_post_sell_evaluation_keys",
+                        "runtime_effect": False,
+                        "allowed_runtime_apply": False,
+                    },
+                },
+                "warnings": ["unknown_bucket_source_quality_gap"],
+                "action_summary": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        mod,
+        "scalp_entry_adm_report_paths",
+        lambda target_date: (
+            adm_path,
+            adm_dir / f"scalp_entry_action_decision_matrix_{target_date}.md",
+        ),
+    )
+
+    summary, path, warnings = mod._scalp_entry_adm_summary("2026-05-22")
+
+    assert path == str(adm_path)
+    assert summary["unknown_bucket_summary"]["affected_rows"] == 4
+    assert summary["outcome_join_diagnostic"]["status"] == "no_candidate_key_overlap"
+    assert summary["outcome_join_diagnostic"]["runtime_effect"] is False
+    assert "scalp_entry_adm:unknown_bucket_source_quality_gap" in warnings
+
+
+@pytest.fixture(autouse=True)
+def _isolate_pattern_lab_audit_dirs(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        mod, "PATTERN_LAB_CURRENTNESS_AUDIT_DIR", tmp_path / "missing_currentness_audit"
+    )
+    monkeypatch.setattr(
+        mod, "PATTERN_LAB_PROPAGATION_AUDIT_DIR", tmp_path / "missing_propagation_audit"
+    )
+    monkeypatch.setattr(
+        mod,
+        "LATENCY_CLASSIFIER_RECOMMENDATION_DIR",
+        tmp_path / "missing_latency_classifier_recommendation",
+    )
+    monkeypatch.setattr(
+        mod,
+        "scalp_entry_adm_report_paths",
+        lambda target_date: (
+            tmp_path
+            / "missing_entry_adm"
+            / f"scalp_entry_action_decision_matrix_{target_date}.json",
+            tmp_path
+            / "missing_entry_adm"
+            / f"scalp_entry_action_decision_matrix_{target_date}.md",
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "lifecycle_matrix_report_paths",
+        lambda target_date: (
+            tmp_path
+            / "missing_lifecycle_matrix"
+            / f"lifecycle_decision_matrix_{target_date}.json",
+            tmp_path
+            / "missing_lifecycle_matrix"
+            / f"lifecycle_decision_matrix_{target_date}.md",
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "lifecycle_ai_context_report_paths",
+        lambda target_date: (
+            tmp_path
+            / "missing_lifecycle_ai_context"
+            / f"lifecycle_ai_context_{target_date}.json",
+            tmp_path
+            / "missing_lifecycle_ai_context"
+            / f"lifecycle_ai_context_{target_date}.md",
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "lifecycle_ai_context_attribution_paths",
+        lambda target_date: (
+            tmp_path
+            / "missing_lifecycle_ai_context_attribution"
+            / f"lifecycle_ai_context_attribution_{target_date}.json",
+            tmp_path
+            / "missing_lifecycle_ai_context_attribution"
+            / f"lifecycle_ai_context_attribution_{target_date}.md",
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "institutional_flow_report_paths",
+        lambda target_date: (
+            tmp_path
+            / "missing_institutional_flow_context"
+            / f"institutional_flow_context_{target_date}.json",
+            tmp_path
+            / "missing_institutional_flow_context"
+            / f"institutional_flow_context_{target_date}.md",
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "microstructure_reaction_report_paths",
+        lambda target_date: (
+            tmp_path
+            / "missing_microstructure_reaction_context"
+            / f"microstructure_reaction_context_{target_date}.json",
+            tmp_path
+            / "missing_microstructure_reaction_context"
+            / f"microstructure_reaction_context_{target_date}.md",
+        ),
+    )
+
+
+def test_lifecycle_bucket_windows_summary_separates_daily_and_promotion(
+    tmp_path, monkeypatch
+):
+    discovery_dir = tmp_path / "lifecycle_bucket_discovery"
+    discovery_dir.mkdir()
+    daily_path = discovery_dir / "lifecycle_bucket_discovery_2026-05-29.json"
+    monkeypatch.setattr(
+        mod, "lifecycle_bucket_discovery_report_path", lambda target_date: daily_path
+    )
+    daily_path.write_text(
+        json.dumps({"summary": {"status": "pass", "live_auto_apply_ready_count": 1}}),
+        encoding="utf-8",
+    )
+    for suffix, count in {"rolling5d": 34, "rolling10d": 35, "mtd": 36}.items():
+        (
+            discovery_dir / f"lifecycle_bucket_discovery_2026-05-29_{suffix}.json"
+        ).write_text(
+            json.dumps(
+                {
+                    "window_policy": suffix,
+                    "summary": {
+                        "status": "pass",
+                        "source_contract_status": "pass",
+                        "ai_two_pass_review_status": "parsed",
+                        "parent_bucket_count": count,
+                        "selected_parent_level": "L1_broad",
+                        "parent_granularity_status": "target_pass",
+                        "absorbed_child_count": 100,
+                        "absorbed_sample_count": 1000,
+                        "child_conflict_warning_count": 2,
+                        "live_auto_apply_ready_count": 0,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    summary, warnings = mod._lifecycle_bucket_windows_summary("2026-05-29")
+
+    assert warnings == []
+    assert summary["daily"]["window_role"] == "new_pattern_detection"
+    assert summary["windows"]["mtd"]["window_role"] == "promotion_confirmation"
+    assert summary["windows"]["mtd"]["parent_bucket_count"] == 36
+    assert summary["windows"]["rolling5d"]["window_role"] == "rolling_confirmation"
+
+
+def test_build_threshold_cycle_ev_report_uses_existing_reports(tmp_path, monkeypatch):
+    report_dir = tmp_path / "report"
+    monitor_dir = report_dir / "monitor_snapshots"
+    calibration_dir = report_dir / "threshold_cycle_calibration"
+    apply_dir = tmp_path / "apply_plans"
+    ev_dir = report_dir / "threshold_cycle_ev"
+    automation_dir = report_dir / "scalping_pattern_lab_automation"
+    workorder_report_dir = report_dir / "code_improvement_workorder"
+    workorder_doc_dir = tmp_path / "docs" / "code-improvement-workorders"
+    monitor_dir.mkdir(parents=True)
+    calibration_dir.mkdir(parents=True)
+    apply_dir.mkdir(parents=True)
+    automation_dir.mkdir(parents=True)
+    workorder_report_dir.mkdir(parents=True)
+    workorder_doc_dir.mkdir(parents=True)
+    monkeypatch.setattr(mod, "MONITOR_SNAPSHOT_DIR", monitor_dir)
+    monkeypatch.setattr(mod, "CALIBRATION_REPORT_DIR", calibration_dir)
+    monkeypatch.setattr(mod, "EV_REPORT_DIR", ev_dir)
+    monkeypatch.setattr(
+        mod,
+        "apply_manifest_path",
+        lambda target_date: apply_dir / f"threshold_apply_{target_date}.json",
+    )
+    monkeypatch.setattr(
+        mod,
+        "automation_report_paths",
+        lambda target_date: (
+            automation_dir / f"scalping_pattern_lab_automation_{target_date}.json",
+            automation_dir / f"scalping_pattern_lab_automation_{target_date}.md",
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "code_improvement_workorder_paths",
+        lambda target_date: (
+            workorder_report_dir / f"code_improvement_workorder_{target_date}.json",
+            workorder_doc_dir / f"code_improvement_workorder_{target_date}.md",
+        ),
+    )
+
+    (monitor_dir / "trade_review_2026-05-08.json").write_text(
+        json.dumps(
+            {
+                "metrics": {
+                    "completed_trades": 2,
+                    "open_trades": 0,
+                    "win_trades": 1,
+                    "loss_trades": 1,
+                    "avg_profit_rate": -0.39,
+                    "realized_pnl_krw": -282,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (monitor_dir / "performance_tuning_2026-05-08.json").write_text(
+        json.dumps(
+            {
+                "metrics": {
+                    "budget_pass_events": 100,
+                    "order_bundle_submitted_events": 5,
+                    "latency_block_events": 95,
+                    "latency_pass_events": 5,
+                    "full_fill_events": 2,
+                    "partial_fill_events": 0,
+                    "full_fill_completed_avg_profit_rate": -0.395,
+                    "holding_reviews": 17,
+                    "exit_signals": 2,
+                    "holding_review_ms_p95": 17022,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (monitor_dir / "wait6579_ev_cohort_2026-05-08.json").write_text(
+        json.dumps(
+            {
+                "metrics": {
+                    "total_candidates": 3,
+                    "score65_74_probe_candidates": 2,
+                    "avg_expected_ev_pct": 1.25,
+                    "expected_ev_krw_sum": 12000,
+                },
+                "counterfactual_summary": {
+                    "book": "scalp_score65_74_probe_counterfactual",
+                    "role": "missed_buy_probe_counterfactual",
+                    "actual_order_submitted": False,
+                    "broker_order_forbidden": True,
+                    "runtime_effect": "counterfactual_report_only",
+                    "calibration_authority": "missed_probe_ev_only_not_broker_execution",
+                    "total_candidates": 3,
+                    "score65_74_probe_candidates": 2,
+                    "avg_expected_ev_pct": 1.25,
+                    "score65_74_avg_expected_ev_pct": 2.5,
+                    "expected_ev_krw_sum": 12000,
+                    "real_execution_quality_source": "none",
+                },
+                "approval_gate": {
+                    "min_sample_gate_passed": False,
+                    "threshold_relaxation_approved": False,
+                    "full_samples": 2,
+                    "partial_samples": 0,
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (
+        calibration_dir / "threshold_cycle_calibration_2026-05-08_postclose.json"
+    ).write_text(
+        json.dumps(
+            {
+                "run_phase": "postclose",
+                "completed_by_source_by_window": {
+                    "same_day": {
+                        "real": {
+                            "sample": 3,
+                            "win_count": 2,
+                            "loss_count": 1,
+                            "avg_profit_rate": 0.4,
+                        },
+                        "sim": {"sample": 1},
+                    }
+                },
+                "calibration_candidates": [
+                    {
+                        "family": "score65_74_recovery_probe",
+                        "calibration_state": "adjust_up",
+                        "sample_count": 20,
+                        "sample_floor": 20,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (apply_dir / "threshold_apply_2026-05-08.json").write_text(
+        json.dumps(
+            {
+                "status": "auto_bounded_live_ready",
+                "runtime_change": True,
+                "auto_apply_selected": [{"family": "score65_74_recovery_probe"}],
+                "operator_runtime_env_merge": {
+                    "preserved_selected_families": [
+                        "bad_entry_refined_canary",
+                        "swing_one_share_real_canary_phase0",
+                    ]
+                },
+                "swing_runtime_approval": {
+                    "request_report": "data/report/swing_runtime_approval/swing_runtime_approval_2026-05-08.json",
+                    "approval_artifact": None,
+                    "requested": 1,
+                    "approved": 0,
+                    "real_canary_policy": {
+                        "policy_id": "swing_one_share_real_canary_phase0",
+                        "real_order_allowed_actions": ["BUY_INITIAL", "SELL_CLOSE"],
+                        "sim_only_actions": ["AVG_DOWN", "PYRAMID", "SCALE_IN"],
+                    },
+                    "blocked": ["approval_artifact_missing"],
+                    "requests": [
+                        {
+                            "approval_id": "swing_runtime_approval:2026-05-08:swing_model_floor",
+                            "family": "swing_model_floor",
+                            "stage": "selection",
+                            "tradeoff_score": 0.72,
+                            "target_env_keys": ["SWING_FLOOR_BULL"],
+                            "recommended_values": {"floor_bull": 0.30},
+                        }
+                    ],
+                    "selected": [],
+                    "decisions": [],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (automation_dir / "scalping_pattern_lab_automation_2026-05-08.json").write_text(
+        json.dumps(
+            {
+                "ev_report_summary": {
+                    "gemini_fresh": True,
+                    "claude_fresh": True,
+                    "consensus_count": 1,
+                    "auto_family_candidate_count": 0,
+                    "code_improvement_order_count": 1,
+                    "top_consensus_findings": [
+                        {
+                            "title": "AI threshold miss EV 회수 조건 점검",
+                            "route": "existing_family",
+                            "mapped_family": "score65_74_recovery_probe",
+                        }
+                    ],
+                    "top_code_improvement_orders": [
+                        {
+                            "order_id": "order_ai_threshold",
+                            "title": "AI threshold miss EV 회수 조건 점검",
+                            "target_subsystem": "entry_funnel",
+                        }
+                    ],
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (workorder_report_dir / "code_improvement_workorder_2026-05-08.json").write_text(
+        json.dumps(
+            {
+                "summary": {
+                    "selected_order_count": 1,
+                    "decision_counts": {"attach_existing_family": 1},
+                },
+                "orders": [
+                    {
+                        "order_id": "order_ai_threshold",
+                        "decision": "attach_existing_family",
+                        "target_subsystem": "entry_funnel",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (workorder_doc_dir / "code_improvement_workorder_2026-05-08.md").write_text(
+        "# workorder\n", encoding="utf-8"
+    )
+
+    report = mod.build_threshold_cycle_ev_report("2026-05-08")
+
+    assert report["runtime_apply"]["selected_families"] == [
+        "score65_74_recovery_probe",
+        "bad_entry_refined_canary",
+        "swing_one_share_real_canary_phase0",
+    ]
+    assert report["daily_ev_summary"]["completed_trades"] == 3
+    assert report["daily_ev_summary"]["win_trades"] == 2
+    assert report["daily_ev_summary"]["avg_profit_rate_pct"] == 0.4
+    assert (
+        report["daily_ev_summary"]["headline_authority"]
+        == "completed_by_source_same_day_real"
+    )
+    assert not report["daily_ev_summary"]["trade_review_snapshot_reconciliation"][
+        "count_match"
+    ]
+    assert "trade_review_calibration_count_mismatch" in report["warnings"]
+    assert report["daily_ev_summary"]["realized_pnl_krw"] == -282
+    assert report["summary"]["status"] == "warning"
+    assert report["summary"]["real_sample"] == 3
+    assert report["summary"]["live_auto_ready_count"] == 0
+    assert report["summary"]["runtime_effect"] is False
+    assert report["entry_funnel"]["budget_pass_to_submitted_rate_pct"] == 5.0
+    assert (
+        report["missed_probe_counterfactual"]["book"]
+        == "scalp_score65_74_probe_counterfactual"
+    )
+    assert report["missed_probe_counterfactual"]["score65_74_probe_candidates"] == 2
+    assert (
+        report["missed_probe_counterfactual"]["real_execution_quality_source"] == "none"
+    )
+    assert report["pattern_lab_automation"]["consensus_count"] == 1
+    assert report["scalp_entry_action_decision_matrix"]["available"] is False
+    assert report["microstructure_reaction_context"]["available"] is False
+    assert "microstructure_reaction_context_missing" not in report["warnings"]
+    assert report["swing_runtime_approval"]["requested"] == 1
+    assert "real_canary_policy" not in report["swing_runtime_approval"]
+    assert report["swing_runtime_approval"]["requests"][0]["tradeoff_score"] == 0.72
+    assert (
+        report["pattern_lab_automation"]["top_consensus_findings"][0]["mapped_family"]
+        == "score65_74_recovery_probe"
+    )
+    assert report["code_improvement_workorder"]["selected_order_count"] == 1
+    assert (
+        report["code_improvement_workorder"]["top_orders"][0]["order_id"]
+        == "order_ai_threshold"
+    )
+    assert (ev_dir / "threshold_cycle_ev_2026-05-08.json").exists()
+    assert (ev_dir / "threshold_cycle_ev_2026-05-08.md").exists()
+    markdown = (ev_dir / "threshold_cycle_ev_2026-05-08.md").read_text(encoding="utf-8")
+    assert "## Summary" in markdown
+    assert "Missed Probe Counterfactual" in markdown
+    assert "Swing Runtime Approval" in markdown
+    assert "Scalp Entry ADM" in markdown
+    assert "Lifecycle Decision Matrix" in markdown
+    assert "real_canary_policy" not in markdown
+    assert "swing_runtime_approval:2026-05-08:swing_model_floor" in markdown
+
+
+def test_build_threshold_cycle_ev_report_surfaces_latency_apply_permission(
+    tmp_path, monkeypatch
+):
+    report_dir = tmp_path / "report"
+    monitor_dir = report_dir / "monitor_snapshots"
+    calibration_dir = report_dir / "threshold_cycle_calibration"
+    latency_dir = report_dir / "latency_classifier_recommendation"
+    apply_dir = tmp_path / "apply_plans"
+    ev_dir = report_dir / "threshold_cycle_ev"
+    for path in (monitor_dir, calibration_dir, latency_dir, apply_dir):
+        path.mkdir(parents=True)
+    monkeypatch.setattr(mod, "MONITOR_SNAPSHOT_DIR", monitor_dir)
+    monkeypatch.setattr(mod, "CALIBRATION_REPORT_DIR", calibration_dir)
+    monkeypatch.setattr(mod, "LATENCY_CLASSIFIER_RECOMMENDATION_DIR", latency_dir)
+    monkeypatch.setattr(mod, "EV_REPORT_DIR", ev_dir)
+    monkeypatch.setattr(
+        mod,
+        "apply_manifest_path",
+        lambda target_date: apply_dir / f"threshold_apply_{target_date}.json",
+    )
+
+    (monitor_dir / "trade_review_2026-05-20.json").write_text(
+        json.dumps({"metrics": {}}), encoding="utf-8"
+    )
+    (monitor_dir / "performance_tuning_2026-05-20.json").write_text(
+        json.dumps(
+            {"metrics": {"latency_block_events": 621, "latency_pass_events": 0}}
+        ),
+        encoding="utf-8",
+    )
+    (
+        calibration_dir / "threshold_cycle_calibration_2026-05-20_postclose.json"
+    ).write_text(
+        json.dumps({"run_phase": "postclose", "calibration_candidates": []}),
+        encoding="utf-8",
+    )
+    (apply_dir / "threshold_apply_2026-05-20.json").write_text(
+        json.dumps({"status": "auto_bounded_live_ready", "auto_apply_selected": []}),
+        encoding="utf-8",
+    )
+    (latency_dir / "latency_classifier_recommendation_2026-05-20.json").write_text(
+        json.dumps(
+            {
+                "profile_generation": {
+                    "mode": "grid_quantile_search",
+                    "profile_count": 486,
+                },
+                "calibration_candidate": {
+                    "family": "latency_classifier_runtime_profile",
+                    "allowed_runtime_apply": False,
+                    "calibration_state": "hold_sample",
+                    "source_metrics": {
+                        "recommended_action": "hold",
+                        "recommended_action_reason": "counterfactual_joined_sample=1 below floor=3",
+                        "would_safe_pass_events": 0,
+                        "would_caution_normal_events": 220,
+                        "would_recovery_canary_events": 220,
+                    },
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    report = mod.build_threshold_cycle_ev_report("2026-05-20")
+
+    assert (
+        report["entry_funnel"]["latency_submit_routing"]
+        == "latency_submit_recovery_hold"
+    )
+    assert report["entry_funnel"]["allowed_runtime_apply"] is False
+    assert report["entry_funnel"]["calibration_state"] == "hold_sample"
+    assert report["entry_funnel"]["recommended_action"] == "hold"
+    assert report["entry_funnel"]["would_recovery_canary_events"] == 220
+
+
+def test_threshold_cycle_ev_lifecycle_summary_surfaces_submit_contract(
+    tmp_path, monkeypatch
+):
+    matrix_dir = tmp_path / "ldm"
+    matrix_dir.mkdir()
+    matrix_path = matrix_dir / "lifecycle_decision_matrix_2026-05-20.json"
+    matrix_path.write_text(
+        json.dumps(
+            {
+                "summary": {
+                    "status": "pass",
+                    "total_rows": 10,
+                    "joined_rows": 5,
+                    "complete_flow_count": 0,
+                    "incomplete_flow_count": 3,
+                    "complete_flow_rate": 0.0,
+                    "join_contract_blocked": True,
+                    "bundle_ev_tuning_state": "blocked_join_gap",
+                    "top_incomplete_reason": "identity_namespace_mismatch",
+                    "incomplete_flow_reason_counts": {"identity_namespace_mismatch": 1},
+                    "submit_bucket_workorder_count": 1,
+                    "submit_bucket_contract_gap_count": 1,
+                },
+                "submit_bucket_attribution": {
+                    "summary": {
+                        "submit_rows": 4,
+                        "contract_gap_count": 1,
+                        "workorder_count": 1,
+                    },
+                    "runtime_approval_candidates": [],
+                    "code_improvement_workorders": [{"workorder_id": "submit_order"}],
+                    "post_submit_contract_gaps": [
+                        {"gap_type": "broker_receipt_contract_gap"}
+                    ],
+                },
+                "entry_bucket_attribution": {
+                    "summary": {
+                        "bucket_count": 3,
+                        "runtime_candidate_count": 2,
+                        "workorder_count": 1,
+                    },
+                    "runtime_approval_candidates": [
+                        {"candidate_id": "entry_bucket_5"},
+                        {"candidate_id": "entry_bucket_6"},
+                    ],
+                    "code_improvement_workorders": [{"workorder_id": "entry_order"}],
+                },
+                "scale_in_bucket_attribution": {
+                    "summary": {
+                        "bucket_count": 4,
+                        "runtime_candidate_count": 3,
+                        "workorder_count": 1,
+                    },
+                    "runtime_approval_candidates": [
+                        {"candidate_id": "scale_in_bucket_5"},
+                        {"candidate_id": "scale_in_bucket_7"},
+                        {"candidate_id": "scale_in_bucket_9"},
+                    ],
+                    "code_improvement_workorders": [{"workorder_id": "scale_in_order"}],
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        mod,
+        "lifecycle_matrix_report_paths",
+        lambda target_date: (
+            matrix_dir / f"lifecycle_decision_matrix_{target_date}.json",
+            matrix_dir / f"lifecycle_decision_matrix_{target_date}.md",
+        ),
+    )
+
+    summary, path, warnings = mod._lifecycle_decision_matrix_summary("2026-05-20")
+
+    assert path == str(matrix_path)
+    assert warnings == []
+    assert summary["complete_flow_count"] == 0
+    assert summary["incomplete_flow_count"] == 3
+    assert summary["join_contract_blocked"] is True
+    assert summary["bundle_ev_tuning_state"] == "blocked_join_gap"
+    assert summary["top_incomplete_reason"] == "identity_namespace_mismatch"
+    assert summary["submit_bucket_contract_gap_count"] == 1
+    assert summary["submit_bucket_code_improvement_workorders"] == [
+        {"workorder_id": "submit_order"}
+    ]
+    assert summary["post_submit_contract_gaps"] == [
+        {"gap_type": "broker_receipt_contract_gap"}
+    ]
+    assert summary["entry_bucket_runtime_candidate_count"] == 2
+    assert summary["entry_bucket_workorder_count"] == 1
+    assert summary["entry_bucket_runtime_approval_candidates"] == [
+        {"candidate_id": "entry_bucket_5"},
+        {"candidate_id": "entry_bucket_6"},
+    ]
+    assert summary["entry_bucket_code_improvement_workorders"] == [
+        {"workorder_id": "entry_order"}
+    ]
+    assert summary["scale_in_bucket_runtime_candidate_count"] == 3
+    assert summary["scale_in_bucket_workorder_count"] == 1
+    assert summary["scale_in_bucket_runtime_approval_candidates"] == [
+        {"candidate_id": "scale_in_bucket_5"},
+        {"candidate_id": "scale_in_bucket_7"},
+        {"candidate_id": "scale_in_bucket_9"},
+    ]
+    assert summary["scale_in_bucket_code_improvement_workorders"] == [
+        {"workorder_id": "scale_in_order"}
+    ]
+
+
+def test_threshold_cycle_ev_lifecycle_bucket_summary_extracts_positive_sim_cases(
+    tmp_path, monkeypatch
+):
+    report_dir = tmp_path / "lifecycle_bucket_discovery"
+    report_dir.mkdir()
+    path = report_dir / "lifecycle_bucket_discovery_2026-06-26.json"
+    path.write_text(
+        json.dumps(
+            {
+                "window_policy": "mtd",
+                "summary": {
+                    "status": "pass",
+                    "candidate_count": 4,
+                    "surfaced_candidate_count": 4,
+                    "sim_auto_approved_count": 1,
+                    "entry_only_sim_auto_approved_count": 1,
+                    "sim_auto_positive_ev_count": 1,
+                    "sim_auto_nonpositive_ev_count": 1,
+                    "active_sim_priority_positive_seed_count": 1,
+                    "active_sim_priority_nonpositive_seed_count": 0,
+                    "parent_bucket_count": 2,
+                    "parent_granularity_status": "target_pass",
+                    "child_conflict_warning_count": 1,
+                    "source_contract_status": "pass",
+                    "ai_two_pass_review_status": "parsed",
+                },
+                "parent_bucket_summaries": [
+                    {
+                        "parent_bucket_id": "parent_positive",
+                        "parent_joined_sample": 42,
+                        "complete_flow_count": 0,
+                        "parent_granularity_floor_passed": True,
+                        "parent_source_quality_adjusted_ev_pct": 1.7,
+                        "child_conflict_warning": True,
+                        "dimension_filters": {
+                            "entry_score_parent": "score_watch_recovery",
+                            "entry_source_parent": "entry_source_wait6579",
+                            "submit_quality_parent": "submit_missing",
+                            "exit_outcome_parent": "exit_missing",
+                            "major_holding_parent": "holding_missing",
+                            "scale_in_parent": "scale_in_none",
+                        },
+                    },
+                    {
+                        "parent_bucket_id": "parent_negative",
+                        "parent_joined_sample": 100,
+                        "parent_source_quality_adjusted_ev_pct": -0.2,
+                        "dimension_filters": {
+                            "entry_score_parent": "score_unobserved",
+                        },
+                    },
+                ],
+                "sim_auto_approved_candidates": [
+                    {
+                        "bucket_id": "entry:positive",
+                        "classification_state": "sim_auto_approved",
+                        "stage": "entry",
+                        "bucket_type": "score_band",
+                        "source_quality_adjusted_ev_pct": 1.4,
+                        "joined_sample": 12,
+                    },
+                    {
+                        "bucket_id": "entry:avoid",
+                        "classification_state": "entry_only_sim_auto_approved",
+                        "stage": "entry",
+                        "bucket_type": "chosen_action",
+                        "source_quality_adjusted_ev_pct": -0.5,
+                        "joined_sample": 20,
+                    },
+                ],
+                "active_sim_priority_seeds": [
+                    {
+                        "active_seed_id": "seed_positive",
+                        "status": "active",
+                        "parent_ev_pct": 1.7,
+                        "parent_joined_sample": 42,
+                        "complete_flow_count": 0,
+                        "observable_prefix": {
+                            "entry_score_parent": "score_watch_recovery",
+                            "entry_source_parent": "entry_source_wait6579",
+                        },
+                        "active_collection_reason": "positive_ev_parent_needs_sim_collection",
+                        "live_conversion_blocked_reason": "incomplete_lifecycle_flow",
+                    }
+                ],
+                "warnings": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        mod,
+        "lifecycle_bucket_discovery_report_path",
+        lambda target_date: (
+            report_dir / f"lifecycle_bucket_discovery_{target_date}.json"
+        ),
+    )
+
+    summary, artifact, warnings = mod._lifecycle_bucket_discovery_summary("2026-06-26")
+
+    assert artifact == str(path)
+    assert warnings == []
+    assert summary["positive_parent_count"] == 1
+    assert summary["positive_parent_sample_ready_count"] == 1
+    assert summary["positive_parent_conflict_count"] == 1
+    assert (
+        summary["top_sample_ready_positive_parent_buckets"][0]["parent_bucket_id"]
+        == "parent_positive"
+    )
+    assert summary["top_active_positive_seeds"][0]["active_seed_id"] == "seed_positive"
+    assert summary["sim_auto_positive_ev_count"] == 1
+    assert summary["sim_auto_nonpositive_ev_count"] == 1
+    assert summary["top_positive_sim_auto_approved"][0]["bucket_id"] == "entry:positive"
+    assert summary["top_nonpositive_sim_auto_approved"][0]["bucket_id"] == "entry:avoid"
+
+
+def test_audit_summary_resolves_source_only_candidate_warning(tmp_path):
+    report_dir = tmp_path / "producer_gap_discovery"
+    report_dir.mkdir()
+    path = report_dir / "producer_gap_discovery_2026-05-26.json"
+    path.write_text(
+        json.dumps(
+            {
+                "status": "warning",
+                "runtime_effect": False,
+                "decision_authority": "source_quality_only",
+                "summary": {
+                    "fail_count": 0,
+                    "workorder_count": 8,
+                    "audit_status": "pass",
+                    "ai_fail_closed": False,
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    summary, artifact, warnings = mod._audit_summary(
+        "2026-05-26", "producer_gap_discovery", report_dir
+    )
+
+    assert artifact == str(path)
+    assert warnings == []
+    assert summary["source_only_candidate_warning_resolved"] is True
+    assert summary["code_improvement_order_count"] == 8
+
+
+def test_audit_summary_surfaces_parsed_ai_review_followup_without_fail_closed(tmp_path):
+    report_dir = tmp_path / "producer_gap_discovery"
+    report_dir.mkdir()
+    path = report_dir / "producer_gap_discovery_2026-05-26.json"
+    path.write_text(
+        json.dumps(
+            {
+                "status": "warning",
+                "runtime_effect": False,
+                "decision_authority": "source_quality_only",
+                "summary": {
+                    "fail_count": 0,
+                    "workorder_count": 1,
+                    "audit_status": "correction_required",
+                    "ai_fail_closed": False,
+                    "ai_review_followup_required": True,
+                    "ai_review_followup_reasons": ["audit_status=correction_required"],
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    summary, artifact, warnings = mod._audit_summary(
+        "2026-05-26", "producer_gap_discovery", report_dir
+    )
+
+    assert artifact == str(path)
+    assert summary["ai_review_followup_required"] is True
+    assert summary["ai_review_followup_reasons"] == ["audit_status=correction_required"]
+    assert summary["ai_fail_closed"] is False
+    assert "producer_gap_discovery_ai_review_followup_required" in warnings
+
+
+def test_swing_lifecycle_bucket_discovery_summary_surfaces_ai_fail_closed(
+    tmp_path, monkeypatch
+):
+    report_dir = tmp_path / "swing_lifecycle_bucket_discovery"
+    report_dir.mkdir()
+    path = report_dir / "swing_lifecycle_bucket_discovery_2026-05-27.json"
+    path.write_text(
+        json.dumps(
+            {
+                "runtime_effect": False,
+                "source_only": True,
+                "decision_authority": "swing_ldm_bucket_discovery_sim_auto",
+                "summary": {
+                    "source_contract_status": "pass",
+                    "ai_two_pass_review_status": "missing",
+                    "ai_fail_closed": True,
+                    "ai_review_blocker_state": "provider_disabled",
+                    "pre_review_sim_auto_candidate_count": 1,
+                    "candidate_count": 1,
+                    "surfaced_candidate_count": 1,
+                },
+                "warnings": [],
+                "surfaced_candidate_ids": ["swing_bucket_entry_test"],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        mod,
+        "swing_lifecycle_bucket_discovery_paths",
+        lambda target_date: (path, path.with_suffix(".md")),
+    )
+
+    summary, artifact, warnings = mod._swing_lifecycle_bucket_discovery_summary(
+        "2026-05-27"
+    )
+
+    assert artifact == str(path)
+    assert summary["ai_two_pass_review_status"] == "missing"
+    assert summary["ai_fail_closed"] is True
+    assert summary["ai_review_blocker_state"] == "provider_disabled"
+    assert summary["pre_review_sim_auto_candidate_count"] == 1
+    assert (
+        "swing_lifecycle_bucket_discovery:ai_two_pass_review_missing_fail_closed"
+        in warnings
+    )
+    assert (
+        "swing_lifecycle_bucket_discovery:ai_two_pass_review_fail_closed_sim_auto_blocked"
+        in summary["warnings"]
+    )
+
+
+def test_swing_lifecycle_matrix_summary_includes_parent_flow_candidates(
+    tmp_path, monkeypatch
+):
+    report_dir = tmp_path / "swing_lifecycle_decision_matrix"
+    report_dir.mkdir()
+    path = report_dir / "swing_lifecycle_decision_matrix_2026-05-27.json"
+    path.write_text(
+        json.dumps(
+            {
+                "runtime_effect": False,
+                "source_only": True,
+                "decision_authority": "swing_ldm_source_only",
+                "summary": {
+                    "total_rows": 9,
+                    "probe_rows": 0,
+                    "discovery_rows": 9,
+                    "swing_lifecycle_flow_bucket_count": 1,
+                    "complete_flow_count": 3,
+                    "incomplete_flow_count": 0,
+                    "identity_join_rate": 1.0,
+                    "complete_flow_rate": 1.0,
+                    "join_contract_blocked": False,
+                    "sim_auto_candidate_count": 1,
+                    "workorder_count": 0,
+                    "raw_swing_event_count": 1200,
+                    "ldm_consumed_event_count": 48,
+                    "ldm_event_coverage_rate": 0.04,
+                    "unmapped_swing_stage_counts": {"swing_other": 5},
+                    "daily_simulation_consumed": False,
+                },
+                "swing_lifecycle_flow_bucket_attribution": {
+                    "runtime_approval_candidates": [
+                        {
+                            "candidate_id": "swing_ldm_lifecycle_flow_combo_parent",
+                            "bucket_id": "swing_ldm_lifecycle_flow_combo_parent",
+                        }
+                    ],
+                    "sim_auto_approval_candidates": [
+                        {
+                            "candidate_id": "swing_ldm_lifecycle_flow_combo_parent",
+                            "bucket_id": "swing_ldm_lifecycle_flow_combo_parent",
+                        }
+                    ],
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        mod,
+        "swing_lifecycle_matrix_paths",
+        lambda target_date: (path, path.with_suffix(".md")),
+    )
+
+    summary, artifact, warnings = mod._swing_lifecycle_matrix_summary("2026-05-27")
+
+    assert artifact == str(path)
+    assert warnings == []
+    assert summary["swing_lifecycle_flow_bucket_count"] == 1
+    assert summary["complete_flow_count"] == 3
+    assert summary["sim_auto_candidate_ids"] == [
+        "swing_ldm_lifecycle_flow_combo_parent"
+    ]
+    assert summary["raw_swing_event_count"] == 1200
+    assert summary["ldm_consumed_event_count"] == 48
+    assert summary["ldm_event_coverage_rate"] == 0.04
+    assert summary["unmapped_swing_stage_counts"] == {"swing_other": 5}
+
+
+def test_swing_lifecycle_bucket_discovery_summary_includes_flow_metrics(
+    tmp_path, monkeypatch
+):
+    report_dir = tmp_path / "swing_lifecycle_bucket_discovery"
+    report_dir.mkdir()
+    path = report_dir / "swing_lifecycle_bucket_discovery_2026-05-27.json"
+    path.write_text(
+        json.dumps(
+            {
+                "runtime_effect": False,
+                "source_only": True,
+                "decision_authority": "swing_ldm_bucket_discovery_sim_auto",
+                "summary": {
+                    "source_contract_status": "pass",
+                    "ai_two_pass_review_status": "parsed",
+                    "ai_fail_closed": False,
+                    "candidate_count": 2,
+                    "surfaced_candidate_count": 2,
+                    "sim_auto_approved_count": 1,
+                    "sim_auto_reviewed_candidate_count": 21,
+                    "sim_auto_unreviewed_candidate_count": 0,
+                    "sim_auto_downgraded_by_review_count": 0,
+                    "sim_auto_review_shard_count": 2,
+                    "swing_lifecycle_flow_bucket_count": 1,
+                    "complete_flow_count": 3,
+                    "incomplete_flow_count": 0,
+                    "identity_join_rate": 1.0,
+                    "complete_flow_rate": 1.0,
+                    "join_contract_blocked": False,
+                    "flow_sim_auto_approved_count": 1,
+                    "stage_only_source_only_count": 1,
+                },
+                "warnings": [],
+                "surfaced_candidate_ids": ["swing_bucket_lifecycle_flow_parent"],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        mod,
+        "swing_lifecycle_bucket_discovery_paths",
+        lambda target_date: (path, path.with_suffix(".md")),
+    )
+
+    summary, _, warnings = mod._swing_lifecycle_bucket_discovery_summary("2026-05-27")
+
+    assert warnings == []
+    assert summary["swing_lifecycle_flow_bucket_count"] == 1
+    assert summary["complete_flow_count"] == 3
+    assert summary["flow_sim_auto_approved_count"] == 1
+    assert summary["stage_only_source_only_count"] == 1
+    assert summary["sim_auto_reviewed_candidate_count"] == 21
+    assert summary["sim_auto_review_shard_count"] == 2
+
+
+def test_swing_lifecycle_bucket_discovery_summary_surfaces_parsed_followup(
+    tmp_path, monkeypatch
+):
+    report_dir = tmp_path / "swing_lifecycle_bucket_discovery"
+    report_dir.mkdir()
+    path = report_dir / "swing_lifecycle_bucket_discovery_2026-05-27.json"
+    path.write_text(
+        json.dumps(
+            {
+                "runtime_effect": False,
+                "source_only": True,
+                "decision_authority": "swing_ldm_bucket_discovery_sim_auto",
+                "summary": {
+                    "source_contract_status": "pass",
+                    "ai_two_pass_review_status": "parsed",
+                    "ai_fail_closed": False,
+                    "ai_review_followup_required": True,
+                    "ai_review_followup_reasons": ["audit_status=correction_required"],
+                    "sim_auto_blocked_by_ai_review_followup": True,
+                    "code_improvement_workorder_ids": [
+                        "swing_lifecycle_bucket_discovery_ai_review_followup"
+                    ],
+                    "implemented_code_improvement_workorder_ids": [
+                        "swing_lifecycle_bucket_discovery_ai_review_followup"
+                    ],
+                    "pending_code_improvement_workorder_ids": [],
+                    "ai_review_followup_workorder_ids": [
+                        "swing_lifecycle_bucket_discovery_ai_review_followup"
+                    ],
+                    "candidate_count": 1,
+                    "surfaced_candidate_count": 1,
+                },
+                "warnings": [],
+                "surfaced_candidate_ids": ["swing_bucket_entry_test"],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        mod,
+        "swing_lifecycle_bucket_discovery_paths",
+        lambda target_date: (path, path.with_suffix(".md")),
+    )
+
+    summary, artifact, warnings = mod._swing_lifecycle_bucket_discovery_summary(
+        "2026-05-27"
+    )
+
+    assert artifact == str(path)
+    assert summary["ai_two_pass_review_status"] == "parsed"
+    assert summary["ai_fail_closed"] is False
+    assert summary["ai_review_followup_required"] is True
+    assert summary["sim_auto_blocked_by_ai_review_followup"] is True
+    assert summary["code_improvement_workorder_ids"] == [
+        "swing_lifecycle_bucket_discovery_ai_review_followup"
+    ]
+    assert summary["ai_review_followup_workorder_ids"] == [
+        "swing_lifecycle_bucket_discovery_ai_review_followup"
+    ]
+    assert "swing_lifecycle_bucket_discovery:ai_review_followup_required" in warnings
+    assert (
+        "swing_lifecycle_bucket_discovery:ai_review_followup_sim_auto_blocked"
+        in warnings
+    )
+    assert not any("fail_closed" in warning for warning in warnings)
+
+
+def test_build_threshold_cycle_ev_report_warns_when_pattern_lab_artifact_missing(
+    tmp_path, monkeypatch
+):
+    report_dir = tmp_path / "report"
+    monitor_dir = report_dir / "monitor_snapshots"
+    calibration_dir = report_dir / "threshold_cycle_calibration"
+    apply_dir = tmp_path / "apply_plans"
+    ev_dir = report_dir / "threshold_cycle_ev"
+    automation_dir = report_dir / "scalping_pattern_lab_automation"
+    workorder_report_dir = report_dir / "code_improvement_workorder"
+    workorder_doc_dir = tmp_path / "docs" / "code-improvement-workorders"
+    monitor_dir.mkdir(parents=True)
+    calibration_dir.mkdir(parents=True)
+    apply_dir.mkdir(parents=True)
+    monkeypatch.setattr(mod, "MONITOR_SNAPSHOT_DIR", monitor_dir)
+    monkeypatch.setattr(mod, "CALIBRATION_REPORT_DIR", calibration_dir)
+    monkeypatch.setattr(mod, "EV_REPORT_DIR", ev_dir)
+    monkeypatch.setattr(
+        mod,
+        "apply_manifest_path",
+        lambda target_date: apply_dir / f"threshold_apply_{target_date}.json",
+    )
+    monkeypatch.setattr(
+        mod,
+        "automation_report_paths",
+        lambda target_date: (
+            automation_dir / f"scalping_pattern_lab_automation_{target_date}.json",
+            automation_dir / f"scalping_pattern_lab_automation_{target_date}.md",
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "code_improvement_workorder_paths",
+        lambda target_date: (
+            workorder_report_dir / f"code_improvement_workorder_{target_date}.json",
+            workorder_doc_dir / f"code_improvement_workorder_{target_date}.md",
+        ),
+    )
+
+    (monitor_dir / "trade_review_2026-05-08.json").write_text(
+        json.dumps({"metrics": {}}), encoding="utf-8"
+    )
+    (monitor_dir / "performance_tuning_2026-05-08.json").write_text(
+        json.dumps({"metrics": {}}), encoding="utf-8"
+    )
+    (
+        calibration_dir / "threshold_cycle_calibration_2026-05-08_postclose.json"
+    ).write_text(
+        json.dumps({"run_phase": "postclose"}),
+        encoding="utf-8",
+    )
+    (apply_dir / "threshold_apply_2026-05-08.json").write_text(
+        json.dumps({"status": "manifest_ready"}), encoding="utf-8"
+    )
+
+    report = mod.build_threshold_cycle_ev_report("2026-05-08")
+
+    assert report["pattern_lab_automation"]["available"] is False
+    assert "pattern_lab_automation_missing" in report["warnings"]
+    assert "code_improvement_workorder_missing" in report["warnings"]
+    assert "codebase_performance_workorder_missing" in report["warnings"]
+
+
+def test_build_threshold_cycle_ev_report_surfaces_source_parse_errors(
+    tmp_path, monkeypatch
+):
+    report_dir = tmp_path / "report"
+    monitor_dir = report_dir / "monitor_snapshots"
+    calibration_dir = report_dir / "threshold_cycle_calibration"
+    apply_dir = tmp_path / "apply_plans"
+    ev_dir = report_dir / "threshold_cycle_ev"
+    workorder_report_dir = report_dir / "code_improvement_workorder"
+    workorder_doc_dir = tmp_path / "docs" / "code-improvement-workorders"
+    for path in (
+        monitor_dir,
+        calibration_dir,
+        apply_dir,
+        workorder_report_dir,
+        workorder_doc_dir,
+    ):
+        path.mkdir(parents=True)
+    monkeypatch.setattr(mod, "MONITOR_SNAPSHOT_DIR", monitor_dir)
+    monkeypatch.setattr(mod, "CALIBRATION_REPORT_DIR", calibration_dir)
+    monkeypatch.setattr(mod, "EV_REPORT_DIR", ev_dir)
+    monkeypatch.setattr(
+        mod,
+        "apply_manifest_path",
+        lambda target_date: apply_dir / f"threshold_apply_{target_date}.json",
+    )
+    monkeypatch.setattr(
+        mod,
+        "automation_report_paths",
+        lambda target_date: (
+            tmp_path
+            / "missing"
+            / f"scalping_pattern_lab_automation_{target_date}.json",
+            tmp_path / "missing" / f"scalping_pattern_lab_automation_{target_date}.md",
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "code_improvement_workorder_paths",
+        lambda target_date: (
+            workorder_report_dir / f"code_improvement_workorder_{target_date}.json",
+            workorder_doc_dir / f"code_improvement_workorder_{target_date}.md",
+        ),
+    )
+
+    (monitor_dir / "trade_review_2026-05-08.json").write_text(
+        "{bad json", encoding="utf-8"
+    )
+    (monitor_dir / "performance_tuning_2026-05-08.json").write_text(
+        json.dumps({"metrics": {}}), encoding="utf-8"
+    )
+    (
+        calibration_dir / "threshold_cycle_calibration_2026-05-08_postclose.json"
+    ).write_text(
+        json.dumps({"run_phase": "postclose"}),
+        encoding="utf-8",
+    )
+    (apply_dir / "threshold_apply_2026-05-08.json").write_text(
+        json.dumps({"status": "manifest_ready"}), encoding="utf-8"
+    )
+    (workorder_report_dir / "code_improvement_workorder_2026-05-08.json").write_text(
+        json.dumps({"summary": {}, "orders": []}),
+        encoding="utf-8",
+    )
+    (workorder_doc_dir / "code_improvement_workorder_2026-05-08.md").write_text(
+        "# workorder\n", encoding="utf-8"
+    )
+
+    report = mod.build_threshold_cycle_ev_report("2026-05-08")
+
+    assert report["source_load_diagnostics"][0]["status"] == "parse_error"
+    assert "source_load_parse_error:trade_review_2026-05-08.json" in report["warnings"]
+    markdown = (ev_dir / "threshold_cycle_ev_2026-05-08.md").read_text(encoding="utf-8")
+    assert "Source Load Diagnostics" in markdown
+
+
+def test_threshold_cycle_ev_report_exposes_codebase_performance_source_as_ops_summary(
+    tmp_path, monkeypatch
+):
+    report_dir = tmp_path / "report"
+    monitor_dir = report_dir / "monitor_snapshots"
+    calibration_dir = report_dir / "threshold_cycle_calibration"
+    perf_dir = report_dir / "codebase_performance_workorder"
+    apply_dir = tmp_path / "apply_plans"
+    ev_dir = report_dir / "threshold_cycle_ev"
+    workorder_report_dir = report_dir / "code_improvement_workorder"
+    workorder_doc_dir = tmp_path / "docs" / "code-improvement-workorders"
+    for path in (
+        monitor_dir,
+        calibration_dir,
+        perf_dir,
+        apply_dir,
+        workorder_report_dir,
+        workorder_doc_dir,
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(mod, "REPORT_DIR", report_dir)
+    monkeypatch.setattr(mod, "MONITOR_SNAPSHOT_DIR", monitor_dir)
+    monkeypatch.setattr(mod, "CALIBRATION_REPORT_DIR", calibration_dir)
+    monkeypatch.setattr(mod, "EV_REPORT_DIR", ev_dir)
+    monkeypatch.setattr(
+        mod,
+        "apply_manifest_path",
+        lambda target_date: apply_dir / f"threshold_apply_{target_date}.json",
+    )
+    monkeypatch.setattr(
+        mod,
+        "automation_report_paths",
+        lambda target_date: (
+            report_dir
+            / "missing"
+            / f"scalping_pattern_lab_automation_{target_date}.json",
+            report_dir
+            / "missing"
+            / f"scalping_pattern_lab_automation_{target_date}.md",
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "code_improvement_workorder_paths",
+        lambda target_date: (
+            workorder_report_dir / f"code_improvement_workorder_{target_date}.json",
+            workorder_doc_dir / f"code_improvement_workorder_{target_date}.md",
+        ),
+    )
+
+    (monitor_dir / "trade_review_2026-05-14.json").write_text(
+        json.dumps({"metrics": {}}), encoding="utf-8"
+    )
+    (monitor_dir / "performance_tuning_2026-05-14.json").write_text(
+        json.dumps({"metrics": {}}), encoding="utf-8"
+    )
+    (
+        calibration_dir / "threshold_cycle_calibration_2026-05-14_postclose.json"
+    ).write_text(
+        json.dumps({"run_phase": "postclose"}),
+        encoding="utf-8",
+    )
+    (apply_dir / "threshold_apply_2026-05-14.json").write_text(
+        json.dumps({"status": "manifest_ready"}), encoding="utf-8"
+    )
+    (workorder_report_dir / "code_improvement_workorder_2026-05-14.json").write_text(
+        json.dumps({"summary": {}, "orders": []}),
+        encoding="utf-8",
+    )
+    (workorder_doc_dir / "code_improvement_workorder_2026-05-14.md").write_text(
+        "# workorder\n", encoding="utf-8"
+    )
+    (perf_dir / "codebase_performance_workorder_2026-05-14.json").write_text(
+        json.dumps(
+            {
+                "source_doc_hash": "abc123",
+                "summary": {
+                    "accepted_count": 7,
+                    "deferred_count": 3,
+                    "rejected_count": 2,
+                },
+                "policy": {
+                    "runtime_effect": False,
+                    "strategy_effect": False,
+                    "data_quality_effect": False,
+                    "tuning_axis_effect": False,
+                    "decision_authority": "ops_performance_workorder_source",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    report = mod.build_threshold_cycle_ev_report("2026-05-14")
+
+    summary = report["codebase_performance_workorder"]
+    assert summary["available"] is True
+    assert summary["accepted_count"] == 7
+    assert summary["deferred_count"] == 3
+    assert summary["rejected_count"] == 2
+    assert summary["runtime_effect"] is False
+    assert summary["strategy_effect"] is False
+    assert summary["data_quality_effect"] is False
+    assert summary["tuning_axis_effect"] is False
+    assert report["sources"]["codebase_performance_workorder"] == str(
+        perf_dir / "codebase_performance_workorder_2026-05-14.json"
+    )
+    markdown = (ev_dir / "threshold_cycle_ev_2026-05-14.md").read_text(encoding="utf-8")
+    assert "Codebase Performance Workorder Source" in markdown
+    assert "ops_performance_workorder_source" in markdown
+
+
+def test_entry_split_summary_treats_real_detail_book_as_real_evidence(
+    tmp_path, monkeypatch
+):
+    report_dir = tmp_path / "entry_split_order_plan"
+    report_dir.mkdir()
+    monkeypatch.setattr(mod, "ENTRY_SPLIT_ORDER_PLAN_DIR", report_dir)
+    (report_dir / "entry_split_order_plan_2026-06-30.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "entry_split_order_plan_v1",
+                "source_quality": {"status": "pass", "tuning_input_allowed": True},
+                "candidate_grid": [
+                    {
+                        "context_bucket": "hold_sample",
+                        "real_sample_count": 0,
+                        "real_outcome_joined_sample": 0,
+                        "sim_sample_count": 5,
+                        "primary_sample_book": "none",
+                    },
+                    {
+                        "context_bucket": "passive_wide_or_weak",
+                        "real_sample_count": 100,
+                        "real_outcome_joined_sample": 17,
+                        "sim_sample_count": 5732,
+                        "primary_sample_book": "real_submit_post_submit_observed_low",
+                    },
+                ],
+                "recommended_policy": {
+                    "policy_file": "policy.json",
+                    "policy_version": "entry_split_order_plan:test",
+                    "runtime_apply_allowed": False,
+                    "candidates": [{"policy_mode": "post_submit_tick_band_seed"}],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary, _path, warnings = mod._entry_split_order_plan_summary("2026-06-30")
+
+    assert warnings == []
+    assert summary["real_sample_count"] == 100
+    assert summary["real_outcome_joined_sample"] == 17
+    assert summary["primary_sample_book"] == "real_submit_post_submit_observed_low"
+
+
+def test_entry_split_summary_separates_exploration_from_ev_authority(
+    tmp_path, monkeypatch
+):
+    report_dir = tmp_path / "entry_split_order_plan"
+    report_dir.mkdir()
+    monkeypatch.setattr(mod, "ENTRY_SPLIT_ORDER_PLAN_DIR", report_dir)
+    (report_dir / "entry_split_order_plan_2026-07-01.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "entry_split_order_plan_v1",
+                "source_quality": {
+                    "status": "pass",
+                    "tuning_input_allowed": True,
+                },
+                "candidate_grid": [],
+                "recommended_policy": {
+                    "runtime_apply_allowed": True,
+                    "runtime_apply_compatibility_semantics": "union_of_exploration_seed_allowed_and_ev_validated_runtime_apply_allowed",
+                    "exploration_seed_allowed": True,
+                    "ev_validated_runtime_apply_allowed": False,
+                    "runtime_apply_authority_classes": ["bounded_exploration_seed"],
+                    "candidates": [],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary, _path, warnings = mod._entry_split_order_plan_summary("2026-07-01")
+
+    assert warnings == []
+    assert summary["runtime_apply_allowed"] is True
+    assert summary["runtime_apply_authority_contract_valid"] is True
+    assert summary["exploration_seed_allowed"] is True
+    assert summary["ev_validated_runtime_apply_allowed"] is False
+    assert summary["primary_decision_metric"] == "qty_preserving_execution_shape_guard"
+    assert summary["primary_decision_metric_scope"] == ("bounded_exploration_seed_only")
+
+
+def test_entry_split_summary_blocks_contradictory_authority_contract(
+    tmp_path, monkeypatch
+):
+    report_dir = tmp_path / "entry_split_order_plan"
+    report_dir.mkdir()
+    monkeypatch.setattr(mod, "ENTRY_SPLIT_ORDER_PLAN_DIR", report_dir)
+    (report_dir / "entry_split_order_plan_2026-07-02.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "entry_split_order_plan_v1",
+                "source_quality": {
+                    "status": "pass",
+                    "tuning_input_allowed": True,
+                },
+                "candidate_grid": [],
+                "recommended_policy": {
+                    "runtime_apply_allowed": True,
+                    "runtime_apply_compatibility_semantics": "union_of_exploration_seed_allowed_and_ev_validated_runtime_apply_allowed",
+                    "exploration_seed_allowed": False,
+                    "ev_validated_runtime_apply_allowed": False,
+                    "candidates": [],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary, _path, warnings = mod._entry_split_order_plan_summary("2026-07-02")
+
+    assert summary["runtime_apply_allowed"] is False
+    assert summary["runtime_apply_authority_contract_valid"] is False
+    assert "entry_split_order_plan_runtime_apply_authority_contract_invalid" in warnings
+
+
+def test_top_level_summary_treats_real_detail_book_as_real_ready():
+    summary = mod._top_level_summary(
+        {
+            "daily_ev_summary": {
+                "source_split": {"real": {"sample": 0}, "sim": {"sample": 0}}
+            },
+            "calibration_outcome": {
+                "decisions": [
+                    {
+                        "family": "entry_split_order_plan",
+                        "source_metrics": {
+                            "real_outcome_joined_sample": 1,
+                            "sim_sample_count": 0,
+                            "primary_sample_book": "real_submit_execution_shape",
+                        },
+                    }
+                ]
+            },
+            "lifecycle_bucket_discovery": {"live_auto_apply_ready_count": 0},
+            "source_quality_preflight_gate": {
+                "status": "pass",
+                "tuning_input_allowed": True,
+            },
+        }
+    )
+
+    assert summary["real_sample_ready"] is True
+    assert summary["primary_sample_book"] == "real_submit_execution_shape"
+    assert summary["primary_verdict"] == "real_primary_evidence_present"
+
+
+def test_threshold_cycle_ev_report_prefers_candidate_sample_counts_from_calibration(
+    tmp_path, monkeypatch
+):
+    report_dir = tmp_path / "report"
+    monitor_dir = report_dir / "monitor_snapshots"
+    calibration_dir = report_dir / "threshold_cycle_calibration"
+    apply_dir = tmp_path / "apply_plans"
+    ev_dir = report_dir / "threshold_cycle_ev"
+    workorder_report_dir = report_dir / "code_improvement_workorder"
+    workorder_doc_dir = tmp_path / "docs" / "code-improvement-workorders"
+    for path in (
+        monitor_dir,
+        calibration_dir,
+        apply_dir,
+        ev_dir,
+        workorder_report_dir,
+        workorder_doc_dir,
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(mod, "MONITOR_SNAPSHOT_DIR", monitor_dir)
+    monkeypatch.setattr(mod, "CALIBRATION_REPORT_DIR", calibration_dir)
+    monkeypatch.setattr(mod, "EV_REPORT_DIR", ev_dir)
+    monkeypatch.setattr(
+        mod,
+        "apply_manifest_path",
+        lambda target_date: apply_dir / f"threshold_apply_{target_date}.json",
+    )
+    monkeypatch.setattr(
+        mod,
+        "automation_report_paths",
+        lambda target_date: (
+            tmp_path
+            / "missing"
+            / f"scalping_pattern_lab_automation_{target_date}.json",
+            tmp_path / "missing" / f"scalping_pattern_lab_automation_{target_date}.md",
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "code_improvement_workorder_paths",
+        lambda target_date: (
+            workorder_report_dir / f"code_improvement_workorder_{target_date}.json",
+            workorder_doc_dir / f"code_improvement_workorder_{target_date}.md",
+        ),
+    )
+
+    (monitor_dir / "trade_review_2026-05-12.json").write_text(
+        json.dumps(
+            {
+                "metrics": {
+                    "completed_trades": 0,
+                    "open_trades": 0,
+                    "win_trades": 0,
+                    "loss_trades": 0,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (monitor_dir / "performance_tuning_2026-05-12.json").write_text(
+        json.dumps(
+            {"metrics": {"budget_pass_events": 0, "order_bundle_submitted_events": 0}}
+        ),
+        encoding="utf-8",
+    )
+    (
+        calibration_dir / "threshold_cycle_calibration_2026-05-12_postclose.json"
+    ).write_text(
+        json.dumps(
+            {
+                "run_phase": "postclose",
+                "runtime_change": False,
+                "calibration_candidates": [
+                    {
+                        "family": "holding_exit_decision_matrix_advisory",
+                        "calibration_state": "hold_no_edge",
+                        "sample_count": 14,
+                        "source_sample_count": 14,
+                        "sample_floor": 1,
+                        "sample_floor_status": "minimum_edge_missing",
+                        "source_metrics": {
+                            "counterfactual_gap_count": 14,
+                            "eligible_but_not_chosen_sample_snapshots": 0,
+                        },
+                    }
+                ],
+                "post_apply_attribution": {
+                    "calibration_decisions": [
+                        {
+                            "family": "holding_exit_decision_matrix_advisory",
+                            "calibration_state": "hold_no_edge",
+                            "sample_count": 0,
+                            "sample_floor": 1,
+                        }
+                    ]
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (apply_dir / "threshold_apply_2026-05-12.json").write_text(
+        json.dumps({"status": "auto_bounded_live_ready", "runtime_change": False}),
+        encoding="utf-8",
+    )
+
+    report = mod.build_threshold_cycle_ev_report("2026-05-12")
+
+    decision = next(
+        item
+        for item in report["calibration_outcome"]["decisions"]
+        if item["family"] == "holding_exit_decision_matrix_advisory"
+    )
+    assert decision["sample_count"] == 14
+    assert decision["source_sample_count"] == 14
+    assert decision["sample_floor_status"] == "minimum_edge_missing"
+    assert decision["source_metrics"]["counterfactual_gap_count"] == 14
+    markdown = (ev_dir / "threshold_cycle_ev_2026-05-12.md").read_text(encoding="utf-8")
+    assert "holding_exit_decision_matrix_advisory" in markdown
+    assert "sample=`14/1`" in markdown
+
+
+def test_build_threshold_cycle_ev_report_renders_swing_pattern_lab_section(
+    tmp_path, monkeypatch
+):
+    report_dir = tmp_path / "report"
+    monitor_dir = report_dir / "monitor_snapshots"
+    calibration_dir = report_dir / "threshold_cycle_calibration"
+    apply_dir = tmp_path / "apply_plans"
+    ev_dir = report_dir / "threshold_cycle_ev"
+    automation_dir = report_dir / "scalping_pattern_lab_automation"
+    swing_lab_automation_dir = report_dir / "swing_pattern_lab_automation"
+    workorder_report_dir = report_dir / "code_improvement_workorder"
+    workorder_doc_dir = tmp_path / "docs" / "code-improvement-workorders"
+    for d in (
+        monitor_dir,
+        calibration_dir,
+        apply_dir,
+        automation_dir,
+        swing_lab_automation_dir,
+        workorder_report_dir,
+        workorder_doc_dir,
+    ):
+        d.mkdir(parents=True)
+    monkeypatch.setattr(mod, "MONITOR_SNAPSHOT_DIR", monitor_dir)
+    monkeypatch.setattr(mod, "CALIBRATION_REPORT_DIR", calibration_dir)
+    monkeypatch.setattr(mod, "EV_REPORT_DIR", ev_dir)
+    monkeypatch.setattr(
+        mod,
+        "apply_manifest_path",
+        lambda target_date: apply_dir / f"threshold_apply_{target_date}.json",
+    )
+    monkeypatch.setattr(
+        mod,
+        "automation_report_paths",
+        lambda target_date: (
+            automation_dir / f"scalping_pattern_lab_automation_{target_date}.json",
+            automation_dir / f"scalping_pattern_lab_automation_{target_date}.md",
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "swing_pattern_lab_automation_report_paths",
+        lambda target_date: (
+            swing_lab_automation_dir
+            / f"swing_pattern_lab_automation_{target_date}.json",
+            swing_lab_automation_dir / f"swing_pattern_lab_automation_{target_date}.md",
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "code_improvement_workorder_paths",
+        lambda target_date: (
+            workorder_report_dir / f"code_improvement_workorder_{target_date}.json",
+            workorder_doc_dir / f"code_improvement_workorder_{target_date}.md",
+        ),
+    )
+
+    (monitor_dir / "trade_review_2026-05-08.json").write_text(
+        json.dumps({"metrics": {}}), encoding="utf-8"
+    )
+    (monitor_dir / "performance_tuning_2026-05-08.json").write_text(
+        json.dumps({"metrics": {}}), encoding="utf-8"
+    )
+    (
+        calibration_dir / "threshold_cycle_calibration_2026-05-08_postclose.json"
+    ).write_text(json.dumps({"run_phase": "postclose"}), encoding="utf-8")
+    (apply_dir / "threshold_apply_2026-05-08.json").write_text(
+        json.dumps({"status": "manifest_ready"}), encoding="utf-8"
+    )
+    (
+        swing_lab_automation_dir / "swing_pattern_lab_automation_2026-05-08.json"
+    ).write_text(
+        json.dumps(
+            {
+                "ev_report_summary": {
+                    "deepseek_lab_available": True,
+                    "findings_count": 2,
+                    "code_improvement_order_count": 1,
+                    "data_quality_warning_count": 0,
+                    "carryover_warning_count": 1,
+                    "population_split_available": True,
+                    "source_quality_blocked_families": [
+                        {
+                            "family": "swing_scale_in_ofi_qi_confirmation",
+                            "stage": "scale_in",
+                            "source_quality_blockers": [
+                                "scale_in_ofi_qi_invalid_micro_context"
+                            ],
+                        }
+                    ],
+                },
+                "consensus_findings": [
+                    {
+                        "finding_id": "f1",
+                        "title": "selection gap",
+                        "route": "design_family_candidate",
+                    },
+                    {
+                        "finding_id": "f2",
+                        "title": "entry block",
+                        "route": "attach_existing_family",
+                    },
+                ],
+                "code_improvement_orders": [
+                    {
+                        "order_id": "order_f1",
+                        "title": "selection gap",
+                        "decision": "design_family_candidate",
+                    },
+                ],
+                "data_quality": {
+                    "warnings": [
+                        "OFI/QI stale/missing ratio: 0.5000 (1/2); reasons: micro_missing=1"
+                    ],
+                    "ofi_qi_quality": {
+                        "stale_missing_unique_record_count": 1,
+                        "sample_count": 20,
+                        "micro_ready_count": 7,
+                        "micro_insufficient_samples_count": 3,
+                        "wide_spread_count": 4,
+                        "max_spread_ticks": 18,
+                        "reason_counts": {
+                            "micro_missing": 9,
+                            "micro_not_ready": 3,
+                            "state_insufficient": 2,
+                            "observer_unhealthy": 1,
+                            "provenance_gap": 5,
+                        },
+                    },
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (workorder_report_dir / "code_improvement_workorder_2026-05-08.json").write_text(
+        json.dumps({"summary": {}, "orders": []}), encoding="utf-8"
+    )
+    (workorder_doc_dir / "code_improvement_workorder_2026-05-08.md").write_text(
+        "# workorder\n", encoding="utf-8"
+    )
+
+    report = mod.build_threshold_cycle_ev_report("2026-05-08")
+    assert report["swing_pattern_lab_automation"]["available"] is True
+    assert report["swing_pattern_lab_automation"]["findings_count"] == 2
+    assert report["swing_pattern_lab_automation"]["carryover_warning_count"] == 1
+    assert (
+        report["swing_pattern_lab_automation"]["resolved_data_quality_warning_count"]
+        == 1
+    )
+    assert not any(
+        "swing_lab_dq:OFI/QI stale/missing" in item for item in report["warnings"]
+    )
+    assert report["swing_pattern_lab_automation"]["source_quality_blocked_families"][0][
+        "family"
+    ] == ("swing_scale_in_ofi_qi_confirmation")
+    blocked = report["swing_pattern_lab_automation"]["source_quality_blocked_families"][
+        0
+    ]
+    assert blocked["provenance_gap_count"] == 5
+    assert blocked["readiness_counts"]["micro_ready_count"] == 7
+    assert blocked["readiness_counts"]["micro_insufficient_samples_count"] == 3
+    assert blocked["spread_quality"]["wide_spread_count"] == 4
+    assert blocked["spread_quality"]["wide_spread_rate"] == 20.0
+    assert blocked["spread_quality"]["max_spread_ticks"] == 18.0
+    assert blocked["spread_quality"]["hard_block"] is False
+    assert blocked["source_quality_reason_stage_split"]["observer_unhealthy"] == 1
+
+    markdown = (ev_dir / "threshold_cycle_ev_2026-05-08.md").read_text(encoding="utf-8")
+    assert "Swing Pattern Lab Automation" in markdown
+    assert "deepseek_lab_available" in markdown
+    assert "source_quality_blocked_families" in markdown
+    assert "resolved_data_quality_warnings" in markdown
+    assert "carryover_warnings" in markdown
+    assert "population_split_available" in markdown
+
+
+def test_swing_micro_provenance_gap_does_not_fallback_to_micro_missing():
+    enriched = mod._enrich_swing_micro_source_quality_blockers(
+        [{"family": "swing_scale_in_ofi_qi_confirmation"}],
+        {
+            "sample_count": 10,
+            "reason_counts": {
+                "micro_missing": 7,
+                "micro_not_ready": 2,
+            },
+        },
+    )
+
+    blocked = enriched[0]
+    assert blocked["provenance_gap_count"] == 0
+    assert blocked["source_quality_reason_stage_split"]["micro_missing"] == 7
+    assert blocked["source_quality_reason_stage_split"]["provenance_gap"] == 0
+
+
+def test_microstructure_summary_propagates_clean_baseline_cumulative(
+    tmp_path, monkeypatch
+):
+    target_date = "2026-07-31"
+    json_path = tmp_path / "microstructure.json"
+    json_path.write_text(
+        json.dumps(
+            {
+                "runtime_effect": False,
+                "summary": {
+                    "row_count": 10,
+                    "opportunity_exploration_funnel": {
+                        "unique_entry_opportunity_count": 2
+                    },
+                    "clean_baseline_cumulative_opportunity_exploration": {
+                        "included_date_count": 40,
+                        "source_quality_adjusted_ev_pct": 0.31,
+                        "runtime_reflection_status": "sample_floor_not_met",
+                        "runtime_apply_required": False,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        mod,
+        "microstructure_reaction_report_paths",
+        lambda unused: (json_path, tmp_path / "microstructure.md"),
+    )
+
+    summary, source_path, warnings = mod._microstructure_reaction_context_summary(
+        target_date
+    )
+
+    assert source_path == str(json_path)
+    assert warnings == []
+    assert (
+        summary["opportunity_exploration_funnel"]["unique_entry_opportunity_count"] == 2
+    )
+    cumulative = summary["clean_baseline_cumulative_opportunity_exploration"]
+    assert cumulative["included_date_count"] == 40
+    assert cumulative["source_quality_adjusted_ev_pct"] == 0.31
+    assert cumulative["runtime_apply_required"] is False

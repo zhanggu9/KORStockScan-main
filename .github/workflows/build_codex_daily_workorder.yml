@@ -1,0 +1,176 @@
+name: Build Codex Daily Workorder
+
+on:
+  workflow_dispatch:
+    inputs:
+      slot:
+        description: "Slot to build"
+        required: true
+        default: "ALL"
+        type: choice
+        options:
+          - ALL
+          - PREOPEN
+          - INTRADAY
+          - POSTCLOSE
+      target_date:
+        description: "Target due date in YYYY-MM-DD. Empty means Asia/Seoul today."
+        required: false
+        default: ""
+        type: string
+      include_overdue:
+        description: "Include overdue items up to target_date"
+        required: true
+        default: true
+        type: boolean
+  schedule:
+    - cron: "20 23 * * *"
+    - cron: "0 1,4 * * *"
+    - cron: "40 6 * * *"
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build-workorder:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - slot: PREOPEN
+            cron: "20 23 * * *"
+            manual_enabled: true
+          - slot: INTRADAY
+            cron: "0 1,4 * * *"
+            manual_enabled: true
+          - slot: POSTCLOSE
+            cron: "40 6 * * *"
+            manual_enabled: true
+    steps:
+      - name: Checkout
+        if: |
+          (github.event_name == 'workflow_dispatch' && matrix.manual_enabled && (github.event.inputs.slot == 'ALL' || github.event.inputs.slot == matrix.slot)) ||
+          (github.event_name == 'schedule' && github.event.schedule == matrix.cron)
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        if: |
+          (github.event_name == 'workflow_dispatch' && matrix.manual_enabled && (github.event.inputs.slot == 'ALL' || github.event.inputs.slot == matrix.slot)) ||
+          (github.event_name == 'schedule' && github.event.schedule == matrix.cron)
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Resolve target date and trading day
+        id: target
+        if: |
+          (github.event_name == 'workflow_dispatch' && matrix.manual_enabled && (github.event.inputs.slot == 'ALL' || github.event.inputs.slot == matrix.slot)) ||
+          (github.event_name == 'schedule' && github.event.schedule == matrix.cron)
+        shell: bash
+        run: |
+          set -euo pipefail
+          target_date="${{ github.event.inputs.target_date }}"
+          if [ -z "${target_date}" ]; then
+            target_date="$(TZ=Asia/Seoul date +%F)"
+          fi
+          export TARGET_DATE="${target_date}"
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          from datetime import date
+          from src.utils.market_day import get_krx_trading_day_status
+
+          target_date = os.environ["TARGET_DATE"]
+          ok, reason = get_krx_trading_day_status(date.fromisoformat(target_date))
+          print(f"target_date={target_date}")
+          print(f"is_trading_day={'true' if ok else 'false'}")
+          print(f"reason={reason}")
+          PY
+
+      - name: Validate required config
+        if: |
+          (
+            (github.event_name == 'workflow_dispatch' && matrix.manual_enabled && (github.event.inputs.slot == 'ALL' || github.event.inputs.slot == matrix.slot)) ||
+            (github.event_name == 'schedule' && github.event.schedule == matrix.cron)
+          ) &&
+          (steps.target.outputs.is_trading_day == 'true' || matrix.slot == 'INTRADAY')
+        env:
+          GH_PROJECT_TOKEN: ${{ secrets.GH_PROJECT_TOKEN }}
+          GH_PROJECT_OWNER: ${{ vars.GH_PROJECT_OWNER }}
+          GH_PROJECT_NUMBER: ${{ vars.GH_PROJECT_NUMBER }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for key in GH_PROJECT_TOKEN GH_PROJECT_OWNER GH_PROJECT_NUMBER; do
+            if [ -z "${!key:-}" ]; then
+              echo "::error::Missing required secret/variable: $key"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Build markdown
+        if: |
+          (
+            (github.event_name == 'workflow_dispatch' && matrix.manual_enabled && (github.event.inputs.slot == 'ALL' || github.event.inputs.slot == matrix.slot)) ||
+            (github.event_name == 'schedule' && github.event.schedule == matrix.cron)
+          ) &&
+          (steps.target.outputs.is_trading_day == 'true' || matrix.slot == 'INTRADAY')
+        env:
+          GH_PROJECT_TOKEN: ${{ secrets.GH_PROJECT_TOKEN }}
+          GH_PROJECT_OWNER: ${{ vars.GH_PROJECT_OWNER }}
+          GH_PROJECT_NUMBER: ${{ vars.GH_PROJECT_NUMBER }}
+          GH_PROJECT_DUE_FIELD_NAME: ${{ vars.GH_PROJECT_DUE_FIELD_NAME }}
+          GH_PROJECT_STATUS_FIELD_NAME: ${{ vars.GH_PROJECT_STATUS_FIELD_NAME }}
+          GH_PROJECT_TRACK_FIELD_NAME: ${{ vars.GH_PROJECT_TRACK_FIELD_NAME }}
+          GH_PROJECT_SLOT_FIELD_NAME: ${{ vars.GH_PROJECT_SLOT_FIELD_NAME }}
+          GH_CODEX_WORKORDER_STATUSES: ${{ vars.GH_CODEX_WORKORDER_STATUSES }}
+          CODEX_WORKORDER_MAX_ITEMS: ${{ vars.CODEX_WORKORDER_MAX_ITEMS }}
+          CODEX_WORKORDER_TARGET_DATE: ${{ steps.target.outputs.target_date }}
+          INCLUDE_OVERDUE: ${{ github.event.inputs.include_overdue }}
+        run: |
+          mkdir -p tmp
+          include_overdue="${INCLUDE_OVERDUE:-true}"
+          if [ -z "${include_overdue}" ]; then
+            include_overdue="true"
+          fi
+          args=(
+            --output "tmp/codex_daily_workorder_${{ matrix.slot }}.md"
+            --max-items "${CODEX_WORKORDER_MAX_ITEMS:-20}"
+            --slot "${{ matrix.slot }}"
+            --target-date "${CODEX_WORKORDER_TARGET_DATE}"
+          )
+          if [ "${include_overdue}" != "true" ]; then
+            args+=(--no-overdue)
+          fi
+          PYTHONPATH=. python -m src.engine.build_codex_daily_workorder \
+            "${args[@]}" | tee "tmp/codex_daily_workorder_summary_${{ matrix.slot }}.json"
+
+      - name: Publish summary
+        if: |
+          (
+            (github.event_name == 'workflow_dispatch' && matrix.manual_enabled && (github.event.inputs.slot == 'ALL' || github.event.inputs.slot == matrix.slot)) ||
+            (github.event_name == 'schedule' && github.event.schedule == matrix.cron)
+          ) &&
+          (steps.target.outputs.is_trading_day == 'true' || matrix.slot == 'INTRADAY')
+        run: |
+          {
+            echo "## Codex Daily Workorder (${{ matrix.slot }})"
+            echo ""
+            echo "- target_date: \`${{ steps.target.outputs.target_date }}\`"
+            echo "- trading_day: \`${{ steps.target.outputs.is_trading_day }}\` / reason: \`${{ steps.target.outputs.reason }}\`"
+            echo ""
+            cat "tmp/codex_daily_workorder_${{ matrix.slot }}.md"
+            echo ""
+            echo "### Build Summary"
+            echo ""
+            echo '```json'
+            cat "tmp/codex_daily_workorder_summary_${{ matrix.slot }}.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

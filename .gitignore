@@ -1,0 +1,114 @@
+# ==========================================
+# 🔐 민감 정보 및 설정 (절대 커밋 금지)
+# ==========================================
+config.json
+config_dev.json
+config_prod.json
+credentials.json
+docker-compose.yml
+*.token
+*.key
+*.sql
+.env
+src/.env
+.clinerules
+
+# ==========================================
+# 🐍 파이썬 환경 및 캐시
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+temp/
+tmp/
+.venv/
+.kilo/
+env/
+build/
+dist/
+*.egg-info/
+
+# ==========================================
+# 📊 데이터베이스 및 로그
+# ==========================================
+# PostgreSQL을 쓰지만, 이전 로컬 DB 잔재나 백업본 방지
+*.db
+*.json
+!data/config/micro_reversion_economic_policy.json
+!data/config/low_price_two_leg_expanded_profile_evidence_2026-08-12.json
+!data/config/low_price_two_leg_expanded_profile_evidence_2026-08-18.json
+!data/config/low_price_two_leg_expanded_profile_evidence_2026-08-19.json
+!data/config/low_price_two_leg_expanded_profile_evidence_2026-08-20.json
+!data/config/low_price_two_leg_expanded_profile_evidence_2026-08-21.json
+!data/config/low_price_two_leg_expanded_profile_evidence_2026-08-24.json
+!data/config/low_price_two_leg_expanded_profile_evidence_2026-08-26.json
+!data/config/low_price_two_leg_expanded_profile_evidence_2026-08-28.json
+!data/config/ofi_bucket_threshold_manifest.json
+!data/config/widget_research_watch_symbols.json
+!data/threshold_cycle/operator_runtime_env_locks/aggressive_entry_price_override_2026-06-13.json
+!data/threshold_cycle/operator_runtime_env_locks/score65_74_strong_micro_override_2026-06-15.json
+!data/threshold_cycle/operator_runtime_env_locks/early_accel_recheck_2026-06-15.json
+!data/source_quality/
+!data/source_quality/clean_baseline_policy.json
+!data/source_quality/market_halt_windows/
+!data/source_quality/market_halt_windows/windows/
+!data/source_quality/market_halt_windows/windows/*.json
+data/source_quality/market_halt_windows/session_events/
+data/source_quality/raw_quarantine/
+data/source_quality/report_quarantine/
+data/source_quality/analytics_quarantine/
+*.jsonl
+*.csv
+*.bak
+*.backup
+*.gz
+*.log
+*.parquet
+*.duckdb
+*.h5
+*.hdf5
+*.zip
+*.tar.gz
+
+# Generated model registry run stores. Keep local artifacts, but do not track
+# per-run MLflow/output directories in git.
+data/model_registry/**/mlruns/
+data/model_registry/**/runs/
+
+# bot_main.py에서 생성하는 로그 폴더
+logs/
+*.log
+
+# ==========================================
+# ⚙️ 시스템 제어 플래그
+# ==========================================
+# bot_main.py의 재시작 감지용 플래그 파일
+restart.flag
+data/threshold_cycle/runtime_env/
+data/runtime/kiwoom_token_cache.json
+data/runtime/kiwoom_token_cache.lock
+data/runtime/kiwoom_episode_ka10080.lock
+data/runtime/rising_missed_nxt_post_block_sampler_state.lock
+data/runtime/widget_signal_auto_trade_state.lock
+data/runtime/samsung_*_one_share_state.lock
+data/runtime/samsung_morning_manual_addon_*.lock
+data/runtime/samsung_widget_manual_orders.lock
+data/runtime/low_price_two_leg/*.lock
+data/runtime/build_next_stage2_checklist/*.lock
+data/runtime/episode_manual_exit_receipts.lock
+data/offline_provider_budget/*.lock
+data/observations/scalp_micro_reversion_forward/.partition_maintenance_locks/*.lock
+*.generation.lock
+*.custody.lock
+data/pipeline_events/*.partition.lock
+data/threshold_cycle/*.partition.lock
+data/cache/micro_reversion_relevant_source_index/
+
+# ==========================================
+# 💻 OS 및 IDE 설정
+# ==========================================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

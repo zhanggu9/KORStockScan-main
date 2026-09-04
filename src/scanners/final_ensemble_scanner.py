@@ -1,0 +1,467 @@
+"""
+[KORStockScan Final Ensemble Scanner (Batch Engine)]
+
+이 모듈은 시스템의 최종 결정을 내리는 '장 마감(또는 장 전) 통합 스캐너' 및 '장중 지능형 재스캔' 엔진입니다.
+시장 전체의 데이터를 분석하여 승률이 가장 높은 타겟을 찾아내고, DB 감시 계층으로 데이터를 전달합니다.
+
+💡 핵심 기능 명세 (Feature Spec):
+-run_integrated_scanner() - 장 마감/장전 배치 작업:
+   1. 코스피 시총/거래량 상위 150~200개 종목을 대상으로 AI 콰트로 앙상블(XGB/LGBM) 예측 수행.
+   2. 지수 상대강도(RS), 단기 정배열, 수급(스마트 머니) 필터를 거쳐 'MAIN' 추천 종목만 DB 감시 대상으로 적재한다.
+      'RUNNER'는 기본적으로 감시 대상에서 제외하며, 필요한 경우 report-only 목록으로만 분리한다.
+   3. 스캐너 필터링 결과를 DB와 관리자 디버그 알림으로 남긴다.
+
+💡 아키텍처 설계 사상 (Decoupling & Event-Driven):
+- 이 파일은 오직 '계산(Compute)과 필터링(Filtering)'에만 집중합니다.
+- 알림 전송: 텔레그램 서버와 직접 통신하지 않으며, 관리자 디버그 알림만 EventBus로 발행합니다.
+- AI 추론: 무거운 ML 예측 연산은 `ml_predictor.py` 모듈로 철저하게 위임(Delegate)하여 책임을 분리했습니다.
+"""
+
+import sys
+from pathlib import Path
+
+# ==========================================
+# 🚀 [핵심 방어] 프로젝트 루트 경로를 sys.path에 동적으로 추가
+# ==========================================
+# 현재 파일(scanners) -> 부모(src) -> 부모(KORStockScan) 경로를 찾아냅니다.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.append(str(PROJECT_ROOT))
+
+import os
+import json
+import warnings
+import pandas as pd
+from datetime import datetime, timedelta
+
+# 💡 Level 1 & 2 공통 모듈
+from src.utils import kiwoom_utils
+from src.utils.constants import TRADING_RULES, DATA_DIR, CONFIG_PATH, DEV_PATH
+from src.database.db_manager import DBManager
+from src.core.event_bus import EventBus
+from src.model.common_v2 import calculate_all_features
+
+# 💡 [교정] 커스텀 로거 적용
+from src.utils.logger import log_error
+
+# 💡 [수정] 순수 AI 추론 도구
+import src.engine.swing.ml_predictor as ml_predictor
+
+warnings.filterwarnings("ignore")
+
+
+def _ensure_telegram_listener():
+    """Register Telegram EventBus subscribers only when the scanner actually runs."""
+    try:
+        import src.notify.telegram_manager  # noqa: F401
+    except Exception as exc:
+        log_error(f"텔레그램 매니저 로드 실패. 스캐너 이벤트만 생성합니다: {exc}")
+
+
+def _safe_float(value, default=0.0):
+    try:
+        if pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def classify_v2_csv_pick(row):
+    """Classify model-v2 rows without treating ranker score as probability."""
+    selection_mode = (
+        str(row.get("selection_mode", "LEGACY") or "LEGACY").strip().upper()
+    )
+    if selection_mode in {"EMPTY", "FALLBACK_DIAGNOSTIC"}:
+        return {
+            "should_save": False,
+            "pick_type": "EMPTY",
+            "position_tag": "EMPTY",
+            "star_icon": "·",
+            "prob": 0.0,
+            "meta_score": _safe_float(row.get("meta_score", row.get("score", 0.0))),
+            "hybrid_mean": _safe_float(row.get("hybrid_mean", 0.0)),
+            "selection_mode": selection_mode,
+        }
+
+    hybrid_mean = _safe_float(row.get("hybrid_mean", row.get("prob", 0.0)))
+    meta_score = _safe_float(row.get("meta_score", row.get("score", 0.0)))
+    prob = hybrid_mean if hybrid_mean > 0 else _safe_float(row.get("prob", 0.0))
+
+    if selection_mode == "SELECTED" or hybrid_mean >= 0.35:
+        pick_type = "MAIN"
+        position_tag = "META_V2"
+        star_icon = "🌟"
+    else:
+        pick_type = "RUNNER"
+        position_tag = "META_FALLBACK"
+        star_icon = "🥈"
+
+    return {
+        "should_save": True,
+        "pick_type": pick_type,
+        "position_tag": position_tag,
+        "star_icon": star_icon,
+        "prob": prob,
+        "meta_score": meta_score,
+        "hybrid_mean": hybrid_mean,
+        "selection_mode": selection_mode,
+    }
+
+
+def split_realtime_recommendations(
+    all_results, *, prob_main_pick, prob_runner_pick, runner_limit=0
+):
+    """Keep every MAIN candidate and optionally include RUNNER candidates."""
+    main_picks = sorted(
+        [r for r in all_results if r["Prob"] >= prob_main_pick],
+        key=lambda x: x["Prob"],
+        reverse=True,
+    )
+    if runner_limit <= 0:
+        return main_picks, []
+    runner_ups = sorted(
+        [r for r in all_results if prob_runner_pick <= r["Prob"] < prob_main_pick],
+        key=lambda x: x["Prob"],
+        reverse=True,
+    )[:runner_limit]
+    return main_picks, runner_ups
+
+
+# --- [1. 메인 스캐너 엔진 (장 마감(또는 장 전) 배치 작업)] ---
+def run_integrated_scanner():
+    marker_date = datetime.now().strftime("%Y-%m-%d")
+    scanner_failed = False
+    print(f"[START] final_ensemble_scanner target_date={marker_date}")
+    print(f"=== KORStockScan v14 (Stacking Ensemble + Event-Driven) ===")
+
+    db = DBManager()
+    event_bus = EventBus()  # 💡 이벤트 버스 장착!
+    _ensure_telegram_listener()
+
+    try:
+        # ==========================================
+        # 1. 💡 가벼워진 ml_predictor를 통해 모델 로드
+        # ==========================================
+        models = ml_predictor.load_models()
+        if not models:
+            scanner_failed = True
+            print("❌ AI 모델 로드 실패로 스캐너를 종료합니다.")
+            print(
+                f"[FAIL] final_ensemble_scanner target_date={marker_date} reason=model_load_failed"
+            )
+            return
+
+        kiwoom_token = None
+        target_path = CONFIG_PATH if os.path.exists(CONFIG_PATH) else DEV_PATH
+        try:
+            with open(target_path, "r", encoding="utf-8") as f:
+                CONF = json.load(f)
+            kiwoom_token = kiwoom_utils.get_kiwoom_token(CONF)
+        except Exception as e:
+            print(f"⚠️ 키움 토큰 발급 생략 (FDR 단독 모드): {e}")
+
+        # ==========================================
+        # 2. 지수 상대강도(RS)용 지수 데이터 확보 (FDR 우선 -> Kiwoom ka20006 우회)
+        # ==========================================
+        kospi_5d_return = 0
+        try:
+            print("📈 FDR을 통해 최신 KOSPI 지수 데이터를 가져오는 중...")
+            kospi_df = fdr.DataReader(
+                "KS11", start=(datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d")
+            )
+            if not kospi_df.empty and len(kospi_df) >= 5:
+                kospi_5d_return = (
+                    kospi_df["Close"].iloc[-1] / kospi_df["Close"].iloc[-5]
+                ) - 1
+            else:
+                raise ValueError("FDR 데이터 부족")
+        except Exception as e:
+            if kiwoom_token:
+                latest_prc, before_prc = kiwoom_utils.get_index_daily_ka20006(
+                    kiwoom_token, "001"
+                )
+                if latest_prc and before_prc:
+                    kospi_5d_return = (latest_prc / before_prc) - 1
+
+        # ==========================================
+        # 3. 기초 유동성 필터 (FDR -> DB Fallback)
+        # ==========================================
+        print("🔍 [1/4] 분석 대상 종목 리스트 구성 중...")
+        target_list = []
+        try:
+            df_krx = fdr.StockListing("KOSPI")
+            top_m = df_krx.sort_values(by="Marcap", ascending=False).head(
+                TRADING_RULES.TOP_N_MARCAP
+            )
+            target_df = top_m.sort_values(by="Volume", ascending=False).head(
+                TRADING_RULES.TOP_N_VOLUME
+            )
+            target_list = target_df[["Code", "Name"]].to_dict("records")
+        except Exception as e:
+            query = """
+                SELECT stock_code AS "Code", stock_name AS "Name" 
+                FROM daily_stock_quotes 
+                WHERE quote_date = (SELECT MAX(quote_date) FROM daily_stock_quotes) 
+                ORDER BY marcap DESC 
+                LIMIT 200
+                """
+            with db.get_session() as session:
+                # 💡 ORM/Core 방식으로 변경 필요 시 추후 대응, 현재는 pandas 연동 유지
+                db_targets = pd.read_sql(query, session.bind)
+            target_list = db_targets.head(150).to_dict("records")
+
+        # ==========================================
+        # 4. AI 앙상블 스캐닝 루프 (💡 except 블록 밖으로 완벽 탈출!)
+        # ==========================================
+        print(f"🚀 [2/4] AI 콰트로 앙상블 분석 시작 ({len(target_list)} 종목)...")
+        all_results = []
+        drop_stats = {
+            "short_data": 0,
+            "invalid_type": 0,
+            "low_price": 0,
+            "quality": 0,
+            "ai_prob": 0,
+            "trend": 0,
+            "supply": 0,
+            "error": 0,
+        }
+
+        # 💡 [핵심] DB의 스네이크 케이스를 AI가 아는 기존 대문자 포맷으로 원상복구하는 사전
+        REVERSE_MAPPING = {
+            "quote_date": "Date",
+            "stock_code": "Code",
+            "stock_name": "Name",
+            "open_price": "Open",
+            "high_price": "High",
+            "low_price": "Low",
+            "close_price": "Close",
+            "volume": "Volume",
+            "ma5": "MA5",
+            "ma20": "MA20",
+            "ma60": "MA60",
+            "ma120": "MA120",
+            "rsi": "RSI",
+            "macd": "MACD",
+            "macd_sig": "MACD_Sig",
+            "macd_hist": "MACD_Hist",
+            "bbl": "BBL",
+            "bbm": "BBM",
+            "bbu": "BBU",
+            "bbb": "BBB",
+            "bbp": "BBP",
+            "vwap": "VWAP",
+            "obv": "OBV",
+            "atr": "ATR",
+            "daily_return": "Return",
+            "marcap": "Marcap",
+            "retail_net": "Retail_Net",
+            "foreign_net": "Foreign_Net",
+            "inst_net": "Inst_Net",
+            "margin_rate": "Margin_Rate",
+        }
+
+        for stock in target_list:
+            code = str(stock["Code"]).strip().zfill(6)
+            name = stock["Name"]
+            df_raw = db.get_stock_data(code, limit=60)
+            if len(df_raw) < 30:
+                drop_stats["short_data"] += 1
+                continue
+
+            # 💡 [핵심 로직] 꺼내온 즉시 컬럼명을 AI용으로 갈아입힙니다.
+            df = df_raw.rename(columns=REVERSE_MAPPING)
+
+            df = df.sort_values("Date")
+            current_price = df.iloc[-1]["Close"]
+
+            if not kiwoom_utils.is_valid_stock(code, name, current_price=current_price):
+                if current_price < TRADING_RULES.MIN_PRICE:
+                    drop_stats["low_price"] += 1
+                else:
+                    drop_stats["invalid_type"] += 1
+                continue
+
+            # =================================================================
+            # 🛡️ 기초품질(Quality) 필터: 하락 추세 및 소외주 1차 컷오프
+            # 아래 3가지 모멘텀 조건 중 **단 1개도 만족하지 못하는(sum < 1)** 종목은 폐기
+            #   1) 상대강도: 최근 5일 수익률이 코스피 지수 5일 수익률보다 높을 것
+            #   2) 단기추세: 현재가 > 5일선 > 20일선 (단기 완전 정배열)
+            #   3) 가격방어: 최근 20일(약 1달) 최고점 대비 하락폭이 -10% 이내일 것
+            # =================================================================
+            stock_5d_return = (current_price / df.iloc[-5]["Close"]) - 1
+            ma5, ma20 = (
+                df["Close"].rolling(5).mean().iloc[-1],
+                df["Close"].rolling(20).mean().iloc[-1],
+            )
+            high_20d = df["High"].tail(20).max()
+
+            if (
+                sum(
+                    [
+                        stock_5d_return > kospi_5d_return,
+                        (current_price > ma5 > ma20),
+                        current_price >= (high_20d * 0.90),
+                    ]
+                )
+                < 1
+            ):
+                drop_stats["quality"] += 1
+                continue
+
+            try:
+                # 추론을 ml_predictor에게 위임!
+                p_final = ml_predictor.predict_prob_for_df(df_raw, models)
+
+                if p_final < getattr(TRADING_RULES, "PROB_RUNNER_PICK", 0.70):
+                    drop_stats["ai_prob"] += 1
+                    continue
+
+                # AI를 통과한 녀석들만 수급 필터를 위해 피처 계산
+                df_feat = calculate_all_features(df_raw)
+                latest_row = df_feat.iloc[[-1]]
+
+                f_roll5 = latest_row["foreign_net_roll5"].values[0]
+                i_roll5 = latest_row["inst_net_roll5"].values[0]
+                f_accel = latest_row["foreign_net_accel"].values[0]
+                i_accel = latest_row["inst_net_accel"].values[0]
+
+                if not ((f_roll5 > 0 and f_accel > 0) or (i_roll5 > 0 and i_accel > 0)):
+                    drop_stats["supply"] += 1
+                    continue
+
+                h60, l60 = df_feat["high"].tail(60).max(), df_feat["low"].tail(60).min()
+                pos_pct = (current_price - l60) / (h60 - l60 + 1e-9)
+                pos_tag = (
+                    "BREAKOUT"
+                    if pos_pct >= 0.8
+                    else ("BOTTOM" if pos_pct <= 0.3 else "MIDDLE")
+                )
+
+                all_results.append(
+                    {
+                        "Name": name,
+                        "Prob": p_final,
+                        "Price": int(current_price),
+                        "Code": code,
+                        "Position": pos_tag,
+                    }
+                )
+
+            except Exception as e:
+                drop_stats["error"] += 1
+                continue
+
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        # ==========================================
+        # 💡 [신규/순서변경] 4.5 V2 Meta Ranker (CSV) 우선 로드 및 DB 적재
+        # ==========================================
+        csv_path = os.path.join(DATA_DIR, "daily_recommendations_v2.csv")
+        csv_count = 0
+        csv_skipped_count = 0
+
+        if os.path.exists(csv_path):
+            try:
+                df_csv = pd.read_csv(csv_path)
+                for row in df_csv.to_dict("records"):
+                    csv_code = str(row["code"]).replace(".0", "").strip().zfill(6)
+                    csv_name = row.get("name", "Unknown")
+                    csv_price = (
+                        int(row.get("close", 0)) if "close" in df_csv.columns else 0
+                    )
+                    classified = classify_v2_csv_pick(row)
+                    if not classified["should_save"]:
+                        csv_skipped_count += 1
+                        continue
+
+                    csv_prob = classified["prob"]
+                    pick_type = classified["pick_type"]
+                    position_tag = classified["position_tag"]
+                    if pick_type == "RUNNER":
+                        csv_skipped_count += 1
+                        continue
+
+                    # 1. DB 우선 적재 (MAIN only; RUNNER is intentionally excluded from WATCHING)
+                    db.save_recommendation(
+                        date=today,
+                        code=csv_code,
+                        name=csv_name,
+                        price=csv_price,
+                        pick_type=pick_type,
+                        position=position_tag,
+                        prob=csv_prob,
+                        strategy="KOSPI_ML",
+                    )
+
+                    csv_count += 1
+                print(
+                    f"✅ V2 CSV에서 {csv_count}개 종목 우선 적재 완료 (skip={csv_skipped_count})"
+                )
+            except Exception as e:
+                print(f"⚠️ V2 CSV 적재 실패: {e}")
+        else:
+            print(f"ℹ️ V2 CSV 파일이 존재하지 않아 실시간 스캐닝 결과만 처리합니다.")
+
+        # ==========================================
+        # 5. 결과 기록 및 관리자 디버그 알림 (Event-Driven)
+        # ==========================================
+        print("📊 [3/4] 결과 기록 및 관리자 디버그 알림 중...")
+
+        # 💡 [핵심] 텔레그램 발송 메시지에 CSV 적재 건수(csv_count)를 한 줄 추가!
+        debug_msg = (
+            f"🛑 *[AI 스캐너 필터링 결과]*\n"
+            f"총 {len(target_list)}개 중 *{len(all_results)}개 생존 (실시간)*\n"
+            f"🌟 *V2 앙상블 (CSV) 추가 적재: {csv_count}개 / skip {csv_skipped_count}개*\n\n"
+            f"📉 *탈락 사유 통계 (실시간)*\n"
+            f" • 데이터 부족: {drop_stats['short_data']}개\n"
+            f" • ETF/동전주: {drop_stats['invalid_type'] + drop_stats['low_price']}개\n"
+            f" • 기초 품질 미달: {drop_stats['quality']}개\n"
+            f" • AI 확신도 부족: {drop_stats['ai_prob']}개\n"
+            f" • 수급 부재(이탈): {drop_stats['supply']}개\n"
+        )
+
+        # 관리자용 디버그 메시지 발송
+        event_bus.publish("TELEGRAM_ADMIN_NOTIFY", {"text": debug_msg})
+
+        # --- 기존 실시간 추천 종목 분류 및 DB 저장 ---
+        main_picks, runner_ups = split_realtime_recommendations(
+            all_results,
+            prob_main_pick=TRADING_RULES.PROB_MAIN_PICK,
+            prob_runner_pick=TRADING_RULES.PROB_RUNNER_PICK,
+            runner_limit=0,
+        )
+
+        for r in main_picks:
+            db.save_recommendation(
+                today,
+                r["Code"],
+                r["Name"],
+                r["Price"],
+                "MAIN",
+                r["Position"],
+                prob=r["Prob"],
+            )
+
+        if csv_count or main_picks or runner_ups:
+            print(
+                "ℹ️ 장전 브리핑 발송은 비활성화됨: "
+                f"csv={csv_count}, main={len(main_picks)}, runner={len(runner_ups)}"
+            )
+
+    except Exception as e:
+        scanner_failed = True
+        print(f"❌ 시스템 에러 발생: {e}")
+        print(
+            f"[FAIL] final_ensemble_scanner target_date={marker_date} reason=exception"
+        )
+    finally:
+        finished_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S%z")
+        if not scanner_failed:
+            print(
+                f"[DONE] final_ensemble_scanner target_date={marker_date} finished_at={finished_at}"
+            )
+        print("🏁 [4/4] 스캐닝 프로세스가 종료되었습니다.")
+
+
+if __name__ == "__main__":
+    run_integrated_scanner()

@@ -1,0 +1,12367 @@
+import inspect
+import os
+from datetime import datetime
+from queue import SimpleQueue
+import threading
+import time
+from types import SimpleNamespace
+
+import pytest
+
+from src.engine import kiwoom_sniper_v2
+from src.engine import sniper_market_regime
+from src.engine.ai.hot_path_ai_dispatcher import HotPathAIDispatcher
+from src.engine.scalping.scanner_async_eval import ScannerAsyncEvalCoordinator
+from src.engine.scalping.scanner_runtime_scheduler import ScannerGeneration
+from src.utils.constants import TRADING_RULES
+
+
+class _RuntimeRecordSession:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+def test_retired_latency_profile_cannot_select_remote_runtime_role(monkeypatch):
+    monkeypatch.setattr(kiwoom_sniper_v2.socket, "gethostname", lambda: "main-node")
+    monkeypatch.delenv("KORSTOCKSCAN_RUNTIME_ROLE", raising=False)
+    monkeypatch.delenv("KORSTOCKSCAN_FORCE_MAIN_ON_REMOTE", raising=False)
+    monkeypatch.setenv("KORSTOCKSCAN_LATENCY_CANARY_PROFILE", "remote_v2")
+
+    assert kiwoom_sniper_v2.resolve_runtime_role() == "main"
+
+
+class _RuntimeRecordDB:
+    def __init__(self, record_id):
+        self.record_id = record_id
+
+    def get_session(self):
+        return _RuntimeRecordSession()
+
+    def find_reusable_watching_record(
+        self,
+        session,
+        *,
+        rec_date,
+        stock_code,
+        strategy=None,
+        position_tag=None,
+    ):
+        return SimpleNamespace(id=self.record_id)
+
+
+class _ExpireQuery:
+    def __init__(self, calls, filters):
+        self.calls = calls
+        self.filters = filters
+
+    def filter(self, *conditions):
+        self.filters.extend(str(condition) for condition in conditions)
+        return self
+
+    def update(self, values, synchronize_session=False):
+        self.calls.append((values, synchronize_session))
+        return 1
+
+
+class _ExpireSession:
+    def __init__(self, calls, filters):
+        self.calls = calls
+        self.filters = filters
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def query(self, model):
+        return _ExpireQuery(self.calls, self.filters)
+
+
+class _ExpireDB:
+    def __init__(self):
+        self.calls = []
+        self.filters = []
+
+    def get_session(self):
+        return _ExpireSession(self.calls, self.filters)
+
+
+def _reset_scanner_hot_override_cache():
+    with kiwoom_sniper_v2._SCANNER_HOT_RUNTIME_OVERRIDES_LOCK:
+        kiwoom_sniper_v2._SCANNER_HOT_RUNTIME_OVERRIDES.update(
+            {"mtime_ns": None, "values": {}, "next_check_ts": 0.0}
+        )
+
+
+@pytest.mark.parametrize(
+    ("cache_key", "expected_fields"),
+    [
+        (
+            "rising_missed:abc",
+            (
+                "_scanner_async_generation_id",
+                "_scanner_async_cache_key",
+                "_scanner_async_state_version",
+                "_scanner_async_submitted_at",
+            ),
+        ),
+        (
+            "watching:abc",
+            (
+                "_scanner_async_generation_id",
+                "_scanner_async_cache_key",
+                "_scanner_async_state_version",
+                "_scanner_async_submitted_at",
+            ),
+        ),
+        (
+            "opening_rotation:abc",
+            (
+                "_scanner_opening_rotation_async_generation_id",
+                "_scanner_opening_rotation_async_cache_key",
+                "_scanner_opening_rotation_async_state_version",
+                "_scanner_opening_rotation_async_submitted_at",
+            ),
+        ),
+    ],
+)
+def test_scanner_async_commit_transport_restores_rehydrated_target(
+    cache_key,
+    expected_fields,
+):
+    target = {
+        "status": "WATCHING",
+        "scanner_generation_id": "005930:promotion:r1",
+    }
+    result = SimpleNamespace(
+        generation_id="005930:promotion:r1",
+        cache_key=cache_key,
+        state_version="state-v1",
+        submitted_epoch=123.5,
+    )
+
+    decision = kiwoom_sniper_v2._restore_scanner_async_commit_transport(
+        target,
+        result,
+    )
+
+    assert decision == {
+        "allowed": True,
+        "reason": "transport_restored",
+        "namespace": (
+            "opening_rotation" if cache_key.startswith("opening_rotation:") else "entry"
+        ),
+    }
+    assert [target[field] for field in expected_fields] == [
+        "005930:promotion:r1",
+        cache_key,
+        "state-v1",
+        123.5,
+    ]
+
+
+def test_scanner_async_commit_transport_rejects_conflicting_live_request():
+    target = {
+        "scanner_generation_id": "005930:promotion:r1",
+        "_scanner_async_generation_id": "005930:promotion:r1",
+        "_scanner_async_cache_key": "watching:newer",
+    }
+    result = SimpleNamespace(
+        generation_id="005930:promotion:r1",
+        cache_key="rising_missed:older",
+        state_version="state-v1",
+        submitted_epoch=123.5,
+    )
+
+    decision = kiwoom_sniper_v2._restore_scanner_async_commit_transport(
+        target,
+        result,
+    )
+
+    assert decision == {
+        "allowed": False,
+        "reason": "async_cache_transport_conflict",
+        "namespace": "entry",
+    }
+    assert target["_scanner_async_cache_key"] == "watching:newer"
+
+
+@pytest.mark.parametrize(
+    ("target_generation_id", "cache_key", "reason"),
+    [
+        (
+            "005930:promotion:r2",
+            "watching:abc",
+            "canonical_generation_transport_conflict",
+        ),
+        (
+            "005930:promotion:r1",
+            "unowned:abc",
+            "async_cache_namespace_unknown",
+        ),
+    ],
+)
+def test_scanner_async_commit_transport_rejects_unowned_result(
+    target_generation_id,
+    cache_key,
+    reason,
+):
+    target = {"scanner_generation_id": target_generation_id}
+    result = SimpleNamespace(
+        generation_id="005930:promotion:r1",
+        cache_key=cache_key,
+        state_version="state-v1",
+        submitted_epoch=123.5,
+    )
+
+    decision = kiwoom_sniper_v2._restore_scanner_async_commit_transport(
+        target,
+        result,
+    )
+
+    assert decision == {
+        "allowed": False,
+        "reason": reason,
+        "namespace": "unknown",
+    }
+    assert "_scanner_async_cache_key" not in target
+
+
+def test_expired_scanner_ai_result_arms_recheck_before_scheduler_discard():
+    target = {"scanner_generation_id": "005930:promotion:r1"}
+    result = SimpleNamespace(
+        status="expired_after_response",
+        cache_key="watching:expired",
+        ai_payload={
+            "ai_decision_snapshot_id": "aims-expired-scheduler",
+        },
+    )
+
+    fields = kiwoom_sniper_v2._arm_scanner_async_rejected_result_recheck(
+        target,
+        result,
+        now_epoch=1000.0,
+    )
+
+    assert fields["scanner_async_expired_response_recheck_armed"] is True
+    assert target["_scanner_async_expired_response_recheck_until_epoch"] == 1015.0
+    assert (
+        target["_scanner_async_expired_parent_snapshot_id"] == "aims-expired-scheduler"
+    )
+    assert fields["scanner_async_expired_response_recheck_runtime_effect"] is False
+    assert (
+        fields["scanner_async_expired_response_recheck_actual_order_submitted"] is False
+    )
+    assert (
+        fields["scanner_async_expired_response_recheck_broker_order_forbidden"] is True
+    )
+
+
+def test_scanner_market_data_enrichment_candidate_accepts_rising_source_marker(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_scanner_market_data_enrichment_enabled", lambda: True
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_is_scanner_watching_target", lambda stock: True
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_scanner_is_rising_entry_relief_candidate",
+        lambda stock: False,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_scanner_positive_delta_value", lambda stock: 0.5
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_scanner_market_data_enrichment_hot_delta_pct", lambda: 2.0
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.sniper_state_handlers,
+        "_has_rising_missed_watch_source_marker",
+        lambda stock: True,
+    )
+
+    assert (
+        kiwoom_sniper_v2._scanner_market_data_enrichment_candidate(
+            {},
+            {"curr": 10000, "quote_age_ms": 5000.0, "quote_stale": True},
+            1000.0,
+        )
+        is True
+    )
+
+
+def test_scanner_market_data_enrichment_candidate_accepts_hot_delta_with_fresh_ws(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_scanner_market_data_enrichment_enabled", lambda: True
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_is_scanner_watching_target", lambda stock: True
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_scanner_is_rising_entry_relief_candidate",
+        lambda stock: False,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_scanner_positive_delta_value", lambda stock: 3.0
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_scanner_market_data_enrichment_hot_delta_pct", lambda: 2.0
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.sniper_state_handlers,
+        "_has_rising_missed_watch_source_marker",
+        lambda stock: False,
+    )
+
+    assert (
+        kiwoom_sniper_v2._scanner_market_data_enrichment_candidate(
+            {},
+            {"curr": 10000, "quote_age_ms": 100.0, "quote_stale": False},
+            1000.0,
+        )
+        is True
+    )
+
+
+def test_scanner_market_data_enrichment_packet_uses_bounded_rest_calls(monkeypatch):
+    calls = []
+    monkeypatch.setattr(kiwoom_sniper_v2, "KIWOOM_TOKEN", "TOKEN")
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_scanner_market_data_enrichment_rest_timeout_ms",
+        lambda: 250,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.sniper_state_handlers,
+        "_fetch_rest_orderbook_snapshot_bounded",
+        lambda code, timeout_ms: calls.append(("orderbook", code, timeout_ms))
+        or ({"best_bid": 9990, "best_ask": 10000}, "ok", 12.5),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.sniper_state_handlers,
+        "_fetch_rising_missed_signed_tape_bounded",
+        lambda code, timeout_ms: calls.append(("signed_tape", code, timeout_ms))
+        or ([{"aggressor_side": "SELL", "signed_trade_volume": "-10"}], "ok", 15.0),
+    )
+    with kiwoom_sniper_v2._SCANNER_MARKET_DATA_ENRICHMENT_LOCK:
+        kiwoom_sniper_v2._SCANNER_MARKET_DATA_ENRICHMENT_CACHE.clear()
+
+    orderbook, signed_ticks, fields = (
+        kiwoom_sniper_v2._fetch_scanner_market_data_enrichment_packet("123456", 1000.0)
+    )
+
+    assert [call[0] for call in calls] == ["orderbook", "signed_tape"]
+    assert all(call[2] == 250 for call in calls)
+    assert orderbook["best_ask"] == 10000
+    assert signed_ticks[0]["aggressor_side"] == "SELL"
+    assert fields["market_data_enrichment_fetch_reason"] == "rest_packet_fetched"
+    assert fields["market_data_enrichment_orderbook_fetch_state"] == "ok"
+    assert fields["market_data_enrichment_signed_tape_fetch_state"] == "ok"
+
+
+def test_scanner_market_data_enrichment_packet_skips_tape_after_orderbook_timeout(
+    monkeypatch,
+):
+    monkeypatch.setattr(kiwoom_sniper_v2, "KIWOOM_TOKEN", "TOKEN")
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_scanner_market_data_enrichment_rest_timeout_ms",
+        lambda: 250,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.sniper_state_handlers,
+        "_fetch_rest_orderbook_snapshot_bounded",
+        lambda code, timeout_ms: ({}, "timeout", 250.0),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.sniper_state_handlers,
+        "_fetch_rising_missed_signed_tape_bounded",
+        lambda code, timeout_ms: pytest.fail(
+            "signed tape must not run without an orderbook"
+        ),
+    )
+
+    orderbook, signed_ticks, fields = (
+        kiwoom_sniper_v2._fetch_scanner_market_data_enrichment_packet("123456", 1000.0)
+    )
+
+    assert orderbook == {}
+    assert signed_ticks == []
+    assert fields["market_data_enrichment_fetch_reason"] == "rest_packet_timeout"
+    assert fields["market_data_enrichment_signed_tape_fetch_state"] == (
+        "skipped_orderbook_unavailable"
+    )
+
+
+def _disable_scanner_operator_runtime_overrides(monkeypatch, tmp_path):
+    _reset_scanner_hot_override_cache()
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_SCANNER_OPERATOR_RUNTIME_OVERRIDE_PATH",
+        tmp_path / "missing_operator_runtime_overrides.env",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_manual_control_exclusion(monkeypatch, tmp_path):
+    empty_path = tmp_path / "manual_control_excluded_codes.empty.txt"
+    empty_path.write_text("", encoding="utf-8")
+    monkeypatch.delenv("KORSTOCKSCAN_MANUAL_CONTROL_EXCLUDED_CODES", raising=False)
+    monkeypatch.delenv("KORSTOCKSCAN_WATCH_EXCLUDED_CODES", raising=False)
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_MANUAL_CONTROL_EXCLUDED_CODES_FILE", str(empty_path)
+    )
+    monkeypatch.delenv("KORSTOCKSCAN_WATCH_EXCLUDED_CODES_FILE", raising=False)
+
+
+def _enable_scanner_rising_ws_gap_test_mode(monkeypatch):
+    _reset_scanner_hot_override_cache()
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_SCANNER_OPERATOR_RUNTIME_OVERRIDE_PATH", os.devnull
+    )
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_RISING_FULL_EVAL_MIN_DELTA_PCT", "0.5")
+
+
+def test_current_market_regime_code_returns_regime_code(monkeypatch):
+    class FakeMarketRegime:
+        def refresh_if_needed(self):
+            return SimpleNamespace(
+                risk_state="RISK_ON",
+                allow_swing_entry=True,
+                swing_score=80,
+            )
+
+    monkeypatch.setattr(kiwoom_sniper_v2, "MARKET_REGIME", FakeMarketRegime())
+
+    assert kiwoom_sniper_v2._current_market_regime_code() == "BULL"
+
+
+def test_current_market_regime_code_falls_back_to_neutral(monkeypatch):
+    class BrokenMarketRegime:
+        def refresh_if_needed(self):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(kiwoom_sniper_v2, "MARKET_REGIME", BrokenMarketRegime())
+
+    assert kiwoom_sniper_v2._current_market_regime_code() == "NEUTRAL"
+
+
+def test_scanner_common_watch_budget_priority_scores_source_supply_speed(monkeypatch):
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCANNER_COMMON_WATCH_BUDGET_PRIORITY_ENABLED", raising=False
+    )
+    target = {
+        "source_signature": "VALUE_TOP,BID_IMBALANCE_SURGE,PRICE_JUMP_START",
+        "buy_pressure_10t": "72.5",
+        "net_aggressive_delta_10t": "1200",
+        "tick_acceleration_ratio": "1.15",
+        "tick_window_span_sec": "28",
+        "volume_ratio_pct": "220",
+        "quote_age_ms": "420",
+    }
+
+    fields = kiwoom_sniper_v2._scanner_common_watch_budget_priority_fields(target)
+
+    assert fields["scanner_common_watch_budget_priority_enabled"] is True
+    assert fields["scanner_common_watch_budget_priority_tier"] == "high_priority_watch"
+    assert fields["scanner_common_watch_budget_priority_score"] >= 6
+    assert fields["scanner_common_watch_budget_supply_pass"] is True
+    assert fields["scanner_common_watch_budget_speed_pass"] is True
+    assert fields["scanner_common_watch_budget_volume_pass"] is True
+    assert fields["scanner_common_watch_budget_freshness_pass"] is True
+    assert (
+        fields["scanner_common_watch_budget_authority"]
+        == "scanner_watch_budget_runtime_priority"
+    )
+    assert "threshold_mutation" in fields["scanner_common_watch_budget_forbidden_uses"]
+
+
+def test_runtime_iteration_prioritizes_common_watch_budget_before_plain_scanner(
+    monkeypatch,
+):
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCANNER_COMMON_WATCH_BUDGET_PRIORITY_ENABLED", raising=False
+    )
+    low = _scanner_watch_stock(
+        code="000002",
+        added_time=1000.0,
+        entry_armed_at_epoch=1000.0,
+        source_signature="",
+        tick_acceleration_ratio="0.5",
+        quote_age_ms="5000",
+    )
+    high = _scanner_watch_stock(
+        code="000001",
+        added_time=999.0,
+        entry_armed_at_epoch=999.0,
+        source_signature="VALUE_TOP,BID_IMBALANCE_SURGE,PRICE_JUMP_START",
+        buy_pressure_10t="75",
+        tick_acceleration_ratio="1.2",
+        tick_window_span_sec="12",
+        volume_ratio_pct="240",
+        quote_age_ms="100",
+    )
+
+    ordered = kiwoom_sniper_v2._runtime_iteration_targets([low, high], now_ts=1010.0)
+
+    assert ordered[0] is high
+    assert ordered[1] is low
+
+
+def test_scanner_fifo_overflow_preserves_high_common_watch_budget_priority(monkeypatch):
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCANNER_COMMON_WATCH_BUDGET_PRIORITY_ENABLED", raising=False
+    )
+    low = _scanner_watch_stock(
+        code="000012",
+        added_time=1000.0,
+        entry_armed_at_epoch=1000.0,
+        _scanner_last_full_eval_epoch=1200.0,
+        price_delta_since_first_seen_pct="1.5",
+        source_signature="",
+        tick_acceleration_ratio="0.5",
+        quote_age_ms="5000",
+    )
+    high = _scanner_watch_stock(
+        code="000011",
+        added_time=999.0,
+        entry_armed_at_epoch=999.0,
+        _scanner_last_full_eval_epoch=1200.0,
+        price_delta_since_first_seen_pct="1.5",
+        source_signature="VALUE_TOP,BID_IMBALANCE_SURGE,PRICE_JUMP_START",
+        buy_pressure_10t="75",
+        tick_acceleration_ratio="1.2",
+        tick_window_span_sec="12",
+        volume_ratio_pct="240",
+        quote_age_ms="100",
+    )
+
+    overflow_order = kiwoom_sniper_v2._scalping_fifo_overflow_candidates(
+        [high, low], now_ts=2000.0
+    )
+
+    assert overflow_order[0] is low
+    assert overflow_order[-1] is high
+
+
+def test_scanner_ws_reg_recovery_throttle_keeps_state_by_source_and_code(monkeypatch):
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_WS_REG_RECOVERY_CODE_TTL_SEC", "20")
+    last_emit_ts = {}
+
+    assert (
+        kiwoom_sniper_v2._scanner_ws_reg_recovery_throttle_allows(
+            last_emit_ts,
+            "scanner_watching_ws_snapshot_recovery",
+            "240810",
+            100.0,
+        )
+        is True
+    )
+    assert (
+        kiwoom_sniper_v2._scanner_ws_reg_recovery_throttle_allows(
+            last_emit_ts,
+            "scanner_watching_ws_snapshot_recovery",
+            "240810",
+            109.9,
+        )
+        is False
+    )
+    assert (
+        kiwoom_sniper_v2._scanner_ws_reg_recovery_throttle_allows(
+            last_emit_ts,
+            "scanner_watching_ws_snapshot_recovery",
+            "240810",
+            110.0,
+        )
+        is False
+    )
+    assert (
+        kiwoom_sniper_v2._scanner_ws_reg_recovery_throttle_allows(
+            last_emit_ts,
+            "scanner_watching_ws_snapshot_recovery",
+            "240810",
+            120.0,
+        )
+        is True
+    )
+    assert (
+        kiwoom_sniper_v2._scanner_ws_reg_recovery_throttle_allows(
+            last_emit_ts,
+            "scanner_fast_precheck_stale_ws_recovery",
+            "240810",
+            120.0,
+        )
+        is False
+    )
+    assert (
+        kiwoom_sniper_v2._scanner_ws_reg_recovery_throttle_allows(
+            last_emit_ts,
+            "scanner_watching_ws_snapshot_recovery",
+            "",
+            120.0,
+        )
+        is False
+    )
+
+
+def test_restore_holding_runtime_state_rehydrates_scalping_defaults(monkeypatch):
+    monkeypatch.setattr(kiwoom_sniper_v2, "highest_prices", {})
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.POSITION_PEAK_LEDGER,
+        "restore_peak",
+        lambda stock: (0, "ledger_row_missing"),
+    )
+
+    targets = [
+        {
+            "id": 1,
+            "code": "123456",
+            "name": "TEST",
+            "status": "HOLDING",
+            "strategy": "SCALPING",
+            "position_tag": "SCALP_BASE",
+            "buy_price": 10000,
+            "buy_qty": 5,
+            "buy_time": "2026-04-08 09:10:00",
+        }
+    ]
+
+    kiwoom_sniper_v2._restore_holding_runtime_state(targets)
+    stock = targets[0]
+
+    assert stock["exit_mode"] == "SCALP_PRESET_TP"
+    assert int(stock["preset_tp_price"]) == 0
+    assert stock["hard_stop_pct"] == TRADING_RULES.SCALP_PRESET_HARD_STOP_PCT
+    assert stock["buy_qty"] == 5
+    assert stock["holding_started_at"] == "2026-04-08 09:10:00"
+    assert kiwoom_sniper_v2.highest_prices["123456"] == 10000
+
+
+def test_restore_holding_runtime_state_restores_durable_scalping_peak(monkeypatch):
+    monkeypatch.setattr(kiwoom_sniper_v2, "highest_prices", {})
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.POSITION_PEAK_LEDGER,
+        "restore_peak",
+        lambda stock: (1140, "ledger_peak_restored"),
+    )
+    targets = [
+        {
+            "id": 117,
+            "code": "001520",
+            "name": "동양",
+            "status": "HOLDING",
+            "strategy": "SCALPING",
+            "position_tag": "SCALP_BASE",
+            "buy_price": 1123,
+            "buy_qty": 1,
+            "buy_time": "2026-07-23 12:09:30",
+        }
+    ]
+
+    kiwoom_sniper_v2._restore_holding_runtime_state(targets)
+
+    assert kiwoom_sniper_v2.highest_prices["001520"] == 1140
+    assert targets[0]["position_peak_restore_reason"] == "ledger_peak_restored"
+    assert targets[0]["position_peak_runtime_price"] == 1140
+
+
+def test_scalping_scanner_promoted_target_attaches_active_watching(monkeypatch):
+    emitted = []
+    published = []
+    monkeypatch.setattr(kiwoom_sniper_v2, "ACTIVE_TARGETS", [])
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_resolve_stock_marcap", lambda stock, code: 123456789
+    )
+    monkeypatch.setattr(kiwoom_sniper_v2, "_latest_stock_name_from_db", lambda code: "")
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda pipeline, name, code, stage, *, record_id=None, fields=None: emitted.append(
+            {
+                "pipeline": pipeline,
+                "name": name,
+                "code": code,
+                "stage": stage,
+                "fields": fields or {},
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    attached = kiwoom_sniper_v2.handle_scalping_scanner_promoted_target(
+        {
+            "record_id": 77,
+            "code": "005930",
+            "name": "SAMSUNG",
+            "strategy": "SCALPING",
+            "trade_type": "SCALP",
+            "status": "WATCHING",
+            "position_tag": "SCANNER",
+            "buy_price": 70000,
+            "added_time": 1000.0,
+            "entry_armed_at_epoch": 1000.0,
+            "scanner_promotion_id": "SCANPROM-005930-1000000",
+            "scanner_promotion_reason": "rank_jump_acceleration",
+            "scanner_promotion_emitted_epoch": "1000.000",
+            "source_signature": "REALTIME_RANK_START",
+            "venue": "KRX",
+            "effective_venue": "KRX",
+            "venue_resolution": "scanner_session_clock:krx_regular",
+            "market_session_bucket": "krx_regular",
+            "current_price_observed": 70000,
+            "price_delta_since_first_seen_pct": "0.50",
+            "late_confirmation_recheck_once": True,
+            "late_confirmation_recheck_requires_fresh_bbo_tape": True,
+            "late_confirmation_recheck_max_age_sec": 900,
+            "late_confirmation_recheck_min_price_delta_pct": 0.30,
+            "late_confirmation_recheck_min_flu_delta_pct": 0.60,
+            "late_confirmation_recheck_rollback_env": (
+                "KORSTOCKSCAN_SCALP_SCANNER_LATE_RECHECK_ENABLED=false"
+            ),
+            "scanner_source_family": "scalping_scanner_rising_start_source_v1",
+            "scanner_source_role": "primary_rising_start",
+            "rank_change": -12,
+            "rank_change_sign": "-",
+            "rank_change_sign_authority": "raw_unverified_not_decision_input",
+            "rank_change_sign_state": "negative",
+            "rank_change_sign_consistency": "consistent",
+            "rank_change_score_input": 0,
+            "rank_change_score_policy": "positive_signed_rank_delta_only_raw_rank_sign_unverified",
+            "realtime_lookup_rank_now": 7,
+            "realtime_lookup_rank_now_state": "observed",
+            "realtime_lookup_rank_change": -12,
+            "realtime_lookup_rank_change_state": "observed",
+            "realtime_lookup_rank_change_sign": "-",
+            "realtime_lookup_rank_window": "5",
+            "realtime_lookup_source_date": "20260902",
+            "realtime_lookup_source_time": "093015",
+            "realtime_lookup_source_timestamp_state": "observed_valid",
+            "value_rank_now": 2,
+            "value_rank_prev_day": 40,
+            "legacy_rank_namespace_state": ("separated_namespaces_legacy_alias_mixed"),
+            "lookup_attention_metric_role": "source_quality_gate",
+            "lookup_attention_metric_definition": (
+                "per_symbol_ka00198_snapshot_score_0_1="
+                "0.50*clip((61-rank_now)/60,0,1)+"
+                "0.35*clip(max(rank_change,0)/20,0,1)+"
+                "0.15*I(rank_now<=20_and_rank_change>0_and_"
+                "rank_now+rank_change>20);"
+                "exclude_source_quality_blocked;not_ev"
+            ),
+            "lookup_attention_decision_authority": "counterfactual_only",
+            "lookup_attention_window_policy": "same_day_intraday_light",
+            "lookup_attention_sample_floor": (
+                "completed_outcome_count>=20_and_trading_date_count>=5_"
+                "else_hold_sample"
+            ),
+            "lookup_attention_primary_decision_metric": (
+                "source_quality_adjusted_ev_pct"
+            ),
+            "lookup_attention_secondary_diagnostics": (
+                "snapshot_score,eligible_coverage,target_adverse_first_hit,"
+                "fill_feasibility,tail_loss"
+            ),
+            "lookup_attention_source_quality_gate": (
+                "namespaced_ka00198_rank_and_exact_source_dt_tm_required"
+            ),
+            "lookup_attention_forbidden_uses": "scanner_sort_or_slot_change",
+            "lookup_attention_runtime_effect": False,
+            "lookup_attention_allowed_runtime_apply": False,
+            "lookup_attention_actual_order_submitted": False,
+            "lookup_attention_broker_order_forbidden": True,
+            "lookup_attention_formula_version": ("ka00198_snapshot_v1_no_persistence"),
+            "lookup_attention_top20_persistence_state": (
+                "not_evaluated_requires_repeated_exact_source_timestamp"
+            ),
+            "lookup_attention_state": "observed_source_only",
+            "lookup_attention_source_quality_gaps": "",
+            "lookup_attention_snapshot_score": 0.39,
+            "lookup_attention_rank_level_component": 0.9,
+            "lookup_attention_positive_change_component": 0.0,
+            "lookup_attention_new_top20_component": 0.0,
+        }
+    )
+
+    assert attached is True
+    assert len(kiwoom_sniper_v2.ACTIVE_TARGETS) == 1
+    attached_target = kiwoom_sniper_v2.ACTIVE_TARGETS[0]
+    assert attached_target["id"] == 77
+    assert attached_target["code"] == "005930"
+    assert attached_target["status"] == "WATCHING"
+    assert attached_target["buy_price"] == 70000
+    assert attached_target["scanner_promotion_id"] == "SCANPROM-005930-1000000"
+    assert attached_target["source_signature"] == "REALTIME_RANK_START"
+    assert attached_target["scanner_watch_budget_owner"] == "rising_missed"
+    assert attached_target["effective_venue"] == "KRX"
+    assert attached_target["market_session_bucket"] == "krx_regular"
+    assert attached_target["late_confirmation_recheck_once"] is True
+    assert attached_target["late_confirmation_recheck_requires_fresh_bbo_tape"] is True
+    assert attached_target["late_confirmation_recheck_max_age_sec"] == 900
+    assert attached_target["late_confirmation_recheck_min_price_delta_pct"] == 0.30
+    assert attached_target["late_confirmation_recheck_min_flu_delta_pct"] == 0.60
+    assert attached_target["late_confirmation_recheck_rollback_env"] == (
+        "KORSTOCKSCAN_SCALP_SCANNER_LATE_RECHECK_ENABLED=false"
+    )
+    assert attached_target["realtime_lookup_rank_now"] == 7
+    assert attached_target["realtime_lookup_rank_change"] == -12
+    assert attached_target["value_rank_now"] == 2
+    assert attached_target["value_rank_prev_day"] == 40
+    assert attached_target["lookup_attention_state"] == "observed_source_only"
+    assert attached_target["lookup_attention_snapshot_score"] == 0.39
+    assert attached_target["lookup_attention_metric_role"] == "source_quality_gate"
+    assert attached_target["lookup_attention_decision_authority"] == (
+        "counterfactual_only"
+    )
+    assert attached_target["lookup_attention_runtime_effect"] is False
+    assert attached_target["lookup_attention_allowed_runtime_apply"] is False
+    assert attached_target["lookup_attention_actual_order_submitted"] is False
+    assert attached_target["lookup_attention_broker_order_forbidden"] is True
+    assert (
+        attached_target["venue_resolution"]
+        == "consistent_explicit:payload.effective_venue,payload.venue"
+    )
+    assert attached_target["marcap"] == 123456789
+    assert published == [
+        (
+            "COMMAND_WS_REG",
+            {"codes": ["005930"], "source": "scanner_runtime_target_attach"},
+        )
+    ]
+    assert emitted[-1]["stage"] == "scalping_scanner_runtime_target_attach"
+    assert emitted[-1]["fields"]["runtime_target_attach_outcome"] == "attached"
+    assert emitted[-1]["fields"]["actual_order_submitted"] is False
+    assert emitted[-1]["fields"]["broker_order_forbidden"] is True
+    assert emitted[-1]["fields"]["venue"] == "KRX"
+    assert emitted[-1]["fields"]["effective_venue"] == "KRX"
+    assert emitted[-1]["fields"]["market_session_bucket"] == "krx_regular"
+    assert (
+        emitted[-1]["fields"]["venue_resolution"]
+        == "consistent_explicit:payload.effective_venue,payload.venue,"
+        "target.effective_venue,target.venue"
+    )
+    assert emitted[-1]["fields"]["rank_change"] == -12
+    assert emitted[-1]["fields"]["rank_change_sign"] == "-"
+    assert (
+        emitted[-1]["fields"]["rank_change_sign_authority"]
+        == "raw_unverified_not_decision_input"
+    )
+    assert emitted[-1]["fields"]["rank_change_sign_state"] == "negative"
+    assert emitted[-1]["fields"]["rank_change_sign_consistency"] == "consistent"
+    assert emitted[-1]["fields"]["rank_change_score_input"] == 0
+    assert (
+        emitted[-1]["fields"]["rank_change_score_policy"]
+        == "positive_signed_rank_delta_only_raw_rank_sign_unverified"
+    )
+    assert emitted[-1]["fields"]["realtime_lookup_rank_now"] == 7
+    assert emitted[-1]["fields"]["realtime_lookup_rank_change"] == -12
+    assert emitted[-1]["fields"]["value_rank_now"] == 2
+    assert emitted[-1]["fields"]["value_rank_prev_day"] == 40
+    assert emitted[-1]["fields"]["lookup_attention_state"] == ("observed_source_only")
+    assert emitted[-1]["fields"]["lookup_attention_snapshot_score"] == 0.39
+    assert emitted[-1]["fields"]["lookup_attention_runtime_effect"] is False
+    assert emitted[-1]["fields"]["lookup_attention_allowed_runtime_apply"] is False
+    assert (
+        emitted[-1]["fields"]["lookup_attention_decision_authority"]
+        == "counterfactual_only"
+    )
+    assert emitted[-1]["fields"]["lookup_attention_metric_role"] == (
+        "source_quality_gate"
+    )
+    assert emitted[-1]["fields"]["lookup_attention_metric_definition"].endswith(
+        ";not_ev"
+    )
+    assert (
+        "tail_loss" in emitted[-1]["fields"]["lookup_attention_secondary_diagnostics"]
+    )
+
+
+def test_scanner_runtime_target_venue_fields_fail_closed_on_session_conflict():
+    fields = kiwoom_sniper_v2._scanner_runtime_target_venue_fields(
+        {
+            "effective_venue": "KRX",
+            "market_session_bucket": "krx_regular",
+        },
+        target={
+            "effective_venue": "KRX",
+            "market_session_bucket": "nxt",
+        },
+    )
+
+    assert fields == {
+        "venue": "UNKNOWN",
+        "effective_venue": "UNKNOWN",
+        "venue_resolution": (
+            "conflicting_explicit_market_session_bucket:"
+            "payload.market_session_bucket=krx_regular,"
+            "target.market_session_bucket=nxt"
+        ),
+        "market_session_bucket": "UNKNOWN",
+        "venue_source_quality_status": "reviewed_fail_closed",
+        "venue_unknown_reviewed_reason": (
+            "conflicting_explicit_market_session_bucket:"
+            "payload.market_session_bucket=krx_regular,"
+            "target.market_session_bucket=nxt"
+        ),
+    }
+
+
+def test_scanner_runtime_target_venue_fields_fail_closed_on_session_venue_mismatch():
+    fields = kiwoom_sniper_v2._scanner_runtime_target_venue_fields(
+        {
+            "effective_venue": "KRX",
+            "market_session_bucket": "nxt",
+        }
+    )
+
+    assert fields == {
+        "venue": "UNKNOWN",
+        "effective_venue": "UNKNOWN",
+        "venue_resolution": (
+            "market_session_bucket_venue_mismatch:"
+            "effective_venue=KRX,market_session_bucket=nxt"
+        ),
+        "market_session_bucket": "nxt",
+        "venue_source_quality_status": "reviewed_fail_closed",
+        "venue_unknown_reviewed_reason": (
+            "market_session_bucket_venue_mismatch:"
+            "effective_venue=KRX,market_session_bucket=nxt"
+        ),
+    }
+
+
+def test_scanner_runtime_target_venue_fields_preserve_canonical_session_by_venue():
+    expected_buckets = {
+        "KRX": "krx_regular",
+        "PREMARKET_KRX_LIKE": "krx_like_premarket",
+        "NXT": "nxt",
+    }
+
+    for venue, market_session_bucket in expected_buckets.items():
+        fields = kiwoom_sniper_v2._scanner_runtime_target_venue_fields(
+            {
+                "effective_venue": venue,
+                "market_session_bucket": market_session_bucket,
+            }
+        )
+
+        assert fields["effective_venue"] == venue
+        assert fields["venue"] == venue
+        assert fields["market_session_bucket"] == market_session_bucket
+        assert fields["venue_resolution"].startswith("consistent_explicit:")
+        assert fields["venue_source_quality_status"] == "pass"
+        assert fields["venue_unknown_reviewed_reason"] == "not_applicable"
+
+
+def test_deadline_scheduler_callback_only_enqueues_immutable_promotion(monkeypatch):
+    inbox = SimpleQueue()
+    monkeypatch.setattr(kiwoom_sniper_v2, "ACTIVE_TARGETS", [])
+    monkeypatch.setattr(kiwoom_sniper_v2, "_SCANNER_PROMOTION_INBOX", inbox)
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_mode",
+        "deadline_v1",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_venues",
+        frozenset({"KRX", "PREMARKET_KRX_LIKE", "NXT"}),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_emit_scanner_scheduler_event",
+        lambda **kwargs: None,
+    )
+    payload = {
+        "code": "005930",
+        "strategy": "SCALPING",
+        "scanner_promotion_id": "PROMO-1",
+        "effective_venue": "KRX",
+        "buy_price": 70_000,
+    }
+
+    accepted = kiwoom_sniper_v2.handle_scalping_scanner_promoted_target(payload)
+    payload["buy_price"] = 1
+    envelope = inbox.get_nowait()
+
+    assert accepted is True
+    assert kiwoom_sniper_v2.ACTIVE_TARGETS == []
+    assert envelope.payload["buy_price"] == 70_000
+    with pytest.raises(TypeError):
+        envelope.payload["buy_price"] = 2
+
+
+def test_scheduler_inbox_duplicate_after_db_poll_attach_is_coalesced(monkeypatch):
+    scheduler = kiwoom_sniper_v2.ScannerRuntimeScheduler(max_active=16)
+    inbox = kiwoom_sniper_v2.ScannerPromotionInbox(max_active=16)
+    payload = {
+        "record_id": 77,
+        "code": "005930",
+        "name": "SAMSUNG",
+        "strategy": "SCALPING",
+        "status": "WATCHING",
+        "position_tag": "SCANNER",
+        "effective_venue": "KRX",
+        "venue_resolution": "consistent_explicit:payload.effective_venue",
+        "scanner_promotion_id": "SCANPROM-005930-1000000",
+        "scanner_promotion_emitted_epoch": 1000.0,
+        "current_price_observed": 70_000,
+        "buy_price": 70_000,
+        "source_signature": "REALTIME_RANK_START",
+    }
+    target = dict(payload)
+    registration = scheduler.register_generation(
+        code="005930",
+        promotion_id=payload["scanner_promotion_id"],
+        record_id=payload["record_id"],
+        venue="KRX",
+        promotion_epoch=1000.0,
+        attach_epoch=1000.2,
+        observed_price=70_000,
+        source_signature="REALTIME_RANK_START",
+    )
+    target["scanner_generation_id"] = registration.item.generation.generation_id
+    target["scanner_generation_revision"] = registration.item.generation.revision
+    emitted = []
+    applied = []
+    inbox.put(
+        kiwoom_sniper_v2.ScannerPromotionEnvelope.from_payload(
+            payload,
+            enqueued_epoch=1000.1,
+        )
+    )
+    monkeypatch.setattr(kiwoom_sniper_v2, "ACTIVE_TARGETS", [target])
+    monkeypatch.setattr(kiwoom_sniper_v2, "_SCANNER_PROMOTION_INBOX", inbox)
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_emit_scanner_scheduler_event",
+        lambda **kwargs: emitted.append(kwargs),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_apply_scalping_scanner_promoted_target",
+        lambda *args, **kwargs: applied.append((args, kwargs)) or True,
+    )
+
+    result = kiwoom_sniper_v2._drain_scanner_promotion_inbox(
+        scheduler,
+        max_items=1,
+    )
+
+    assert result["drained"] == 1
+    assert result["applied"] == 0
+    assert result["coalesced"] == 1
+    assert applied == []
+    assert scheduler.current_generation("005930").revision == 1
+    assert (
+        emitted[-1]["stage"] == "scalping_scanner_scheduler_inbox_duplicate_coalesced"
+    )
+
+
+def test_scheduler_boot_generation_does_not_reuse_old_promotion_anchor(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_mode",
+        "deadline_v1",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_venues",
+        frozenset({"KRX", "PREMARKET_KRX_LIKE", "NXT"}),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_emit_scanner_scheduler_event",
+        lambda **kwargs: None,
+    )
+    target = {
+        "id": 1,
+        "code": "005930",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "effective_venue": "KRX",
+        "scanner_promotion_id": "OLD-PROMOTION",
+        "scanner_promotion_emitted_epoch": 100.0,
+        "current_price_observed": 70_000,
+    }
+    scheduler = kiwoom_sniper_v2.ScannerRuntimeScheduler(max_active=16)
+
+    generation = kiwoom_sniper_v2._register_scanner_scheduler_generation(
+        scheduler,
+        payload={
+            **target,
+            "scanner_promotion_id": "SCANSCHEDBOOT-005930-200000",
+            "scanner_promotion_emitted_epoch": 200.0,
+            "current_price_observed": 0,
+            "buy_price": 0,
+        },
+        target=target,
+        attach_epoch=200.0,
+    )
+
+    assert generation.promotion_id == "SCANSCHEDBOOT-005930-200000"
+    assert generation.promotion_epoch == 200.0
+    assert generation.attach_epoch == 200.0
+    assert generation.observed_price == 0
+    assert target["scanner_promotion_id"] == "OLD-PROMOTION"
+
+
+def test_scheduler_boot_restore_without_canonical_venue_is_isolated(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_mode",
+        "deadline_v1",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_venues",
+        frozenset({"KRX", "PREMARKET_KRX_LIKE", "NXT"}),
+        raising=False,
+    )
+    emitted = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_emit_scanner_scheduler_event",
+        lambda **kwargs: emitted.append(kwargs),
+    )
+    target = {
+        "id": 1,
+        "code": "005930",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "effective_venue": "UNKNOWN",
+        "scanner_generation_id": "005930:STALE:r1",
+        "_scanner_scheduler_lane": "heavy_eval",
+    }
+    scheduler = kiwoom_sniper_v2.ScannerRuntimeScheduler(max_active=16)
+
+    generation = kiwoom_sniper_v2._register_scanner_scheduler_generation(
+        scheduler,
+        payload={
+            **target,
+            "scanner_promotion_id": "SCANSCHEDBOOT-005930-200000",
+            "scanner_promotion_emitted_epoch": 200.0,
+            "current_price_observed": 0,
+            "buy_price": 0,
+        },
+        target=target,
+        attach_epoch=200.0,
+    )
+
+    assert generation is None
+    assert target["status"] == "WATCHING"
+    assert "scanner_generation_id" not in target
+    assert "_scanner_scheduler_lane" not in target
+    assert target["_scanner_scheduler_registration_blocked"] is True
+    assert target["_scanner_scheduler_boot_restore_isolated"] is True
+    assert (
+        target["_scanner_scheduler_registration_reason"]
+        == "scanner_scheduler_canonical_venue_missing_fail_closed"
+    )
+    assert emitted[-1]["stage"] == "scalping_scanner_scheduler_generation_rejected"
+    assert (
+        emitted[-1]["fields"]["scheduler_action"]
+        == "canonical_venue_missing_fail_closed"
+    )
+
+
+def test_scheduler_boot_restore_reuses_persisted_same_session_generation(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "scalping_session_venue_provenance",
+        lambda _epoch: {"effective_venue": "NXT"},
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_scalping_watching_ttl_sec",
+        lambda: 1800.0,
+    )
+    target = {
+        "id": 1,
+        "code": "005930",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "effective_venue": "NXT",
+        "venue_resolution": "session_window:nxt",
+        "scanner_promotion_id": "SCANPROM-005930-190000",
+        "scanner_promotion_emitted_epoch": 190.0,
+        "source_signature": "PRICE_JUMP_START",
+        "buy_price": 70_000,
+    }
+
+    payload = kiwoom_sniper_v2._scanner_scheduler_boot_restore_payload(
+        target,
+        boot_epoch=200.0,
+    )
+
+    assert payload["scanner_scheduler_boot_restore"] is True
+    assert payload["scanner_scheduler_boot_restore_block_reason"] == ""
+    assert payload["scanner_promotion_id"] == "SCANPROM-005930-190000"
+    assert payload["scanner_promotion_emitted_epoch"] == 190.0
+    assert payload["effective_venue"] == "NXT"
+    assert payload["current_price_observed"] == 70_000
+    assert payload["scanner_scheduler_boot_promotion_age_sec"] == 10.0
+
+
+def test_scheduler_boot_restore_registers_without_shared_deadline_backlog(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_mode",
+        "async_v1",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_venues",
+        frozenset({"NXT"}),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_emit_scanner_scheduler_event",
+        lambda **kwargs: None,
+    )
+    target = {
+        "id": 1,
+        "code": "005930",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "effective_venue": "NXT",
+        "scanner_promotion_id": "SCANPROM-005930-190000",
+        "scanner_promotion_emitted_epoch": 190.0,
+        "current_price_observed": 70_000,
+        "source_signature": "PRICE_JUMP_START",
+    }
+    scheduler = kiwoom_sniper_v2.ScannerRuntimeScheduler(max_active=16)
+
+    generation = kiwoom_sniper_v2._register_scanner_scheduler_generation(
+        scheduler,
+        payload={
+            **target,
+            "scanner_scheduler_boot_restore": True,
+            "scanner_scheduler_boot_restore_block_reason": "",
+        },
+        target=target,
+        attach_epoch=200.0,
+    )
+
+    assert generation is not None
+    assert scheduler.current_generation("005930") == generation
+    assert target["scanner_generation_observed_price"] == 70_000
+    assert target["scanner_generation_boot_restore"] is True
+    assert scheduler.snapshot_metrics(now_epoch=200.0)["scheduler_queue_depth"] == 0
+    assert "_scanner_scheduler_lane" not in target
+
+    peer = scheduler.register_generation(
+        code="000001",
+        promotion_id="PROMO-PEER",
+        record_id=2,
+        venue="NXT",
+        promotion_epoch=200.4,
+        attach_epoch=200.5,
+        observed_price=10_000,
+        source_signature="VALUE_TOP",
+    )
+    missing = kiwoom_sniper_v2._scanner_scheduler_claim_target(
+        scheduler,
+        target,
+        lane=kiwoom_sniper_v2.ScannerLane.FAST_PRECHECK,
+        now_epoch=201.0,
+    )
+
+    assert peer.item is not None
+    assert missing.action == "missing"
+    assert missing.reason == "generation_lane_not_enqueued"
+    scheduler.invalidate(
+        "000001",
+        now_epoch=201.0,
+        reason="test_peer_completed_before_refresh",
+    )
+
+    fresh = kiwoom_sniper_v2._scanner_scheduler_refresh_claim_after_expiry(
+        scheduler,
+        target,
+        previous_decision=missing,
+        now_epoch=201.0,
+    )
+
+    assert fresh.action == "dispatch"
+    assert fresh.item.lane is kiwoom_sniper_v2.ScannerLane.FAST_PRECHECK
+    assert fresh.item.precheck_phase == "initial"
+
+
+@pytest.mark.parametrize(
+    "persisted_venue,promotion_epoch,expected_reason",
+    [
+        ("KRX", 190.0, "scanner_scheduler_boot_session_venue_mismatch"),
+        ("NXT", 100.0, "scanner_scheduler_boot_promotion_ttl_expired"),
+        ("UNKNOWN", 190.0, "scanner_scheduler_boot_persisted_venue_missing"),
+    ],
+)
+def test_scheduler_boot_restore_rejects_invalid_persisted_provenance(
+    monkeypatch,
+    persisted_venue,
+    promotion_epoch,
+    expected_reason,
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "scalping_session_venue_provenance",
+        lambda _epoch: {"effective_venue": "NXT"},
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_scalping_watching_ttl_sec",
+        lambda: 30.0,
+    )
+    target = {
+        "code": "005930",
+        "effective_venue": persisted_venue,
+        "venue_resolution": "session_window:persisted",
+        "scanner_promotion_id": "SCANPROM-005930-190000",
+        "scanner_promotion_emitted_epoch": promotion_epoch,
+        "buy_price": 70_000,
+    }
+
+    payload = kiwoom_sniper_v2._scanner_scheduler_boot_restore_payload(
+        target,
+        boot_epoch=200.0,
+    )
+
+    assert payload["scanner_scheduler_boot_restore_block_reason"] == expected_reason
+    assert payload["effective_venue"] == persisted_venue
+    assert payload["current_price_observed"] == 0
+    assert payload["scanner_promotion_id"].startswith("SCANSCHEDBOOT-005930-")
+
+
+def test_invalid_scheduler_boot_restore_expires_unfilled_watching_row(
+    monkeypatch,
+):
+    executed = []
+    emitted = []
+
+    class _Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, statement, params):
+            executed.append((str(statement), params))
+            return SimpleNamespace(rowcount=1)
+
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "DB",
+        SimpleNamespace(get_session=lambda: _Session()),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_emit_scanner_scheduler_event",
+        lambda **kwargs: emitted.append(kwargs),
+    )
+    target = {
+        "id": 77,
+        "code": "005930",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+    }
+    targets = [target]
+    payload = {
+        **target,
+        "scanner_scheduler_boot_restore": True,
+        "scanner_scheduler_boot_restore_block_reason": (
+            "scanner_scheduler_boot_persisted_venue_missing"
+        ),
+        "scanner_scheduler_boot_persisted_venue": "UNKNOWN",
+        "scanner_scheduler_boot_current_venue": "NXT",
+    }
+
+    expired = kiwoom_sniper_v2._expire_invalid_scanner_scheduler_boot_restore(
+        target,
+        targets,
+        payload,
+    )
+
+    assert expired is True
+    assert target["status"] == "EXPIRED"
+    assert executed[0][1] == {"record_id": 77, "stock_code": "005930"}
+    assert emitted[-1]["stage"] == ("scalping_scanner_scheduler_boot_restore_expired")
+    assert emitted[-1]["fields"]["actual_order_submitted"] is False
+
+
+def test_scheduler_event_sink_snapshots_action_for_observation_executor(monkeypatch):
+    submitted = []
+    emitted = []
+
+    class _InlineExecutor:
+        @staticmethod
+        def submit(callback):
+            submitted.append(callback)
+            callback()
+
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_SCANNER_OBSERVATION_EXECUTOR",
+        _InlineExecutor(),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda *args, **kwargs: emitted.append((args, kwargs)),
+    )
+
+    kiwoom_sniper_v2._emit_scanner_scheduler_event(
+        payload={
+            "name": "SAMSUNG",
+            "code": "005930",
+            "record_id": 77,
+            "effective_venue": "KRX",
+        },
+        stage="scalping_scanner_scheduler_work_dispatched",
+        fields={"scheduler_action": "dispatch"},
+    )
+
+    assert len(submitted) == 1
+    assert emitted[0][0][:4] == (
+        "ENTRY_PIPELINE",
+        "SAMSUNG",
+        "005930",
+        "scalping_scanner_scheduler_work_dispatched",
+    )
+    assert emitted[0][1]["record_id"] == 77
+    assert emitted[0][1]["fields"]["scheduler_action"] == "dispatch"
+    assert (
+        emitted[0][1]["fields"]["scanner_scheduler_event_sink"]
+        == "async_observation_executor"
+    )
+    assert emitted[0][1]["fields"]["scanner_scheduler_action_epoch"] > 0
+
+
+def test_scheduler_event_sink_shutdown_cannot_abort_runtime(monkeypatch):
+    errors = []
+
+    class _ClosedExecutor:
+        @staticmethod
+        def submit(callback):
+            raise RuntimeError("executor shutdown")
+
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_SCANNER_OBSERVATION_EXECUTOR",
+        _ClosedExecutor(),
+    )
+    monkeypatch.setattr(kiwoom_sniper_v2, "log_error", errors.append)
+
+    kiwoom_sniper_v2._emit_scanner_scheduler_event(
+        payload={"code": "005930", "effective_venue": "KRX"},
+        stage="scalping_scanner_scheduler_work_dispatched",
+        fields={"scheduler_action": "dispatch"},
+    )
+
+    assert len(errors) == 1
+    assert "event submit failed" in errors[0]
+
+
+def test_fresh_canonical_generation_releases_boot_restore_isolation(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_mode",
+        "deadline_v1",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_venues",
+        frozenset({"KRX", "PREMARKET_KRX_LIKE", "NXT"}),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_emit_scanner_scheduler_event",
+        lambda **kwargs: None,
+    )
+    target = {
+        "id": 1,
+        "code": "005930",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "effective_venue": "UNKNOWN",
+        "_scanner_scheduler_registration_blocked": True,
+        "_scanner_scheduler_registration_reason": (
+            "scanner_scheduler_canonical_venue_missing_fail_closed"
+        ),
+        "_scanner_scheduler_boot_restore_isolated": True,
+    }
+    scheduler = kiwoom_sniper_v2.ScannerRuntimeScheduler(max_active=16)
+
+    generation = kiwoom_sniper_v2._register_scanner_scheduler_generation(
+        scheduler,
+        payload={
+            **target,
+            "effective_venue": "KRX",
+            "venue_resolution": "consistent_explicit:payload.effective_venue",
+            "scanner_promotion_id": "PROMO-FRESH",
+            "scanner_promotion_emitted_epoch": 210.0,
+            "current_price_observed": 70_000,
+        },
+        target=target,
+        attach_epoch=211.0,
+    )
+
+    assert generation is not None
+    assert target["_scanner_scheduler_registration_blocked"] is False
+    assert target["_scanner_scheduler_registration_reason"] == "-"
+    assert target["_scanner_scheduler_boot_restore_isolated"] is False
+    assert target["scanner_generation_id"] == generation.generation_id
+    assert target["effective_venue"] == "KRX"
+    assert target["venue"] == "KRX"
+    assert target["venue_resolution"] == "consistent_explicit:payload.effective_venue"
+
+
+def test_scheduler_submit_guard_blocks_promotion_arriving_during_heavy_eval(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_mode",
+        "deadline_v1",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_venues",
+        frozenset({"KRX", "PREMARKET_KRX_LIKE", "NXT"}),
+        raising=False,
+    )
+    scheduler = kiwoom_sniper_v2.ScannerRuntimeScheduler(max_active=16)
+    registration = scheduler.register_generation(
+        code="005930",
+        promotion_id="PROMO-OLD",
+        record_id=1,
+        venue="KRX",
+        promotion_epoch=100.0,
+        attach_epoch=101.0,
+        observed_price=70_000,
+        source_signature="VALUE_TOP",
+    )
+    generation = registration.item.generation
+    target = {
+        "id": 1,
+        "code": "005930",
+        "status": "BUY_ORDERED",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "effective_venue": "KRX",
+        "venue_resolution": "consistent_explicit:payload.effective_venue",
+        "scanner_generation_id": generation.generation_id,
+        "scanner_generation_revision": generation.revision,
+    }
+    inbox = kiwoom_sniper_v2.ScannerPromotionInbox(max_active=16)
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_runtime_scheduler",
+        scheduler,
+        raising=False,
+    )
+    monkeypatch.setattr(kiwoom_sniper_v2, "_SCANNER_PROMOTION_INBOX", inbox)
+
+    current = kiwoom_sniper_v2._scanner_generation_submit_guard(target, "005930")
+    assert current["allowed"] is True
+
+    inbox.put(
+        kiwoom_sniper_v2.ScannerPromotionEnvelope.from_payload(
+            {
+                "code": "005930",
+                "scanner_promotion_id": "PROMO-NEW",
+                "effective_venue": "KRX",
+            },
+            enqueued_epoch=105.0,
+        )
+    )
+    superseded = kiwoom_sniper_v2._scanner_generation_submit_guard(target, "005930")
+
+    assert superseded["allowed"] is False
+    assert superseded["reason"] == "newer_promotion_pending_main_thread_attach"
+    assert superseded["scanner_pending_promotion_id"] == "PROMO-NEW"
+
+
+def test_scheduler_deferred_claim_keeps_candidate_and_blocker_identity_separate(
+    monkeypatch,
+):
+    scheduler = kiwoom_sniper_v2.ScannerRuntimeScheduler(max_active=16)
+    blocker = scheduler.register_generation(
+        code="000001",
+        promotion_id="PROMO-BLOCKER",
+        record_id=1,
+        venue="KRX",
+        promotion_epoch=99.0,
+        attach_epoch=100.0,
+        observed_price=10_000,
+        source_signature="VALUE_TOP",
+    )
+    candidate = scheduler.register_generation(
+        code="000002",
+        promotion_id="PROMO-CANDIDATE",
+        record_id=2,
+        venue="KRX",
+        promotion_epoch=100.5,
+        attach_epoch=101.0,
+        observed_price=11_000,
+        source_signature="OPEN_TOP",
+    )
+    candidate_target = {
+        "id": 2,
+        "code": "000002",
+        "name": "candidate",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "effective_venue": "KRX",
+        "venue_resolution": "consistent_explicit:target.effective_venue",
+        "scanner_generation_id": candidate.item.generation.generation_id,
+    }
+    emitted = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_emit_scanner_scheduler_event",
+        lambda **kwargs: emitted.append(kwargs),
+    )
+
+    decision = kiwoom_sniper_v2._scanner_scheduler_claim_target(
+        scheduler,
+        candidate_target,
+        lane=kiwoom_sniper_v2.ScannerLane.FAST_PRECHECK,
+        now_epoch=101.1,
+    )
+
+    assert decision.action == "not_next"
+    assert emitted[-1]["payload"]["code"] == "000002"
+    fields = emitted[-1]["fields"]
+    assert fields["scanner_generation_id"] == candidate.item.generation.generation_id
+    assert (
+        fields["scanner_scheduler_claim_candidate_generation_id"]
+        == candidate.item.generation.generation_id
+    )
+    assert (
+        fields["scanner_scheduler_blocking_generation_id"]
+        == blocker.item.generation.generation_id
+    )
+    assert fields["scanner_scheduler_blocking_generation_code"] == "000001"
+    assert "attach_to_first_precheck_sec" not in fields
+
+
+def test_scheduler_expired_recheck_is_parked_without_same_generation_refresh(
+    monkeypatch,
+):
+    scheduler = kiwoom_sniper_v2.ScannerRuntimeScheduler(max_active=16)
+    registration = scheduler.register_generation(
+        code="000001",
+        promotion_id="PROMO-1",
+        record_id=1,
+        venue="KRX",
+        promotion_epoch=99.0,
+        attach_epoch=100.0,
+        observed_price=10_000,
+        source_signature="VALUE_TOP",
+    )
+    generation = registration.item.generation
+    target = {
+        "id": 1,
+        "code": "000001",
+        "name": "target",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "effective_venue": "KRX",
+        "venue_resolution": "consistent_explicit:target.effective_venue",
+        "scanner_generation_id": generation.generation_id,
+    }
+    emitted = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_emit_scanner_scheduler_event",
+        lambda **kwargs: emitted.append(kwargs),
+    )
+    initial = kiwoom_sniper_v2._scanner_scheduler_claim_target(
+        scheduler,
+        target,
+        lane=kiwoom_sniper_v2.ScannerLane.FAST_PRECHECK,
+        now_epoch=100.1,
+    )
+    scheduler.complete(initial.item, completed_epoch=100.2, outcome="pass")
+    scheduler.enqueue(
+        generation,
+        lane=kiwoom_sniper_v2.ScannerLane.FAST_PRECHECK,
+        owner="precheck_not_eligible_fresh_recheck",
+        enqueued_epoch=100.2,
+        deadline_epoch=110.2,
+        attempt=2,
+    )
+    emitted.clear()
+
+    expired = kiwoom_sniper_v2._scanner_scheduler_claim_target(
+        scheduler,
+        target,
+        lane=kiwoom_sniper_v2.ScannerLane.FAST_PRECHECK,
+        now_epoch=110.3,
+    )
+    refreshed = kiwoom_sniper_v2._scanner_scheduler_refresh_claim_after_expiry(
+        scheduler,
+        target,
+        previous_decision=expired,
+        now_epoch=110.3,
+    )
+
+    assert expired.action == "deadline_expired"
+    assert refreshed is None
+    assert target["_scanner_scheduler_warm_parked"] is True
+    assert [event["stage"] for event in emitted] == [
+        "scalping_scanner_scheduler_deadline_expired",
+        "scalping_scanner_scheduler_work_completed",
+    ]
+    metrics = scheduler.snapshot_metrics(now_epoch=110.3)
+    assert metrics["scheduler_queue_depth"] == 0
+    assert metrics["scheduler_in_flight_count"] == 0
+
+
+def test_scheduler_expired_initial_is_parked_until_new_promotion(
+    monkeypatch,
+):
+    scheduler = kiwoom_sniper_v2.ScannerRuntimeScheduler(max_active=16)
+    registration = scheduler.register_generation(
+        code="000001",
+        promotion_id="PROMO-1",
+        record_id=1,
+        venue="KRX",
+        promotion_epoch=99.0,
+        attach_epoch=100.0,
+        observed_price=10_000,
+        source_signature="VALUE_TOP",
+    )
+    target = {
+        "id": 1,
+        "code": "000001",
+        "name": "target",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "effective_venue": "KRX",
+        "venue_resolution": "consistent_explicit:target.effective_venue",
+        "scanner_generation_id": registration.item.generation.generation_id,
+    }
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_emit_scanner_scheduler_event",
+        lambda **kwargs: None,
+    )
+
+    expired = kiwoom_sniper_v2._scanner_scheduler_claim_target(
+        scheduler,
+        target,
+        lane=kiwoom_sniper_v2.ScannerLane.FAST_PRECHECK,
+        now_epoch=110.1,
+    )
+    refreshed = kiwoom_sniper_v2._scanner_scheduler_refresh_claim_after_expiry(
+        scheduler,
+        target,
+        previous_decision=expired,
+        now_epoch=110.1,
+    )
+
+    assert expired.action == "deadline_expired"
+    assert refreshed is None
+    assert target["_scanner_scheduler_warm_parked"] is True
+    assert scheduler.snapshot_metrics(now_epoch=110.1)["scheduler_queue_depth"] == 0
+
+
+def test_scheduler_reconciles_replaced_watch_before_new_capacity_registration(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_emit_scanner_scheduler_event",
+        lambda **kwargs: None,
+    )
+    scheduler = kiwoom_sniper_v2.ScannerRuntimeScheduler(max_active=1)
+    scheduler.register_generation(
+        code="000001",
+        promotion_id="PROMO-OLD",
+        record_id=1,
+        venue="KRX",
+        promotion_epoch=100.0,
+        attach_epoch=101.0,
+        observed_price=10_000,
+        source_signature="VALUE_TOP",
+    )
+    replacement_target = {
+        "id": 2,
+        "code": "000002",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+    }
+
+    invalidated = kiwoom_sniper_v2._scanner_scheduler_reconcile_active_targets(
+        scheduler,
+        [replacement_target],
+        now_epoch=102.0,
+    )
+    replacement = scheduler.register_generation(
+        code="000002",
+        promotion_id="PROMO-NEW",
+        record_id=2,
+        venue="KRX",
+        promotion_epoch=102.0,
+        attach_epoch=103.0,
+        observed_price=11_000,
+        source_signature="OPEN_TOP",
+    )
+
+    assert invalidated == 1
+    assert replacement.action == "generation_registered"
+    assert scheduler.generation_codes() == frozenset({"000002"})
+
+
+def test_scanner_generation_guard_runs_immediately_before_first_broker_submit():
+    source = inspect.getsource(
+        kiwoom_sniper_v2.sniper_state_handlers._submit_watching_triggered_entry
+    )
+    loop_idx = source.index("for planned_order in planned_orders:")
+    guard_idx = source.index("SCANNER_GENERATION_SUBMIT_GUARD(stock, code)", loop_idx)
+    send_idx = source.index("kiwoom_orders.send_buy_order(", guard_idx)
+
+    assert loop_idx < guard_idx < send_idx
+
+
+def test_scanner_runtime_target_event_fields_preserve_explicit_venue_provenance():
+    fields = kiwoom_sniper_v2._scanner_runtime_target_event_fields(
+        {
+            "code": "005930",
+            "effective_venue": "KRX",
+            "source_signature": "REALTIME_RANK_START",
+        },
+        outcome="attached",
+        reason="scanner_runtime_target_attach",
+        target={
+            "code": "005930",
+            "tp1_context": {"rising_missed_effective_venue": "KRX"},
+        },
+    )
+
+    assert fields["venue"] == "KRX"
+    assert fields["effective_venue"] == "KRX"
+    assert fields["venue_resolution"] == (
+        "consistent_explicit:payload.effective_venue,"
+        "target.tp1_context.rising_missed_effective_venue"
+    )
+
+
+def test_scanner_runtime_context_clears_stale_lookup_attention_generation():
+    existing = {
+        "realtime_lookup_source_date": "20260902",
+        "realtime_lookup_source_time": "093015",
+        "lookup_attention_state": "observed_source_only",
+        "lookup_attention_source_quality_gaps": "",
+        "lookup_attention_snapshot_score": 0.66,
+    }
+    updates = kiwoom_sniper_v2._scanner_runtime_context_updates(
+        {
+            "realtime_lookup_source_date": "",
+            "realtime_lookup_source_time": "",
+            "lookup_attention_state": "source_quality_blocked",
+            "lookup_attention_source_quality_gaps": (
+                "realtime_lookup_source_date,realtime_lookup_source_time"
+            ),
+            "lookup_attention_snapshot_score": None,
+            "lookup_attention_runtime_effect": "false",
+            "lookup_attention_allowed_runtime_apply": "false",
+            "lookup_attention_actual_order_submitted": "false",
+            "lookup_attention_broker_order_forbidden": "true",
+        }
+    )
+
+    assert updates["realtime_lookup_source_date"] == ""
+    assert updates["realtime_lookup_source_time"] == ""
+    assert updates["lookup_attention_snapshot_score"] is None
+    assert updates["lookup_attention_runtime_effect"] is False
+    assert updates["lookup_attention_allowed_runtime_apply"] is False
+    assert updates["lookup_attention_actual_order_submitted"] is False
+    assert updates["lookup_attention_broker_order_forbidden"] is True
+
+    merged_updates, _fields = (
+        kiwoom_sniper_v2._scanner_merge_context_preserving_positive_delta(
+            existing, updates, incoming_promotion_id="SCANPROM-new"
+        )
+    )
+    existing.update(merged_updates)
+
+    assert existing["realtime_lookup_source_date"] == ""
+    assert existing["realtime_lookup_source_time"] == ""
+    assert existing["lookup_attention_state"] == "source_quality_blocked"
+    assert existing["lookup_attention_source_quality_gaps"] == (
+        "realtime_lookup_source_date,realtime_lookup_source_time"
+    )
+    assert existing["lookup_attention_snapshot_score"] is None
+
+
+def test_scanner_runtime_target_event_normalizes_lookup_attention_bool_strings():
+    fields = kiwoom_sniper_v2._scanner_runtime_target_event_fields(
+        {
+            "code": "005930",
+            "lookup_attention_runtime_effect": "false",
+            "lookup_attention_allowed_runtime_apply": "false",
+            "lookup_attention_actual_order_submitted": "false",
+            "lookup_attention_broker_order_forbidden": "true",
+        },
+        outcome="attached",
+        reason="scanner_runtime_target_attach",
+    )
+
+    assert fields["lookup_attention_runtime_effect"] is False
+    assert fields["lookup_attention_allowed_runtime_apply"] is False
+    assert fields["lookup_attention_actual_order_submitted"] is False
+    assert fields["lookup_attention_broker_order_forbidden"] is True
+
+
+def test_scanner_runtime_target_event_fields_fail_closed_on_venue_conflict():
+    fields = kiwoom_sniper_v2._scanner_runtime_target_event_fields(
+        {"code": "005930", "effective_venue": "KRX"},
+        outcome="attached",
+        reason="scanner_runtime_target_attach",
+        target={"code": "005930", "effective_venue": "NXT"},
+    )
+
+    assert fields["venue"] == "UNKNOWN"
+    assert fields["effective_venue"] == "UNKNOWN"
+    assert fields["venue_resolution"].startswith("conflicting_explicit_venue:")
+
+
+def test_scanner_runtime_target_event_fields_preserve_premarket_cohort():
+    fields = kiwoom_sniper_v2._scanner_runtime_target_event_fields(
+        {
+            "code": "096770",
+            "effective_venue": "PREMARKET_KRX_LIKE",
+        },
+        outcome="attached",
+        reason="scanner_runtime_target_attach",
+        target={
+            "code": "096770",
+            "tp1_context": {"rising_missed_effective_venue": "PREMARKET_KRX_LIKE"},
+        },
+    )
+
+    assert fields["venue"] == "PREMARKET_KRX_LIKE"
+    assert fields["effective_venue"] == "PREMARKET_KRX_LIKE"
+    assert fields["venue_resolution"].startswith("consistent_explicit:")
+
+
+def test_scalping_scanner_promoted_target_skips_manual_control_excluded_code(
+    monkeypatch, tmp_path
+):
+    emitted = []
+    published = []
+    excluded_path = tmp_path / "manual_control_excluded_codes.txt"
+    excluded_path.write_text("005930\n", encoding="utf-8")
+    monkeypatch.delenv("KORSTOCKSCAN_MANUAL_CONTROL_EXCLUDED_CODES", raising=False)
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_MANUAL_CONTROL_EXCLUDED_CODES_FILE", str(excluded_path)
+    )
+    monkeypatch.setattr(kiwoom_sniper_v2, "ACTIVE_TARGETS", [])
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda pipeline, name, code, stage, *, record_id=None, fields=None: emitted.append(
+            {
+                "pipeline": pipeline,
+                "name": name,
+                "code": code,
+                "stage": stage,
+                "fields": fields or {},
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    attached = kiwoom_sniper_v2.handle_scalping_scanner_promoted_target(
+        {
+            "record_id": 77,
+            "code": "005930",
+            "name": "SAMSUNG",
+            "strategy": "SCALPING",
+            "trade_type": "SCALP",
+            "status": "WATCHING",
+            "position_tag": "SCANNER",
+            "buy_price": 70000,
+        }
+    )
+
+    assert attached is False
+    assert kiwoom_sniper_v2.ACTIVE_TARGETS == []
+    assert published == []
+    assert emitted[-1]["stage"] == "scalping_scanner_runtime_target_attach"
+    assert emitted[-1]["fields"]["runtime_target_attach_outcome"] == "skipped"
+    assert (
+        emitted[-1]["fields"]["runtime_target_attach_reason"]
+        == "operator_manual_control_excluded_symbol"
+    )
+    assert emitted[-1]["fields"]["manual_control_exclusion_applied"] is True
+    assert emitted[-1]["fields"]["actual_order_submitted"] is False
+
+
+def test_scalping_scanner_promoted_target_skips_immediate_capacity_overflow(
+    monkeypatch, tmp_path
+):
+    emitted = []
+    published = []
+    _disable_scanner_operator_runtime_overrides(monkeypatch, tmp_path)
+    kiwoom_sniper_v2._reset_scalping_dynamic_watch_cap_state()
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_MAX_ACTIVE", "1")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FIFO_NEW_PROMOTION_GRACE_SEC", "0")
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "ACTIVE_TARGETS",
+        [
+            {
+                "id": 1,
+                "code": "000001",
+                "name": "RISING",
+                "strategy": "SCALPING",
+                "status": "WATCHING",
+                "position_tag": "SCANNER",
+                "entry_armed_at_epoch": 1000.0,
+                "price_delta_since_first_seen_pct": "1.0",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_resolve_stock_marcap", lambda stock, code: 123456789
+    )
+    monkeypatch.setattr(kiwoom_sniper_v2, "_latest_stock_name_from_db", lambda code: "")
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda pipeline, name, code, stage, *, record_id=None, fields=None: emitted.append(
+            {
+                "pipeline": pipeline,
+                "name": name,
+                "code": code,
+                "stage": stage,
+                "fields": fields or {},
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    attached = kiwoom_sniper_v2.handle_scalping_scanner_promoted_target(
+        {
+            "record_id": 2,
+            "code": "000002",
+            "name": "FLAT",
+            "strategy": "SCALPING",
+            "trade_type": "SCALP",
+            "position_tag": "SCANNER",
+            "buy_price": 10000,
+            "added_time": 1010.0,
+            "entry_armed_at_epoch": 1010.0,
+            "price_delta_since_first_seen_pct": "0.0",
+        }
+    )
+
+    assert attached is False
+    assert [target["code"] for target in kiwoom_sniper_v2.ACTIVE_TARGETS] == ["000001"]
+    assert published == []
+    assert emitted[-1]["fields"]["runtime_target_attach_outcome"] == "skipped"
+    assert (
+        emitted[-1]["fields"]["runtime_target_attach_reason"]
+        == "scalping_dynamic_watch_cap_capacity"
+    )
+    assert emitted[-1]["fields"]["scanner_attach_capacity_cap"] == 1
+    assert emitted[-1]["fields"]["scanner_attach_capacity_watching_count"] == 1
+    assert emitted[-1]["fields"]["scanner_attach_capacity_candidate_overflow"] is True
+    kiwoom_sniper_v2._reset_scalping_dynamic_watch_cap_state()
+
+
+def test_scalping_scanner_promoted_target_allows_higher_priority_capacity_candidate(
+    monkeypatch, tmp_path
+):
+    emitted = []
+    published = []
+    _disable_scanner_operator_runtime_overrides(monkeypatch, tmp_path)
+    kiwoom_sniper_v2._reset_scalping_dynamic_watch_cap_state()
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_MAX_ACTIVE", "1")
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "ACTIVE_TARGETS",
+        [
+            {
+                "id": 1,
+                "code": "000001",
+                "name": "FLAT",
+                "strategy": "SCALPING",
+                "status": "WATCHING",
+                "position_tag": "SCANNER",
+                "entry_armed_at_epoch": 1000.0,
+                "price_delta_since_first_seen_pct": "0.0",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_resolve_stock_marcap", lambda stock, code: 123456789
+    )
+    monkeypatch.setattr(kiwoom_sniper_v2, "_latest_stock_name_from_db", lambda code: "")
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda pipeline, name, code, stage, *, record_id=None, fields=None: emitted.append(
+            {
+                "pipeline": pipeline,
+                "name": name,
+                "code": code,
+                "stage": stage,
+                "fields": fields or {},
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    attached = kiwoom_sniper_v2.handle_scalping_scanner_promoted_target(
+        {
+            "record_id": 2,
+            "code": "000002",
+            "name": "RISING",
+            "strategy": "SCALPING",
+            "trade_type": "SCALP",
+            "position_tag": "SCANNER",
+            "buy_price": 10000,
+            "added_time": 1010.0,
+            "entry_armed_at_epoch": 1010.0,
+            "price_delta_since_first_seen_pct": "1.0",
+        }
+    )
+
+    assert attached is True
+    assert [target["code"] for target in kiwoom_sniper_v2.ACTIVE_TARGETS] == ["000002"]
+    assert published == [
+        (
+            "COMMAND_WS_UNREG",
+            {
+                "codes": ["000001"],
+                "source": "scalping_scanner_watch_budget_reallocation",
+                "reason": "higher_priority_owner_slot_reclaimed",
+            },
+        ),
+        (
+            "COMMAND_WS_REG",
+            {"codes": ["000002"], "source": "scanner_runtime_target_attach"},
+        ),
+    ]
+    assert emitted[-1]["fields"]["runtime_target_attach_outcome"] == "attached"
+    kiwoom_sniper_v2._reset_scalping_dynamic_watch_cap_state()
+
+
+def test_scalping_scanner_promoted_target_blocks_capacity_replacement_when_hot_disabled(
+    monkeypatch, tmp_path
+):
+    emitted = []
+    published = []
+    override_path = tmp_path / "operator_runtime_overrides.env"
+    _reset_scanner_hot_override_cache()
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_SCANNER_OPERATOR_RUNTIME_OVERRIDE_PATH", override_path
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_SCANNER_HOT_RUNTIME_OVERRIDE_REFRESH_SEC", 0.0
+    )
+    kiwoom_sniper_v2._reset_scalping_dynamic_watch_cap_state()
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_MAX_ACTIVE", "1")
+    override_path.write_text(
+        "export KORSTOCKSCAN_SCALPING_WATCHING_ATTACH_REPLACE_ENABLED=false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "ACTIVE_TARGETS",
+        [
+            {
+                "id": 1,
+                "code": "000001",
+                "name": "FLAT",
+                "strategy": "SCALPING",
+                "status": "WATCHING",
+                "position_tag": "SCANNER",
+                "entry_armed_at_epoch": 1000.0,
+                "price_delta_since_first_seen_pct": "0.0",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_resolve_stock_marcap", lambda stock, code: 123456789
+    )
+    monkeypatch.setattr(kiwoom_sniper_v2, "_latest_stock_name_from_db", lambda code: "")
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda pipeline, name, code, stage, *, record_id=None, fields=None: emitted.append(
+            {
+                "pipeline": pipeline,
+                "name": name,
+                "code": code,
+                "stage": stage,
+                "fields": fields or {},
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    attached = kiwoom_sniper_v2.handle_scalping_scanner_promoted_target(
+        {
+            "record_id": 2,
+            "code": "000002",
+            "name": "RISING",
+            "strategy": "SCALPING",
+            "trade_type": "SCALP",
+            "position_tag": "SCANNER",
+            "buy_price": 10000,
+            "added_time": 1010.0,
+            "entry_armed_at_epoch": 1010.0,
+            "price_delta_since_first_seen_pct": "3.0",
+        }
+    )
+
+    assert attached is False
+    assert [target["code"] for target in kiwoom_sniper_v2.ACTIVE_TARGETS] == ["000001"]
+    assert published == []
+    assert emitted[-1]["fields"]["runtime_target_attach_outcome"] == "skipped"
+    assert (
+        emitted[-1]["fields"]["runtime_target_attach_reason"]
+        == "scalping_dynamic_watch_cap_capacity"
+    )
+    assert emitted[-1]["fields"]["scanner_attach_capacity_cap"] == 1
+    assert emitted[-1]["fields"]["scanner_attach_capacity_watching_count"] == 1
+    assert emitted[-1]["fields"]["scanner_attach_capacity_candidate_overflow"] is True
+    _reset_scanner_hot_override_cache()
+    kiwoom_sniper_v2._reset_scalping_dynamic_watch_cap_state()
+
+
+def test_scalping_scanner_promoted_target_allows_recent_promotion_grace_capacity_candidate(
+    monkeypatch, tmp_path
+):
+    emitted = []
+    published = []
+    _disable_scanner_operator_runtime_overrides(monkeypatch, tmp_path)
+    kiwoom_sniper_v2._reset_scalping_dynamic_watch_cap_state()
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_MAX_ACTIVE", "1")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FIFO_NEW_PROMOTION_GRACE_SEC", "60")
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "ACTIVE_TARGETS",
+        [
+            {
+                "id": 1,
+                "code": "000001",
+                "name": "RISING_OLD",
+                "strategy": "SCALPING",
+                "status": "WATCHING",
+                "position_tag": "SCANNER",
+                "entry_armed_at_epoch": 1000.0,
+                "price_delta_since_first_seen_pct": "1.0",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_resolve_stock_marcap", lambda stock, code: 123456789
+    )
+    monkeypatch.setattr(kiwoom_sniper_v2, "_latest_stock_name_from_db", lambda code: "")
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda pipeline, name, code, stage, *, record_id=None, fields=None: emitted.append(
+            {
+                "pipeline": pipeline,
+                "name": name,
+                "code": code,
+                "stage": stage,
+                "fields": fields or {},
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    attached = kiwoom_sniper_v2.handle_scalping_scanner_promoted_target(
+        {
+            "record_id": 2,
+            "code": "000002",
+            "name": "RECENT_FLAT",
+            "strategy": "SCALPING",
+            "trade_type": "SCALP",
+            "position_tag": "SCANNER",
+            "buy_price": 10000,
+            "added_time": 1500.0,
+            "entry_armed_at_epoch": 1495.0,
+            "price_delta_since_first_seen_pct": "0.0",
+        }
+    )
+
+    assert attached is True
+    assert [target["code"] for target in kiwoom_sniper_v2.ACTIVE_TARGETS] == ["000002"]
+    assert published == [
+        (
+            "COMMAND_WS_UNREG",
+            {
+                "codes": ["000001"],
+                "source": "scalping_scanner_watch_budget_reallocation",
+                "reason": "higher_priority_owner_slot_reclaimed",
+            },
+        ),
+        (
+            "COMMAND_WS_REG",
+            {"codes": ["000002"], "source": "scanner_runtime_target_attach"},
+        ),
+    ]
+    assert emitted[-1]["fields"]["runtime_target_attach_outcome"] == "attached"
+    kiwoom_sniper_v2._reset_scalping_dynamic_watch_cap_state()
+
+
+def test_scalping_scanner_promoted_target_blocks_name_code_mismatch(monkeypatch):
+    emitted = []
+    published = []
+    fake_db = _ExpireDB()
+    monkeypatch.setattr(kiwoom_sniper_v2, "ACTIVE_TARGETS", [])
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_latest_stock_name_from_db", lambda code: "두산"
+    )
+    monkeypatch.setattr(kiwoom_sniper_v2, "DB", fake_db)
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda pipeline, name, code, stage, *, record_id=None, fields=None: emitted.append(
+            {
+                "pipeline": pipeline,
+                "name": name,
+                "code": code,
+                "stage": stage,
+                "fields": fields or {},
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    attached = kiwoom_sniper_v2.handle_scalping_scanner_promoted_target(
+        {
+            "record_id": 77,
+            "code": "000150",
+            "name": "아로마티카",
+            "strategy": "SCALPING",
+            "trade_type": "SCALP",
+            "status": "WATCHING",
+            "position_tag": "SCANNER",
+            "buy_price": 5450,
+            "added_time": 1000.0,
+            "entry_armed_at_epoch": 1000.0,
+            "scanner_promotion_id": "SCANPROM-000150-1000000",
+            "scanner_promotion_reason": "price_jump_start_acceleration",
+            "scanner_promotion_emitted_epoch": "1000.000",
+            "source_signature": "PRICE_JUMP_START",
+            "current_price_observed": 5450,
+        }
+    )
+
+    assert attached is False
+    assert kiwoom_sniper_v2.ACTIVE_TARGETS == []
+    assert published == []
+    assert emitted[-1]["stage"] == "scalping_scanner_runtime_target_attach"
+    assert emitted[-1]["fields"]["runtime_target_attach_outcome"] == "skipped"
+    assert (
+        emitted[-1]["fields"]["runtime_target_attach_reason"]
+        == "scanner_identity_name_mismatch"
+    )
+    assert emitted[-1]["fields"]["scanner_identity_payload_name"] == "아로마티카"
+    assert emitted[-1]["fields"]["scanner_identity_db_name"] == "두산"
+    assert emitted[-1]["fields"]["actual_order_submitted"] is False
+    assert emitted[-1]["fields"]["broker_order_forbidden"] is True
+    assert emitted[-1]["fields"]["scanner_identity_mismatch_expired"] is True
+    assert fake_db.calls == [({"status": "EXPIRED"}, False)]
+
+
+def test_scalping_scanner_promoted_target_blocks_source_price_ws_mismatch(monkeypatch):
+    emitted = []
+    published = []
+    fake_db = _ExpireDB()
+    monkeypatch.setattr(kiwoom_sniper_v2, "ACTIVE_TARGETS", [])
+    monkeypatch.setattr(kiwoom_sniper_v2, "_latest_stock_name_from_db", lambda code: "")
+    monkeypatch.setattr(kiwoom_sniper_v2, "DB", fake_db)
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "WS_MANAGER",
+        SimpleNamespace(get_latest_data=lambda code: {"curr": 1_647_000}),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda pipeline, name, code, stage, *, record_id=None, fields=None: emitted.append(
+            {
+                "pipeline": pipeline,
+                "name": name,
+                "code": code,
+                "stage": stage,
+                "fields": fields or {},
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    attached = kiwoom_sniper_v2.handle_scalping_scanner_promoted_target(
+        {
+            "record_id": 77,
+            "code": "000150",
+            "name": "아로마티카",
+            "strategy": "SCALPING",
+            "trade_type": "SCALP",
+            "status": "WATCHING",
+            "position_tag": "SCANNER",
+            "buy_price": 5450,
+            "added_time": 1000.0,
+            "entry_armed_at_epoch": 1000.0,
+            "scanner_promotion_id": "SCANPROM-000150-1000000",
+            "scanner_promotion_reason": "price_jump_start_acceleration",
+            "scanner_promotion_emitted_epoch": "1000.000",
+            "source_signature": "PRICE_JUMP_START",
+            "current_price_observed": 5450,
+        }
+    )
+
+    assert attached is False
+    assert kiwoom_sniper_v2.ACTIVE_TARGETS == []
+    assert published == []
+    assert (
+        emitted[-1]["fields"]["runtime_target_attach_reason"]
+        == "scanner_identity_price_mismatch"
+    )
+    assert emitted[-1]["fields"]["scanner_identity_ws_curr"] == 1_647_000
+    assert emitted[-1]["fields"]["scanner_identity_price_ratio"] > 300
+    assert emitted[-1]["fields"]["scanner_identity_mismatch_expired"] is True
+    assert fake_db.calls == [({"status": "EXPIRED"}, False)]
+
+
+def test_scalping_scanner_promoted_target_refresh_resets_eval_state(monkeypatch):
+    emitted = []
+    published = []
+    existing = {
+        "id": 77,
+        "code": "011930",
+        "name": "OLD",
+        "strategy": "SCALPING",
+        "status": "WATCHING",
+        "position_tag": "SCANNER",
+        "entry_armed_at_epoch": 1000.0,
+        "added_time": 1000.0,
+        "_scanner_last_full_eval_epoch": 1500.0,
+        "_scanner_last_heavy_eval_attempt_epoch": 1500.0,
+        "_scanner_last_heavy_eval_evidence_fingerprint": "old-generation-bbo",
+        "_scanner_last_heavy_eval_explicit_recheck_key": "strength:1:1499.000000",
+        "_scanner_heavy_eval_retry_after_epoch": 1515.0,
+        "_scanner_fast_precheck_logged_at": 1500.0,
+        "_scanner_runtime_queue_lag_logged_at": 1500.0,
+        "_scanner_heavy_eval_lag_logged_at": 1500.0,
+        "_scanner_heavy_queue_enter_epoch": 1500.0,
+        "_scanner_fast_precheck_result": "eligible_for_heavy_entry_eval",
+        "_scanner_fast_precheck_reason": "fast_precheck_pass",
+        "_scanner_fast_precheck_fields": {
+            "fast_precheck_result": "eligible_for_heavy_entry_eval"
+        },
+        "_scanner_watch_queue_lag_count": 2,
+        "_scanner_watch_queue_lag_first_observed_epoch": 1490.0,
+        "_scanner_watch_queue_lag_last_observed_epoch": 1500.0,
+        "_scanner_watch_full_eval_deferred_count": 2,
+        "_scanner_watch_full_eval_deferred_first_observed_epoch": 1490.0,
+        "_scanner_watch_full_eval_deferred_last_observed_epoch": 1500.0,
+        "_scanner_watching_runtime_skip_logged": {
+            "scanner_full_eval_loop_budget_deferred": 1500.0
+        },
+    }
+    older_never_eval = {
+        "id": 88,
+        "code": "000001",
+        "name": "OLDER",
+        "strategy": "SCALPING",
+        "status": "WATCHING",
+        "position_tag": "SCANNER",
+        "entry_armed_at_epoch": 1200.0,
+        "added_time": 1200.0,
+    }
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "ACTIVE_TARGETS", [older_never_eval, existing]
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_resolve_stock_marcap", lambda stock, code: 123456789
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda pipeline, name, code, stage, *, record_id=None, fields=None: emitted.append(
+            {"stage": stage, "fields": fields or {}}
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    refreshed = kiwoom_sniper_v2.handle_scalping_scanner_promoted_target(
+        {
+            "record_id": 77,
+            "code": "011930",
+            "name": "NEW",
+            "strategy": "SCALPING",
+            "status": "WATCHING",
+            "position_tag": "SCANNER",
+            "buy_price": 20500,
+            "added_time": 2000.0,
+            "entry_armed_at_epoch": 2000.0,
+            "scanner_promotion_id": "SCANPROM-011930-2000000",
+            "scanner_promotion_reason": "price_jump_start_acceleration",
+            "scanner_promotion_emitted_epoch": "2000.000",
+            "source_signature": "PRICE_JUMP_START",
+            "current_price_observed": 20500,
+            "price_delta_since_first_seen_pct": "2.35",
+            "comparable_flu_delta_since_first_seen": "1.10",
+            "cntr_str_available": "True",
+            "cntr_str": "145.5",
+        }
+    )
+
+    assert refreshed is True
+    assert existing["entry_armed_at_epoch"] == 2000.0
+    assert existing["scanner_promotion_id"] == "SCANPROM-011930-2000000"
+    assert existing["price_delta_since_first_seen_pct"] == "2.35"
+    assert existing["comparable_flu_delta_since_first_seen"] == "1.10"
+    assert existing["cntr_str"] == "145.5"
+    for key in (
+        "_scanner_last_full_eval_epoch",
+        "_scanner_last_heavy_eval_attempt_epoch",
+        "_scanner_last_heavy_eval_evidence_fingerprint",
+        "_scanner_last_heavy_eval_explicit_recheck_key",
+        "_scanner_heavy_eval_retry_after_epoch",
+        "_scanner_fast_precheck_logged_at",
+        "_scanner_runtime_queue_lag_logged_at",
+        "_scanner_heavy_eval_lag_logged_at",
+        "_scanner_heavy_queue_enter_epoch",
+        "_scanner_fast_precheck_result",
+        "_scanner_fast_precheck_reason",
+        "_scanner_fast_precheck_fields",
+        "_scanner_watch_queue_lag_count",
+        "_scanner_watch_queue_lag_first_observed_epoch",
+        "_scanner_watch_queue_lag_last_observed_epoch",
+        "_scanner_watching_runtime_skip_logged",
+    ):
+        assert key not in existing
+    assert existing["_scanner_watch_full_eval_deferred_count"] == 2
+    assert existing["_scanner_watch_full_eval_deferred_first_observed_epoch"] == 1490.0
+    assert existing["_scanner_watch_full_eval_deferred_last_observed_epoch"] == 1500.0
+    ordered = kiwoom_sniper_v2._runtime_iteration_targets(
+        [older_never_eval, existing],
+        now_ts=2001.0,
+    )
+    assert [target["id"] for target in ordered] == [77, 88]
+    assert emitted[-1]["fields"]["runtime_target_attach_outcome"] == "refreshed"
+    assert published == [
+        (
+            "COMMAND_WS_REG",
+            {"codes": ["011930"], "source": "scanner_runtime_target_refresh"},
+        )
+    ]
+
+
+def test_scanner_runtime_handoff_provenance_preserves_same_generation_only(
+    monkeypatch,
+):
+    monkeypatch.setattr(kiwoom_sniper_v2.time, "time", lambda: 200.0)
+    existing = {
+        "scanner_runtime_handoff_epoch": 100.0,
+        "scanner_runtime_handoff_promotion_id": "PROMO-A",
+    }
+
+    same = kiwoom_sniper_v2._scanner_runtime_handoff_updates(
+        {"scanner_promotion_id": "PROMO-A"},
+        source="promotion_event_refresh",
+        existing=existing,
+    )
+    rotated = kiwoom_sniper_v2._scanner_runtime_handoff_updates(
+        {"scanner_promotion_id": "PROMO-B"},
+        source="promotion_event_refresh",
+        existing=existing,
+    )
+
+    assert same["scanner_runtime_handoff_epoch"] == 100.0
+    assert rotated["scanner_runtime_handoff_epoch"] == 200.0
+    assert rotated["scanner_runtime_handoff_promotion_id"] == "PROMO-B"
+    assert rotated["scanner_attach_provenance_version"] == (
+        "scanner_runtime_handoff_v1"
+    )
+    assert "scanner_attach_epoch" not in same
+    assert "scanner_attach_epoch" not in rotated
+
+
+def test_scalping_scanner_promoted_target_refresh_preserves_higher_positive_delta(
+    monkeypatch,
+):
+    emitted = []
+    published = []
+    existing = {
+        "id": 77,
+        "code": "397030",
+        "name": "에이프릴바이오",
+        "strategy": "SCALPING",
+        "status": "WATCHING",
+        "position_tag": "SCANNER",
+        "entry_armed_at_epoch": 1000.0,
+        "added_time": 1000.0,
+        "scanner_promotion_id": "SCANPROM-397030-1000000",
+        "scanner_promotion_reason": "price_jump_start_acceleration",
+        "scanner_promotion_emitted_epoch": "1000.000",
+        "source_signature": "PRICE_JUMP_START,VOLUME_SURGE_POSITIVE",
+        "price_delta_since_first_seen_pct": "7.72",
+        "comparable_flu_delta_since_first_seen": "7.72",
+        "cntr_str": "181.0",
+    }
+    monkeypatch.setattr(kiwoom_sniper_v2, "ACTIVE_TARGETS", [existing])
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_resolve_stock_marcap", lambda stock, code: 123456789
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda pipeline, name, code, stage, *, record_id=None, fields=None: emitted.append(
+            {"stage": stage, "fields": fields or {}}
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    refreshed = kiwoom_sniper_v2.handle_scalping_scanner_promoted_target(
+        {
+            "record_id": 77,
+            "code": "397030",
+            "name": "에이프릴바이오",
+            "strategy": "SCALPING",
+            "status": "WATCHING",
+            "position_tag": "SCANNER",
+            "buy_price": 15500,
+            "added_time": 2000.0,
+            "entry_armed_at_epoch": 2000.0,
+            "scanner_promotion_id": "SCANPROM-397030-2000000",
+            "scanner_promotion_reason": "price_jump_start_acceleration",
+            "scanner_promotion_emitted_epoch": "2000.000",
+            "source_signature": "PRICE_JUMP_START",
+            "current_price_observed": 15500,
+            "price_delta_since_first_seen_pct": "0.00",
+            "comparable_flu_delta_since_first_seen": "0.00",
+            "cntr_str_available": "True",
+            "cntr_str": "190.0",
+        }
+    )
+
+    assert refreshed is True
+    assert existing["price_delta_since_first_seen_pct"] == "0.00"
+    assert existing["comparable_flu_delta_since_first_seen"] == "0.00"
+    assert existing["entry_armed_at_epoch"] == 2000.0
+    assert existing["added_time"] == 2000.0
+    assert existing["scanner_promotion_id"] == "SCANPROM-397030-2000000"
+    assert existing["scanner_promotion_emitted_epoch"] == "2000.000"
+    assert existing["source_signature"] == "PRICE_JUMP_START"
+    assert existing["scanner_evidence_peak_positive_delta_pct"] == 7.72
+    assert existing["scanner_evidence_peak_promotion_id"] == "SCANPROM-397030-1000000"
+    assert existing["cntr_str"] == "190.0"
+    assert emitted[-1]["fields"]["price_delta_since_first_seen_pct"] == "0.00"
+    assert emitted[-1]["fields"]["scanner_promotion_id"] == "SCANPROM-397030-2000000"
+    assert emitted[-1]["fields"]["scanner_positive_delta_context_preserved"] is True
+    assert (
+        emitted[-1]["fields"]["scanner_positive_delta_context_previous_pct"] == "7.72"
+    )
+    assert (
+        emitted[-1]["fields"]["scanner_positive_delta_context_incoming_pct"] == "0.00"
+    )
+    assert published == [
+        (
+            "COMMAND_WS_REG",
+            {"codes": ["397030"], "source": "scanner_runtime_target_refresh"},
+        )
+    ]
+
+
+def test_scanner_pipeline_stock_snapshot_preserves_positive_promotion_context():
+    snapshot = kiwoom_sniper_v2._scanner_pipeline_stock_snapshot(
+        {
+            "id": 77,
+            "name": "POSITIVE",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "scanner_promotion_id": "SCANPROM-011930-2000000",
+            "scanner_promotion_reason": "price_jump_start_acceleration",
+            "scanner_promotion_emitted_epoch": "2000.000",
+            "source_signature": "PRICE_JUMP_START,VOLUME_SURGE_POSITIVE",
+            "venue": "PREMARKET_KRX_LIKE",
+            "effective_venue": "PREMARKET_KRX_LIKE",
+            "venue_resolution": "consistent_explicit:payload.effective_venue,payload.venue",
+            "venue_source_quality_status": "pass",
+            "venue_unknown_reviewed_reason": "not_applicable",
+            "market_session_bucket": "krx_like_premarket",
+            "rising_missed_effective_venue": "PREMARKET_KRX_LIKE",
+            "rising_missed_market_session_bucket": "krx_like_premarket",
+            "entry_armed_at_epoch": 2000.0,
+            "added_time": 2000.0,
+            "current_price_observed": 20500,
+            "price_delta_since_first_seen_pct": "2.35",
+            "comparable_flu_delta_since_first_seen": "1.10",
+            "cntr_str_available": "True",
+            "cntr_str": "145.5",
+            "_scanner_fast_precheck_result": "eligible_for_heavy_entry_eval",
+        }
+    )
+
+    assert snapshot["price_delta_since_first_seen_pct"] == "2.35"
+    assert snapshot["comparable_flu_delta_since_first_seen"] == "1.10"
+    assert snapshot["current_price_observed"] == 20500
+    assert snapshot["cntr_str"] == "145.5"
+    assert snapshot["effective_venue"] == "PREMARKET_KRX_LIKE"
+    assert snapshot["market_session_bucket"] == "krx_like_premarket"
+    assert snapshot["venue_source_quality_status"] == "pass"
+    assert snapshot["rising_missed_effective_venue"] == "PREMARKET_KRX_LIKE"
+    assert "_scanner_fast_precheck_result" not in snapshot
+
+
+def test_scalping_scanner_promoted_target_does_not_override_holding(monkeypatch):
+    emitted = []
+    published = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "ACTIVE_TARGETS",
+        [
+            {
+                "code": "005930",
+                "name": "SAMSUNG",
+                "strategy": "SCALPING",
+                "status": "HOLDING",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda pipeline, name, code, stage, *, record_id=None, fields=None: emitted.append(
+            {"stage": stage, "fields": fields or {}}
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    attached = kiwoom_sniper_v2.handle_scalping_scanner_promoted_target(
+        {
+            "record_id": 78,
+            "code": "005930",
+            "name": "SAMSUNG",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "buy_price": 70000,
+            "scanner_promotion_id": "SCANPROM-005930-1000001",
+            "scanner_promotion_emitted_epoch": "1000.001",
+            "source_signature": "PRICE_JUMP_START",
+        }
+    )
+
+    assert attached is False
+    assert kiwoom_sniper_v2.ACTIVE_TARGETS == [
+        {
+            "code": "005930",
+            "name": "SAMSUNG",
+            "strategy": "SCALPING",
+            "status": "HOLDING",
+        }
+    ]
+    assert published == []
+    assert emitted[-1]["fields"]["runtime_target_attach_outcome"] == "skipped"
+    assert (
+        emitted[-1]["fields"]["runtime_target_attach_reason"]
+        == "same_symbol_active_order_or_holding"
+    )
+    assert emitted[-1]["fields"]["existing_status"] == "HOLDING"
+    assert (
+        emitted[-1]["fields"]["existing_actual_order_submitted"]
+        == "not_applicable_existing_actual_order_submitted"
+    )
+
+
+def test_scalping_scanner_promoted_target_ignores_non_real_same_symbol_observation(
+    monkeypatch,
+):
+    emitted = []
+    published = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "ACTIVE_TARGETS",
+        [
+            {
+                "id": 11,
+                "code": "005930",
+                "name": "SIM",
+                "strategy": "SCALPING",
+                "status": "HOLDING",
+                "position_tag": "SIM",
+                "actual_order_submitted": False,
+                "simulation_owner": "scalp_ai_buy_all",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_resolve_stock_marcap", lambda stock, code: 0
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda pipeline, name, code, stage, *, record_id=None, fields=None: emitted.append(
+            {"stage": stage, "fields": fields or {}}
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    attached = kiwoom_sniper_v2.handle_scalping_scanner_promoted_target(
+        {
+            "record_id": 78,
+            "code": "005930",
+            "name": "SAMSUNG",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "buy_price": 70000,
+            "added_time": 1000.0,
+            "scanner_promotion_id": "SCANPROM-005930-1000001",
+            "scanner_promotion_emitted_epoch": "1000.001",
+            "source_signature": "PRICE_JUMP_START",
+        }
+    )
+
+    assert attached is True
+    assert len(kiwoom_sniper_v2.ACTIVE_TARGETS) == 2
+    assert kiwoom_sniper_v2.ACTIVE_TARGETS[-1]["status"] == "WATCHING"
+    assert published == [
+        (
+            "COMMAND_WS_REG",
+            {"codes": ["005930"], "source": "scanner_runtime_target_attach"},
+        )
+    ]
+    assert emitted[-1]["fields"]["runtime_target_attach_outcome"] == "attached"
+
+
+def test_scalping_scanner_promoted_target_refreshes_existing_watching_and_ws(
+    monkeypatch,
+):
+    emitted = []
+    published = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "ACTIVE_TARGETS",
+        [
+            {
+                "id": 10,
+                "code": "005930",
+                "name": "OLD",
+                "strategy": "SCALPING",
+                "status": "WATCHING",
+                "position_tag": "SCANNER",
+                "buy_price": 69000,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda pipeline, name, code, stage, *, record_id=None, fields=None: emitted.append(
+            {"stage": stage, "fields": fields or {}}
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    refreshed = kiwoom_sniper_v2.handle_scalping_scanner_promoted_target(
+        {
+            "record_id": 77,
+            "code": "005930",
+            "name": "NEW",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "buy_price": 70000,
+            "added_time": 1001.0,
+            "scanner_promotion_id": "SCANPROM-005930-1001000",
+            "scanner_promotion_emitted_epoch": "1001.000",
+            "source_signature": "PRICE_JUMP_START",
+        }
+    )
+
+    assert refreshed is True
+    assert kiwoom_sniper_v2.ACTIVE_TARGETS[0]["id"] == 77
+    assert kiwoom_sniper_v2.ACTIVE_TARGETS[0]["name"] == "NEW"
+    assert kiwoom_sniper_v2.ACTIVE_TARGETS[0]["buy_price"] == 70000
+    assert kiwoom_sniper_v2.ACTIVE_TARGETS[0]["entry_armed_at_epoch"] == 1001.0
+    assert published == [
+        (
+            "COMMAND_WS_REG",
+            {"codes": ["005930"], "source": "scanner_runtime_target_refresh"},
+        )
+    ]
+    assert emitted[-1]["fields"]["runtime_target_attach_outcome"] == "refreshed"
+
+
+def test_scalping_scanner_promoted_target_refreshes_recency_from_promotion_epoch(
+    monkeypatch,
+):
+    emitted = []
+    published = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "ACTIVE_TARGETS",
+        [
+            {
+                "id": 10,
+                "code": "005930",
+                "name": "OLD",
+                "strategy": "SCALPING",
+                "status": "WATCHING",
+                "position_tag": "SCANNER",
+                "buy_price": 69000,
+                "entry_armed_at_epoch": 900.0,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda pipeline, name, code, stage, *, record_id=None, fields=None: emitted.append(
+            {"stage": stage, "fields": fields or {}}
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    refreshed = kiwoom_sniper_v2.handle_scalping_scanner_promoted_target(
+        {
+            "record_id": 77,
+            "code": "005930",
+            "name": "NEW",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "buy_price": 70000,
+            "added_time": 1001.0,
+            "scanner_promotion_id": "SCANPROM-005930-1200000",
+            "scanner_promotion_emitted_epoch": "1200.000",
+            "source_signature": "PRICE_JUMP_START",
+        }
+    )
+
+    assert refreshed is True
+    assert kiwoom_sniper_v2.ACTIVE_TARGETS[0]["entry_armed_at_epoch"] == 1200.0
+    assert (
+        kiwoom_sniper_v2._runtime_iteration_targets(
+            kiwoom_sniper_v2.ACTIVE_TARGETS, now_ts=1205.0
+        )[0]["id"]
+        == 77
+    )
+    assert published == [
+        (
+            "COMMAND_WS_REG",
+            {"codes": ["005930"], "source": "scanner_runtime_target_refresh"},
+        )
+    ]
+    assert emitted[-1]["fields"]["runtime_target_attach_outcome"] == "refreshed"
+
+
+def test_scalping_scanner_promoted_target_hydrates_missing_record_id(monkeypatch):
+    emitted = []
+    published = []
+    monkeypatch.setattr(kiwoom_sniper_v2, "ACTIVE_TARGETS", [])
+    monkeypatch.setattr(kiwoom_sniper_v2, "DB", _RuntimeRecordDB(record_id=88))
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_resolve_stock_marcap", lambda stock, code: 0
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda pipeline, name, code, stage, *, record_id=None, fields=None: emitted.append(
+            {"stage": stage, "fields": fields or {}}
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    attached = kiwoom_sniper_v2.handle_scalping_scanner_promoted_target(
+        {
+            "code": "005930",
+            "name": "SAMSUNG",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "buy_price": 70000,
+            "scanner_promotion_id": "SCANPROM-005930-1001001",
+            "scanner_promotion_emitted_epoch": "1001.001",
+            "source_signature": "PRICE_JUMP_START",
+        }
+    )
+
+    assert attached is True
+    assert kiwoom_sniper_v2.ACTIVE_TARGETS[0]["id"] == 88
+    assert emitted[-1]["fields"]["runtime_record_id"] == 88
+    assert published == [
+        (
+            "COMMAND_WS_REG",
+            {"codes": ["005930"], "source": "scanner_runtime_target_attach"},
+        )
+    ]
+
+
+def test_runtime_added_time_uses_scanner_entry_armed_epoch():
+    target = {
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "added_time": 2000.0,
+        "entry_armed_at_epoch": 1234.5,
+    }
+
+    assert (
+        kiwoom_sniper_v2._runtime_added_time_for_target(target, now_ts=3000.0) == 1234.5
+    )
+
+
+def test_runtime_added_time_keeps_non_scanner_added_time():
+    target = {
+        "strategy": "SCALPING",
+        "position_tag": "SCALP_BASE",
+        "added_time": 2000.0,
+        "entry_armed_at_epoch": 1234.5,
+    }
+
+    assert (
+        kiwoom_sniper_v2._runtime_added_time_for_target(target, now_ts=3000.0) == 2000.0
+    )
+
+
+def test_scalping_fifo_candidates_preserve_scanner_entry_armed_order():
+    watching = [
+        {
+            "id": 1,
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "added_time": 3000.0,
+            "entry_armed_at_epoch": 900.0,
+        },
+        {
+            "id": 2,
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "added_time": 1000.0,
+            "entry_armed_at_epoch": 2500.0,
+        },
+        {
+            "id": 3,
+            "strategy": "SCALPING",
+            "position_tag": "VCP_CANDID",
+            "added_time": 100.0,
+            "entry_armed_at_epoch": 100.0,
+        },
+        {
+            "id": 4,
+            "strategy": "KOSPI_ML",
+            "position_tag": "BASE",
+            "added_time": 10.0,
+        },
+    ]
+
+    ordered = kiwoom_sniper_v2._scalping_fifo_candidates(watching, now_ts=4000.0)
+
+    assert [target["id"] for target in ordered] == [1, 2]
+
+
+def test_runtime_iteration_targets_prioritizes_recent_scanner_without_mutating_targets():
+    targets = [
+        {
+            "id": "holding",
+            "code": "000004",
+            "status": "HOLDING",
+            "strategy": "SCALPING",
+        },
+        {
+            "id": "old",
+            "code": "000001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1000.0,
+        },
+        {
+            "id": "base",
+            "code": "000003",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCALP_BASE",
+            "added_time": 900.0,
+        },
+        {
+            "id": "new",
+            "code": "000002",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1200.0,
+        },
+        {
+            "id": "ordered",
+            "code": "000005",
+            "status": "BUY_ORDERED",
+            "strategy": "SCALPING",
+        },
+    ]
+
+    ordered = kiwoom_sniper_v2._runtime_iteration_targets(targets, now_ts=1300.0)
+
+    assert [target["id"] for target in ordered] == [
+        "ordered",
+        "holding",
+        "new",
+        "old",
+        "base",
+    ]
+    assert [target["id"] for target in targets] == [
+        "holding",
+        "old",
+        "base",
+        "new",
+        "ordered",
+    ]
+
+
+def test_deadline_scheduler_orders_precheck_before_holding_and_recovery(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_mode",
+        "deadline_v1",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_venues",
+        frozenset({"KRX", "PREMARKET_KRX_LIKE", "NXT"}),
+        raising=False,
+    )
+    targets = [
+        {
+            "id": "recovery",
+            "code": "000001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "effective_venue": "KRX",
+            "_scanner_scheduler_lane": "recovery",
+            "_scanner_scheduler_deadline_epoch": 1001.0,
+        },
+        {
+            "id": "holding",
+            "code": "000002",
+            "status": "HOLDING",
+            "strategy": "SCALPING",
+            "actual_order_submitted": True,
+        },
+        {
+            "id": "precheck",
+            "code": "000003",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "effective_venue": "NXT",
+            "_scanner_scheduler_lane": "fast_precheck",
+            "_scanner_scheduler_deadline_epoch": 1002.0,
+        },
+        {
+            "id": "receipt",
+            "code": "000004",
+            "status": "BUY_ORDERED",
+            "strategy": "SCALPING",
+        },
+    ]
+
+    ordered = kiwoom_sniper_v2._runtime_iteration_targets(targets, now_ts=1000.0)
+
+    assert [target["id"] for target in ordered] == [
+        "receipt",
+        "precheck",
+        "holding",
+        "recovery",
+    ]
+
+
+@pytest.mark.parametrize("lane", ["commit", "fast_precheck"])
+def test_deadline_scheduler_attach_yields_to_ready_precheck(lane):
+    pending = {
+        "id": "pending",
+        "code": "000003",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "scanner_generation_id": "GEN-000003-1",
+        "_scanner_scheduler_lane": lane,
+    }
+
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_attach_must_yield_to_runtime_work([pending])
+        is True
+    )
+
+
+@pytest.mark.parametrize("lane", ["recovery", "heavy_eval", "", None])
+def test_deadline_scheduler_attach_can_interleave_after_precheck(lane):
+    target = {
+        "id": "post-precheck",
+        "code": "000003",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "scanner_generation_id": "GEN-000003-1",
+        "_scanner_scheduler_lane": lane,
+    }
+
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_attach_must_yield_to_runtime_work([target])
+        is False
+    )
+
+
+@pytest.mark.parametrize("status", ["BUY_ORDERED", "SELL_ORDERED"])
+def test_deadline_scheduler_attach_yields_to_order_safety_work(status):
+    ordered = {
+        "id": "ordered",
+        "code": "000004",
+        "status": status,
+        "strategy": "SCALPING",
+        "scanner_generation_id": "GEN-000004-1",
+        "_scanner_scheduler_lane": "fast_precheck",
+    }
+
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_attach_must_yield_to_runtime_work([ordered])
+        is True
+    )
+
+
+def test_deadline_scheduler_attach_does_not_starve_behind_later_precheck():
+    ordinary_head = {
+        "id": "holding-head",
+        "code": "000003",
+        "status": "HOLDING",
+        "strategy": "SCALPING",
+    }
+    later_precheck = {
+        "id": "later-precheck",
+        "code": "000004",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "scanner_generation_id": "GEN-000004-1",
+        "_scanner_scheduler_lane": "fast_precheck",
+    }
+
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_attach_must_yield_to_runtime_work(
+            [ordinary_head, later_precheck]
+        )
+        is False
+    )
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_attach_must_yield_to_runtime_work(
+            [later_precheck, ordinary_head]
+        )
+        is True
+    )
+
+
+def test_deadline_scheduler_runtime_drains_one_attach_between_prechecks():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+
+    assert source.count("_drain_scanner_promotion_inbox(") == 2
+    assert source.count("max_items=1") >= 2
+    assert "attach_guard_queue = _runtime_iteration_targets(" in source
+    assert (
+        "_scanner_scheduler_attach_must_yield_to_runtime_work(\n"
+        "                attach_guard_queue\n"
+        "            )" in source
+    )
+    assert (
+        "_scanner_scheduler_attach_must_yield_to_runtime_work(\n"
+        "                    runtime_work_queue\n"
+        "                )" in source
+    )
+
+
+def test_deadline_scheduler_runtime_requeues_continuation_before_attach_drain():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    helper_idx = source.index("def _admit_runtime_live_attaches")
+    continuation_idx = source.index(
+        "_runtime_requeue_pending_scanner_scheduler_targets(",
+        helper_idx,
+    )
+    drain_idx = source.index(
+        "_drain_scanner_promotion_inbox(",
+        helper_idx,
+    )
+
+    assert continuation_idx < drain_idx
+
+
+def test_runtime_admit_live_scanner_attaches_prioritizes_new_target_without_mutating_active_targets():
+    old = {
+        "id": "old",
+        "code": "000001",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "entry_armed_at_epoch": 1000.0,
+        "price_delta_since_first_seen_pct": 1.0,
+    }
+    new = {
+        "id": "new",
+        "code": "000002",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "entry_armed_at_epoch": 1200.0,
+        "price_delta_since_first_seen_pct": 5.0,
+    }
+    active_targets = [old, new]
+
+    queue, admitted = kiwoom_sniper_v2._runtime_admit_live_scanner_attaches(
+        [old],
+        active_targets,
+        processed_target_ids=set(),
+        admitted_target_ids=set(),
+        now_ts=1300.0,
+    )
+
+    assert admitted == [new]
+    assert queue == [new, old]
+    assert active_targets == [old, new]
+
+
+def test_deadline_runtime_live_attach_does_not_jump_registered_precheck(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_mode",
+        "deadline_v1",
+        raising=False,
+    )
+    registered = {
+        "id": "registered",
+        "code": "000001",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "effective_venue": "NXT",
+        "entry_armed_at_epoch": 1000.0,
+        "scanner_generation_id": "000001:PROMO:r1",
+        "_scanner_scheduler_lane": "fast_precheck",
+        "_scanner_scheduler_deadline_epoch": 1002.0,
+    }
+    db_poll_attach = {
+        "id": "db-poll",
+        "code": "000002",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "effective_venue": "NXT",
+        "entry_armed_at_epoch": 1100.0,
+    }
+    ordered = {
+        "id": "ordered",
+        "code": "000003",
+        "status": "SELL_ORDERED",
+        "strategy": "SCALPING",
+    }
+
+    queue, admitted = kiwoom_sniper_v2._runtime_admit_live_scanner_attaches(
+        [registered, ordered],
+        [registered, ordered, db_poll_attach],
+        processed_target_ids=set(),
+        admitted_target_ids=set(),
+        now_ts=1200.0,
+    )
+
+    assert admitted == [db_poll_attach]
+    assert queue == [ordered, registered, db_poll_attach]
+
+
+def test_runtime_prioritizes_refreshed_generation_even_if_target_was_already_queued():
+    ordered = {
+        "id": "ordered",
+        "code": "000001",
+        "status": "BUY_ORDERED",
+        "strategy": "SCALPING",
+    }
+    refreshed = {
+        "id": "refreshed",
+        "code": "000002",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "scanner_generation_id": "000002:PROMO-NEW:r2",
+        "_scanner_scheduler_lane": "fast_precheck",
+    }
+    holding = {
+        "id": "holding",
+        "code": "000003",
+        "status": "HOLDING",
+        "strategy": "SCALPING",
+    }
+
+    queue = kiwoom_sniper_v2._runtime_prioritize_registered_scanner_targets(
+        [holding, refreshed, ordered],
+        [refreshed, refreshed],
+    )
+
+    assert queue == [ordered, refreshed, holding]
+    assert queue.count(refreshed) == 1
+
+
+def test_runtime_discards_old_delayed_heavy_for_refreshed_generation():
+    refreshed = {
+        "id": "refreshed",
+        "code": "000002",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "scanner_generation_id": "000002:PROMO-NEW:r2",
+    }
+    other = {
+        "id": "other",
+        "code": "000003",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "scanner_generation_id": "000003:PROMO:r1",
+    }
+    delayed = [
+        (refreshed, "000002", {"curr": 10_000}, 1000.0),
+        (other, "000003", {"curr": 20_000}, 1001.0),
+    ]
+
+    kept = kiwoom_sniper_v2._runtime_discard_superseded_delayed_heavy(
+        delayed,
+        [refreshed],
+    )
+
+    assert kept == [delayed[1]]
+    assert delayed == [
+        (refreshed, "000002", {"curr": 10_000}, 1000.0),
+        (other, "000003", {"curr": 20_000}, 1001.0),
+    ]
+
+
+def test_deadline_scheduler_runtime_surfaces_inbox_registration_before_target_revisit():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    helper_idx = source.index("def _admit_runtime_live_attaches")
+    drain_idx = source.index(
+        "drain_result = _drain_scanner_promotion_inbox(",
+        helper_idx,
+    )
+    prioritize_idx = source.index(
+        "_runtime_prioritize_registered_scanner_targets(",
+        drain_idx,
+    )
+    live_admit_idx = source.index(
+        "_runtime_admit_live_scanner_attaches(",
+        prioritize_idx,
+    )
+
+    assert drain_idx < prioritize_idx < live_admit_idx
+
+
+def test_runtime_requeues_scheduler_continuation_before_holding(monkeypatch):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_mode",
+        "deadline_v1",
+        raising=False,
+    )
+    scheduler = object()
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_scanner_scheduler_target_generation",
+        lambda current_scheduler, target: (
+            object() if current_scheduler is scheduler else None
+        ),
+    )
+    ordered = {
+        "id": "ordered",
+        "code": "000001",
+        "status": "SELL_ORDERED",
+        "strategy": "SCALPING",
+    }
+    holding = {
+        "id": "holding",
+        "code": "000002",
+        "status": "HOLDING",
+        "strategy": "SCALPING",
+        "actual_order_submitted": True,
+    }
+    continuation = {
+        "id": "continuation",
+        "code": "000003",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "effective_venue": "NXT",
+        "scanner_generation_id": "000003:PROMO-1:r1",
+        "_scanner_scheduler_lane": "fast_precheck",
+        "_scanner_scheduler_deadline_epoch": 1001.0,
+    }
+
+    queue, requeued = (
+        kiwoom_sniper_v2._runtime_requeue_pending_scanner_scheduler_targets(
+            [ordered, holding],
+            [ordered, holding, continuation],
+            scheduler=scheduler,
+            now_ts=1000.0,
+        )
+    )
+
+    assert requeued == [continuation]
+    assert [target["id"] for target in queue] == [
+        "ordered",
+        "continuation",
+        "holding",
+    ]
+
+
+@pytest.mark.parametrize("lane", ["commit", "fast_precheck", "recovery"])
+def test_runtime_requeues_each_main_scheduler_continuation_lane(monkeypatch, lane):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_mode",
+        "deadline_v1",
+        raising=False,
+    )
+    scheduler = object()
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_scanner_scheduler_target_generation",
+        lambda current_scheduler, target: (
+            object() if current_scheduler is scheduler else None
+        ),
+    )
+    continuation = {
+        "id": lane,
+        "code": "000003",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "effective_venue": "NXT",
+        "scanner_generation_id": "000003:PROMO-1:r1",
+        "_scanner_scheduler_lane": lane,
+        "_scanner_scheduler_deadline_epoch": 1001.0,
+    }
+
+    queue, requeued = (
+        kiwoom_sniper_v2._runtime_requeue_pending_scanner_scheduler_targets(
+            [],
+            [continuation],
+            scheduler=scheduler,
+            now_ts=1000.0,
+        )
+    )
+
+    assert queue == [continuation]
+    assert requeued == [continuation]
+
+
+def test_runtime_does_not_duplicate_queued_scheduler_continuation(monkeypatch):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_mode",
+        "deadline_v1",
+        raising=False,
+    )
+    scheduler = object()
+    continuation = {
+        "id": "queued",
+        "code": "000003",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "effective_venue": "NXT",
+        "scanner_generation_id": "000003:PROMO-1:r1",
+        "_scanner_scheduler_lane": "fast_precheck",
+        "_scanner_scheduler_deadline_epoch": 1001.0,
+    }
+
+    queue, requeued = (
+        kiwoom_sniper_v2._runtime_requeue_pending_scanner_scheduler_targets(
+            [continuation],
+            [continuation],
+            scheduler=scheduler,
+            now_ts=1000.0,
+        )
+    )
+
+    assert queue == [continuation]
+    assert requeued == []
+
+
+def test_runtime_does_not_requeue_scheduler_target_processed_in_same_loop(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_mode",
+        "deadline_v1",
+        raising=False,
+    )
+    scheduler = object()
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_scanner_scheduler_target_generation",
+        lambda current_scheduler, target: (
+            object() if current_scheduler is scheduler else None
+        ),
+    )
+    continuation = {
+        "id": "processed",
+        "code": "000003",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "effective_venue": "NXT",
+        "scanner_generation_id": "000003:PROMO-1:r1",
+        "_scanner_scheduler_lane": "fast_precheck",
+        "_scanner_scheduler_deadline_epoch": 1001.0,
+    }
+
+    queue, requeued = (
+        kiwoom_sniper_v2._runtime_requeue_pending_scanner_scheduler_targets(
+            [],
+            [continuation],
+            scheduler=scheduler,
+            now_ts=1000.0,
+            processed_target_ids={id(continuation)},
+        )
+    )
+
+    assert queue == []
+    assert requeued == []
+
+
+def test_runtime_requeues_expired_heavy_target_once_for_fresh_precheck():
+    target = {"code": "000001"}
+    queue = [{"code": "000002"}]
+
+    inserted = kiwoom_sniper_v2._runtime_requeue_expired_heavy_target(
+        queue,
+        target,
+    )
+    duplicate = kiwoom_sniper_v2._runtime_requeue_expired_heavy_target(
+        queue,
+        target,
+    )
+
+    assert inserted is True
+    assert duplicate is False
+    assert queue == [target, {"code": "000002"}]
+
+
+def test_runtime_scheduler_surfaces_deferred_edf_winner_once():
+    winner = {
+        "code": "460930",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "scanner_generation_id": "460930:PROMO-1:r1",
+    }
+    candidate = {
+        "code": "100090",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "scanner_generation_id": "100090:PROMO-2:r1",
+    }
+    decision = SimpleNamespace(
+        item=SimpleNamespace(
+            generation=SimpleNamespace(generation_id="460930:PROMO-1:r1")
+        )
+    )
+
+    assert (
+        kiwoom_sniper_v2._runtime_scheduler_deferred_winner_target(
+            decision,
+            [candidate, winner],
+        )
+        is winner
+    )
+    assert (
+        kiwoom_sniper_v2._runtime_scheduler_deferred_winner_target(
+            decision,
+            [candidate, winner],
+            forced_target_ids={id(winner)},
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "exclusion_name",
+    ["queued_target_ids", "delayed_target_ids", "forced_target_ids"],
+)
+def test_runtime_scheduler_does_not_duplicate_deferred_edf_winner(
+    exclusion_name,
+):
+    winner = {
+        "code": "460930",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "scanner_generation_id": "460930:PROMO-1:r1",
+    }
+    decision = SimpleNamespace(
+        item=SimpleNamespace(
+            generation=SimpleNamespace(generation_id="460930:PROMO-1:r1")
+        )
+    )
+
+    assert (
+        kiwoom_sniper_v2._runtime_scheduler_deferred_winner_target(
+            decision,
+            [winner],
+            **{exclusion_name: {id(winner)}},
+        )
+        is None
+    )
+
+
+def test_runtime_scheduler_does_not_surface_stale_deferred_generation():
+    stale = {
+        "code": "460930",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "scanner_generation_id": "460930:PROMO-NEW:r2",
+    }
+    decision = SimpleNamespace(
+        item=SimpleNamespace(
+            generation=SimpleNamespace(generation_id="460930:PROMO-OLD:r1")
+        )
+    )
+
+    assert (
+        kiwoom_sniper_v2._runtime_scheduler_deferred_winner_target(
+            decision,
+            [stale],
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("lane", ["fast_precheck", "recovery"])
+def test_scheduler_lane_owns_missing_ws_before_generic_recovery(
+    monkeypatch,
+    lane,
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_mode",
+        "deadline_v1",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_venues",
+        frozenset({"NXT"}),
+        raising=False,
+    )
+    scheduler = object()
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_scanner_scheduler_target_generation",
+        lambda current_scheduler, target: (
+            object() if current_scheduler is scheduler else None
+        ),
+    )
+    target = {
+        "code": "100090",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "effective_venue": "NXT",
+        "scanner_generation_id": "100090:PROMO-1:r1",
+        "_scanner_scheduler_lane": lane,
+    }
+
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_owns_missing_ws_lane(
+            target,
+            scheduler=scheduler,
+        )
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    "mode,lane,venue",
+    [
+        ("legacy", "fast_precheck", "NXT"),
+        ("deadline_v1", "heavy_eval", "NXT"),
+        ("deadline_v1", "fast_precheck", "UNKNOWN"),
+    ],
+)
+def test_generic_recovery_keeps_non_scheduler_missing_ws_ownership(
+    monkeypatch,
+    mode,
+    lane,
+    venue,
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_mode",
+        mode,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_venues",
+        frozenset({"NXT"}),
+        raising=False,
+    )
+    scheduler = object()
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_scanner_scheduler_target_generation",
+        lambda current_scheduler, target: (
+            object() if current_scheduler is scheduler else None
+        ),
+    )
+    target = {
+        "code": "100090",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "effective_venue": venue,
+        "scanner_generation_id": "100090:PROMO-1:r1",
+        "_scanner_scheduler_lane": lane,
+    }
+
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_owns_missing_ws_lane(
+            target,
+            scheduler=scheduler,
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "mode,venue,generation_available,expected_reason",
+    [
+        (
+            "deadline_v1",
+            "UNKNOWN",
+            False,
+            "scanner_scheduler_canonical_venue_missing_fail_closed",
+        ),
+        (
+            "deadline_v1",
+            "NXT",
+            False,
+            "scanner_scheduler_generation_unavailable_fail_closed",
+        ),
+        ("deadline_v1", "NXT", True, ""),
+        ("legacy", "UNKNOWN", False, ""),
+    ],
+)
+def test_scheduler_pre_recovery_gate_blocks_invalid_runtime_provenance(
+    monkeypatch,
+    mode,
+    venue,
+    generation_available,
+    expected_reason,
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_mode",
+        mode,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_venues",
+        frozenset({"NXT"}),
+        raising=False,
+    )
+    scheduler = object()
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_scanner_scheduler_target_generation",
+        lambda current_scheduler, target: (
+            object()
+            if generation_available and current_scheduler is scheduler
+            else None
+        ),
+    )
+    target = {
+        "code": "100090",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "effective_venue": venue,
+        "scanner_generation_id": "100090:PROMO-1:r1",
+    }
+
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_pre_recovery_block_reason(
+            target,
+            scheduler=scheduler,
+        )
+        == expected_reason
+    )
+
+
+def test_scheduler_pre_recovery_gate_runs_before_blocking_ws_recovery():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+
+    gate_idx = source.index("_scanner_scheduler_pre_recovery_block_reason(")
+    recovery_idx = source.index("_recover_missing_ws_snapshot(", gate_idx)
+
+    assert gate_idx < recovery_idx
+
+
+@pytest.mark.parametrize(
+    "mode,lane",
+    [("legacy", "fast_precheck"), ("deadline_v1", "heavy_eval")],
+)
+def test_runtime_does_not_requeue_non_main_scheduler_owner(monkeypatch, mode, lane):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_mode",
+        mode,
+        raising=False,
+    )
+    scheduler = object()
+    target = {
+        "id": "excluded",
+        "code": "000003",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "effective_venue": "NXT",
+        "scanner_generation_id": "000003:PROMO-1:r1",
+        "_scanner_scheduler_lane": lane,
+        "_scanner_scheduler_deadline_epoch": 1001.0,
+    }
+
+    queue, requeued = (
+        kiwoom_sniper_v2._runtime_requeue_pending_scanner_scheduler_targets(
+            [],
+            [target],
+            scheduler=scheduler,
+            now_ts=1000.0,
+        )
+    )
+
+    assert queue == []
+    assert requeued == []
+
+
+def test_runtime_does_not_requeue_stale_scheduler_generation(monkeypatch):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_mode",
+        "deadline_v1",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_scanner_scheduler_target_generation",
+        lambda scheduler, target: None,
+    )
+    target = {
+        "id": "stale",
+        "code": "000003",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "effective_venue": "NXT",
+        "scanner_generation_id": "000003:PROMO-OLD:r1",
+        "_scanner_scheduler_lane": "fast_precheck",
+        "_scanner_scheduler_deadline_epoch": 1001.0,
+    }
+
+    queue, requeued = (
+        kiwoom_sniper_v2._runtime_requeue_pending_scanner_scheduler_targets(
+            [],
+            [target],
+            scheduler=object(),
+            now_ts=1000.0,
+        )
+    )
+
+    assert queue == []
+    assert requeued == []
+
+
+def test_runtime_admit_live_scanner_attach_gets_first_precheck_after_safety_barrier():
+    ordered = {
+        "id": "ordered",
+        "code": "000010",
+        "status": "SELL_ORDERED",
+        "strategy": "SCALPING",
+    }
+    holding = {
+        "id": "holding",
+        "code": "000011",
+        "status": "HOLDING",
+        "strategy": "SCALPING",
+        "actual_order_submitted": True,
+    }
+    old_high_priority = {
+        "id": "old",
+        "code": "000012",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "price_delta_since_first_seen_pct": 5.0,
+    }
+    new_low_priority = {
+        "id": "new",
+        "code": "000013",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "price_delta_since_first_seen_pct": 0.0,
+    }
+
+    queue, admitted = kiwoom_sniper_v2._runtime_admit_live_scanner_attaches(
+        [ordered, holding, old_high_priority],
+        [ordered, holding, old_high_priority, new_low_priority],
+        processed_target_ids=set(),
+        admitted_target_ids=set(),
+        now_ts=1300.0,
+    )
+
+    assert admitted == [new_low_priority]
+    assert [target["id"] for target in queue] == [
+        "ordered",
+        "holding",
+        "new",
+        "old",
+    ]
+    rank_fields = kiwoom_sniper_v2._runtime_queue_rank_fields(queue)
+    assert rank_fields["queue_rank_by_obj"][id(new_low_priority)] == 3
+    assert rank_fields["scanner_rank_by_obj"][id(new_low_priority)] == 1
+    assert rank_fields["pre_scanner_runtime_count"] == 2
+
+
+def test_runtime_admit_live_scanner_attaches_is_bounded_and_does_not_reprocess():
+    old = {
+        "id": "old",
+        "code": "000001",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+    }
+    first = {
+        "id": "first",
+        "code": "000002",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "price_delta_since_first_seen_pct": 5.0,
+    }
+    second = {
+        "id": "second",
+        "code": "000003",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "price_delta_since_first_seen_pct": 4.0,
+    }
+
+    queue, admitted = kiwoom_sniper_v2._runtime_admit_live_scanner_attaches(
+        [],
+        [old, first, second],
+        processed_target_ids={id(old)},
+        admitted_target_ids=set(),
+        now_ts=1300.0,
+        max_new_targets=1,
+    )
+
+    assert admitted == [first]
+    assert queue == [first]
+    queue, admitted = kiwoom_sniper_v2._runtime_admit_live_scanner_attaches(
+        queue,
+        [old, first, second],
+        processed_target_ids={id(old)},
+        admitted_target_ids={id(first)},
+        now_ts=1301.0,
+        max_new_targets=1,
+    )
+    assert admitted == []
+    assert queue == [first]
+
+
+def test_runtime_iteration_targets_moves_non_real_holding_behind_scanner():
+    targets = [
+        {
+            "id": "sim_holding",
+            "code": "000010",
+            "status": "HOLDING",
+            "strategy": "SCALPING",
+            "simulation_owner": "scalp_ai_buy_all",
+            "actual_order_submitted": False,
+        },
+        {
+            "id": "probe_holding",
+            "code": "000011",
+            "status": "HOLDING",
+            "strategy": "SWING",
+            "swing_intraday_probe": True,
+        },
+        {
+            "id": "real_holding",
+            "code": "000012",
+            "status": "HOLDING",
+            "strategy": "SCALPING",
+            "actual_order_submitted": True,
+        },
+        {
+            "id": "scanner",
+            "code": "000013",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1200.0,
+        },
+        {
+            "id": "ordered",
+            "code": "000014",
+            "status": "SELL_ORDERED",
+            "strategy": "SCALPING",
+        },
+    ]
+
+    ordered = kiwoom_sniper_v2._runtime_iteration_targets(targets, now_ts=1300.0)
+    context = kiwoom_sniper_v2._runtime_queue_context(targets, now_ts=1300.0)
+
+    assert [target["id"] for target in ordered] == [
+        "ordered",
+        "real_holding",
+        "scanner",
+        "sim_holding",
+        "probe_holding",
+    ]
+    assert [target["id"] for target in targets] == [
+        "sim_holding",
+        "probe_holding",
+        "real_holding",
+        "scanner",
+        "ordered",
+    ]
+    assert context["real_holding_count"] == 1
+    assert context["non_real_holding_count"] == 2
+    assert context["pre_scanner_runtime_count"] == 2
+
+
+def test_runtime_iteration_targets_prioritizes_armed_real_shallow_recheck():
+    targets = [
+        {
+            "id": "ordinary_holding",
+            "code": "000010",
+            "status": "HOLDING",
+            "strategy": "SCALPING",
+        },
+        {
+            "id": "armed_recheck",
+            "code": "000011",
+            "status": "HOLDING",
+            "strategy": "SCALPING",
+            "shallow_source_gap_recheck_armed": True,
+        },
+        {
+            "id": "scanner",
+            "code": "000012",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+        },
+        {
+            "id": "ordered",
+            "code": "000013",
+            "status": "BUY_ORDERED",
+            "strategy": "SCALPING",
+        },
+    ]
+
+    ordered = kiwoom_sniper_v2._runtime_iteration_targets(targets, now_ts=1300.0)
+
+    assert [target["id"] for target in ordered] == [
+        "ordered",
+        "armed_recheck",
+        "ordinary_holding",
+        "scanner",
+    ]
+
+
+def test_runtime_iteration_targets_does_not_prioritize_false_string_shallow_recheck():
+    targets = [
+        {
+            "id": "false_armed_holding",
+            "code": "000010",
+            "status": "HOLDING",
+            "strategy": "SCALPING",
+            "shallow_source_gap_recheck_armed": "false",
+        },
+        {
+            "id": "ordinary_holding",
+            "code": "000011",
+            "status": "HOLDING",
+            "strategy": "SCALPING",
+        },
+    ]
+
+    ordered = kiwoom_sniper_v2._runtime_iteration_targets(targets, now_ts=1300.0)
+
+    assert [target["id"] for target in ordered] == [
+        "false_armed_holding",
+        "ordinary_holding",
+    ]
+
+
+def test_runtime_iteration_targets_uses_added_time_when_scanner_armed_epoch_missing():
+    targets = [
+        {
+            "id": "old",
+            "code": "000001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "added_time": 1000.0,
+        },
+        {
+            "id": "new",
+            "code": "000002",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "added_time": 1200.0,
+        },
+    ]
+
+    ordered = kiwoom_sniper_v2._runtime_iteration_targets(targets, now_ts=1300.0)
+
+    assert [target["id"] for target in ordered] == ["new", "old"]
+
+
+def test_runtime_iteration_targets_prioritizes_due_strength_recheck_scanner():
+    targets = [
+        {
+            "id": "new_never_eval",
+            "code": "000001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1300.0,
+        },
+        {
+            "id": "pending_recheck",
+            "code": "000002",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1200.0,
+            "_scanner_last_full_eval_epoch": 1400.0,
+            "entry_strength_momentum_recheck_pending": True,
+            "entry_strength_momentum_recheck_after_epoch": 1499.0,
+        },
+        {
+            "id": "real_holding",
+            "code": "000003",
+            "status": "HOLDING",
+            "strategy": "SCALPING",
+            "actual_order_submitted": True,
+        },
+    ]
+
+    ordered = kiwoom_sniper_v2._runtime_iteration_targets(targets, now_ts=1500.0)
+
+    assert [target["id"] for target in ordered] == [
+        "real_holding",
+        "pending_recheck",
+        "new_never_eval",
+    ]
+
+
+def test_scanner_strength_recheck_waiting_waits_until_due_epoch():
+    target = {
+        "entry_strength_momentum_recheck_pending": True,
+        "entry_strength_momentum_recheck_after_epoch": 1502.0,
+    }
+
+    assert (
+        kiwoom_sniper_v2._scanner_strength_recheck_waiting(target, now_ts=1500.0)
+        is True
+    )
+    assert (
+        kiwoom_sniper_v2._scanner_strength_recheck_pending(target, now_ts=1500.0)
+        is False
+    )
+    assert (
+        kiwoom_sniper_v2._scanner_strength_recheck_waiting(target, now_ts=1502.0)
+        is False
+    )
+    assert (
+        kiwoom_sniper_v2._scanner_strength_recheck_pending(target, now_ts=1502.0)
+        is True
+    )
+
+
+def test_runtime_iteration_targets_round_robins_scanner_full_eval():
+    targets = [
+        {
+            "id": "processed_new",
+            "code": "000001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1300.0,
+            "_scanner_last_full_eval_epoch": 1400.0,
+        },
+        {
+            "id": "never_eval_old",
+            "code": "000002",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1200.0,
+        },
+        {
+            "id": "processed_oldest_eval",
+            "code": "000003",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1100.0,
+            "_scanner_last_full_eval_epoch": 1390.0,
+        },
+    ]
+
+    ordered = kiwoom_sniper_v2._runtime_iteration_targets(targets, now_ts=1500.0)
+
+    assert [target["id"] for target in ordered] == [
+        "never_eval_old",
+        "processed_oldest_eval",
+        "processed_new",
+    ]
+
+
+def test_runtime_iteration_targets_prioritizes_positive_scanner_delta_before_zero_delta():
+    targets = [
+        {
+            "id": "zero_delta_newer",
+            "code": "000001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1500.0,
+            "price_delta_since_first_seen_pct": "0.00",
+        },
+        {
+            "id": "positive_delta_older",
+            "code": "000002",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1400.0,
+            "price_delta_since_first_seen_pct": "13.95",
+        },
+    ]
+
+    ordered = kiwoom_sniper_v2._runtime_iteration_targets(targets, now_ts=1600.0)
+
+    assert [target["id"] for target in ordered] == [
+        "positive_delta_older",
+        "zero_delta_newer",
+    ]
+
+
+def test_runtime_iteration_targets_orders_positive_scanner_by_delta_magnitude():
+    targets = [
+        {
+            "id": "small_positive",
+            "code": "000001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1500.0,
+            "price_delta_since_first_seen_pct": "0.70",
+        },
+        {
+            "id": "large_positive",
+            "code": "000002",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1400.0,
+            "price_delta_since_first_seen_pct": "13.95",
+        },
+    ]
+
+    ordered = kiwoom_sniper_v2._runtime_iteration_targets(targets, now_ts=1600.0)
+
+    assert [target["id"] for target in ordered] == ["large_positive", "small_positive"]
+
+
+def test_runtime_iteration_targets_demotes_under_10000_scanner_for_heavy_eval():
+    targets = [
+        {
+            "id": "under_10000_large_delta",
+            "code": "000001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1500.0,
+            "buy_price": 9900,
+            "price_delta_since_first_seen_pct": "13.95",
+        },
+        {
+            "id": "tenk_small_delta",
+            "code": "000002",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1400.0,
+            "buy_price": 10000,
+            "price_delta_since_first_seen_pct": "0.70",
+        },
+    ]
+
+    ordered = kiwoom_sniper_v2._runtime_iteration_targets(targets, now_ts=1600.0)
+
+    assert [target["id"] for target in ordered] == [
+        "tenk_small_delta",
+        "under_10000_large_delta",
+    ]
+
+
+def test_runtime_iteration_targets_applies_rising_missed_selection_prior_delta(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "rising_missed_selection_rank_delta",
+        lambda target: 20.0 if target.get("id") == "positive_prior" else -20.0,
+    )
+    targets = [
+        {
+            "id": "risk_prior",
+            "code": "000001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1500.0,
+            "price_delta_since_first_seen_pct": "1.50",
+        },
+        {
+            "id": "positive_prior",
+            "code": "000002",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1400.0,
+            "price_delta_since_first_seen_pct": "1.50",
+        },
+    ]
+
+    ordered = kiwoom_sniper_v2._runtime_iteration_targets(targets, now_ts=1600.0)
+
+    assert [target["id"] for target in ordered] == ["positive_prior", "risk_prior"]
+
+
+def test_runtime_iteration_targets_prioritizes_due_rising_recheck():
+    targets = [
+        {
+            "id": "evaluated_positive",
+            "code": "000001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1400.0,
+            "_scanner_last_full_eval_epoch": 1500.0,
+            "price_delta_since_first_seen_pct": "1.20",
+        },
+        {
+            "id": "due_recheck",
+            "code": "000002",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1450.0,
+            "_scanner_last_full_eval_epoch": 1510.0,
+            "_scanner_rising_cooldown_recheck_after_epoch": 1599.0,
+            "price_delta_since_first_seen_pct": "0.80",
+        },
+    ]
+
+    ordered = kiwoom_sniper_v2._runtime_iteration_targets(targets, now_ts=1600.0)
+
+    assert [target["id"] for target in ordered] == ["due_recheck", "evaluated_positive"]
+
+
+def test_runtime_iteration_targets_prioritizes_market_gainer_awaiting_first_ai(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_MARKET_GAINER_FIRST_EVAL_RETENTION_SEC", "180"
+    )
+    targets = [
+        {
+            "id": "due_recheck",
+            "code": "000001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1450.0,
+            "_scanner_last_full_eval_epoch": 1510.0,
+            "_scanner_rising_cooldown_recheck_after_epoch": 1599.0,
+            "price_delta_since_first_seen_pct": "3.00",
+        },
+        {
+            "id": "market_gainer_awaiting_ai",
+            "code": "000002",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "source_signature": "PREV_CLOSE_GAINER,VALUE_TOP",
+            "scanner_promotion_emitted_epoch": 1500.0,
+            "entry_armed_at_epoch": 1500.0,
+            "_scanner_last_full_eval_epoch": 1550.0,
+            "_scanner_last_heavy_eval_attempt_epoch": 1550.0,
+            "price_delta_since_first_seen_pct": "0.50",
+        },
+    ]
+
+    ordered = kiwoom_sniper_v2._runtime_iteration_targets(targets, now_ts=1600.0)
+
+    assert [target["id"] for target in ordered] == [
+        "market_gainer_awaiting_ai",
+        "due_recheck",
+    ]
+
+
+def test_runtime_iteration_targets_releases_market_gainer_after_evaluated_ai(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_MARKET_GAINER_FIRST_EVAL_RETENTION_SEC", "180"
+    )
+    targets = [
+        {
+            "id": "market_gainer_evaluated",
+            "code": "000001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "source_signature": "PREV_CLOSE_GAINER",
+            "scanner_promotion_emitted_epoch": 1500.0,
+            "entry_armed_at_epoch": 1500.0,
+            "_scanner_last_full_eval_epoch": 1550.0,
+            "last_watching_ai_attempt_completed_at": 1551.0,
+            "last_watching_ai_attempt_result_source": "live",
+            "last_watching_ai_attempt_evaluation_status": "evaluated",
+            "last_watching_ai_attempt_trusted": True,
+            "price_delta_since_first_seen_pct": "3.00",
+        },
+        {
+            "id": "due_recheck",
+            "code": "000002",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1450.0,
+            "_scanner_last_full_eval_epoch": 1510.0,
+            "_scanner_rising_cooldown_recheck_after_epoch": 1599.0,
+            "price_delta_since_first_seen_pct": "0.50",
+        },
+    ]
+
+    ordered = kiwoom_sniper_v2._runtime_iteration_targets(targets, now_ts=1600.0)
+
+    assert [target["id"] for target in ordered] == [
+        "due_recheck",
+        "market_gainer_evaluated",
+    ]
+
+
+def test_runtime_iteration_targets_prioritizes_due_latency_direct_recheck():
+    targets = [
+        {
+            "id": "evaluated_positive",
+            "code": "000001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1400.0,
+            "_scanner_last_full_eval_epoch": 1500.0,
+            "price_delta_since_first_seen_pct": "1.20",
+        },
+        {
+            "id": "due_latency_direct_recheck",
+            "code": "000002",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1450.0,
+            "_scanner_last_full_eval_epoch": 1510.0,
+            "_scanner_rising_latency_direct_recheck_after_epoch": 1599.0,
+            "price_delta_since_first_seen_pct": "0.80",
+        },
+    ]
+
+    assert not kiwoom_sniper_v2._scanner_rising_recheck_pending(
+        targets[1], now_ts=1598.0
+    )
+    assert kiwoom_sniper_v2._scanner_rising_recheck_pending(targets[1], now_ts=1600.0)
+
+    ordered = kiwoom_sniper_v2._runtime_iteration_targets(targets, now_ts=1600.0)
+
+    assert [target["id"] for target in ordered] == [
+        "due_latency_direct_recheck",
+        "evaluated_positive",
+    ]
+
+
+def test_runtime_iteration_targets_prioritizes_due_terminal_hardgate_recheck():
+    targets = [
+        {
+            "id": "evaluated_positive",
+            "code": "000001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1400.0,
+            "_scanner_last_full_eval_epoch": 1500.0,
+            "price_delta_since_first_seen_pct": "1.20",
+        },
+        {
+            "id": "due_terminal_hardgate_recheck",
+            "code": "000002",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1450.0,
+            "_scanner_last_full_eval_epoch": 1510.0,
+            "_scanner_rising_terminal_hardgate_recheck_after_epoch": 1599.0,
+            "price_delta_since_first_seen_pct": "0.80",
+        },
+    ]
+
+    ordered = kiwoom_sniper_v2._runtime_iteration_targets(targets, now_ts=1600.0)
+
+    assert [target["id"] for target in ordered] == [
+        "due_terminal_hardgate_recheck",
+        "evaluated_positive",
+    ]
+
+
+def test_runtime_iteration_targets_delays_cooldown_waiting_scanner_behind_fresh_candidate():
+    targets = [
+        {
+            "id": "cooldown_waiting",
+            "code": "000001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1500.0,
+            "_scanner_rising_cooldown_recheck_after_epoch": 1660.0,
+            "price_delta_since_first_seen_pct": "5.00",
+        },
+        {
+            "id": "fresh_candidate",
+            "code": "000002",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1400.0,
+            "price_delta_since_first_seen_pct": "1.20",
+        },
+    ]
+
+    ordered = kiwoom_sniper_v2._runtime_iteration_targets(targets, now_ts=1600.0)
+
+    assert [target["id"] for target in ordered] == [
+        "fresh_candidate",
+        "cooldown_waiting",
+    ]
+
+
+def test_runtime_iteration_targets_promotes_cooldown_recheck_when_due():
+    targets = [
+        {
+            "id": "cooldown_due",
+            "code": "000001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1500.0,
+            "_scanner_rising_cooldown_recheck_after_epoch": 1599.0,
+            "price_delta_since_first_seen_pct": "0.80",
+        },
+        {
+            "id": "fresh_candidate",
+            "code": "000002",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1400.0,
+            "price_delta_since_first_seen_pct": "1.20",
+        },
+    ]
+
+    ordered = kiwoom_sniper_v2._runtime_iteration_targets(targets, now_ts=1600.0)
+
+    assert [target["id"] for target in ordered] == ["cooldown_due", "fresh_candidate"]
+
+
+def test_scanner_promotion_latency_trace_fields_measure_ws_and_heavy_latency():
+    target = {
+        "id": 77,
+        "code": "123456",
+        "name": "TEST",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "entry_armed_at_epoch": 1000.0,
+        "scanner_promotion_id": "SCANPROM-123456-1000",
+        "scanner_promotion_emitted_epoch": "1000.000",
+        "source_signature": "REALTIME_RANK_START",
+        "venue": "KRX",
+        "effective_venue": "KRX",
+        "venue_resolution": "scanner_session_clock:krx_regular",
+        "market_session_bucket": "krx_regular",
+        "_scanner_fast_precheck_result": "eligible_for_heavy_entry_eval",
+        "_scanner_fast_precheck_reason": "fast_precheck_pass",
+    }
+    ws_data = {
+        "curr": 10000,
+        "last_realtime_type_ts": {"0B": 1002.5},
+        "strength_momentum_history": [{"ts": 1003.0}],
+    }
+
+    fields = kiwoom_sniper_v2._scanner_promotion_latency_trace_fields(
+        target,
+        ws_data,
+        now_ts=1005.0,
+        trace_phase="fast_precheck",
+        fast_precheck_fields={
+            "fast_precheck_result": "eligible_for_heavy_entry_eval",
+            "fast_precheck_reason": "fast_precheck_pass",
+        },
+        heavy_queue_enter_epoch=1004.0,
+    )
+
+    assert (
+        fields["decision_authority"] == "real_scalping_scanner_latency_observation_only"
+    )
+    assert fields["actual_order_submitted"] is False
+    assert fields["broker_order_forbidden"] is True
+    assert fields["effective_venue"] == "KRX"
+    assert fields["venue_resolution"] == "scanner_session_clock:krx_regular"
+    assert fields["market_session_bucket"] == "krx_regular"
+    assert fields["promotion_to_trace_sec"] == 5.0
+    assert fields["promotion_to_last_0b_sec"] == 2.5
+    assert fields["last_0b_to_trace_sec"] == 2.5
+    assert fields["promotion_to_strength_history_sec"] == 3.0
+    assert fields["heavy_queue_enter_epoch"] == "1004.000"
+    assert fields["fast_precheck_result"] == "eligible_for_heavy_entry_eval"
+
+
+def test_scanner_positive_delta_uses_promotion_fallback_when_stock_delta_is_zero(
+    monkeypatch,
+):
+    _enable_scanner_rising_ws_gap_test_mode(monkeypatch)
+
+    def fake_find_context(stock, *, min_delta, require_bid_imbalance):
+        assert min_delta == 0.5
+        assert require_bid_imbalance is False
+        return {
+            "allowed": True,
+            "price_delta_since_first_seen_pct": "7.80",
+            "scanner_context_source": "promotion_event_fallback",
+            "scanner_context_emitted_epoch": "1782175601.000",
+            "scanner_promotion_reason": "price_jump_start_acceleration",
+            "source_signature": "PRICE_JUMP_START,VOLUME_SURGE_POSITIVE,REALTIME_RANK_START",
+        }
+
+    stock = {
+        "code": "010690",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "price_delta_since_first_seen_pct": "0.00",
+    }
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.sniper_state_handlers,
+        "_find_scanner_rising_strength_context",
+        fake_find_context,
+    )
+
+    assert kiwoom_sniper_v2._scanner_positive_delta_value(stock) == 7.8
+    assert stock["price_delta_since_first_seen_pct"] == "7.80"
+    assert stock["_scanner_rising_context_source"] == "promotion_event_fallback"
+
+
+def test_scanner_positive_delta_does_not_reuse_history_for_current_generation(
+    monkeypatch,
+):
+    _enable_scanner_rising_ws_gap_test_mode(monkeypatch)
+    fallback_called = False
+
+    def fake_find_context(*args, **kwargs):
+        nonlocal fallback_called
+        fallback_called = True
+        return {
+            "allowed": True,
+            "price_delta_since_first_seen_pct": "7.80",
+        }
+
+    stock = {
+        "code": "010690",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "scanner_generation_id": "010690:PROMO-CURRENT:r1",
+        "price_delta_since_first_seen_pct": "0.25",
+    }
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.sniper_state_handlers,
+        "_find_scanner_rising_strength_context",
+        fake_find_context,
+    )
+
+    assert kiwoom_sniper_v2._scanner_positive_delta_value(stock) == 0.25
+    assert fallback_called is False
+    assert stock["price_delta_since_first_seen_pct"] == "0.25"
+
+
+def test_rising_strength_context_does_not_scan_history_for_current_generation(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.sniper_state_handlers,
+        "_load_scanner_promotion_context_events",
+        lambda *_args, **_kwargs: pytest.fail(
+            "current scheduler generation must not scan promotion history"
+        ),
+    )
+    stock = {
+        "code": "300080",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "scanner_generation_id": "300080:PROMO-CURRENT:r1",
+        "scanner_promotion_emitted_epoch": "1784887168.434",
+        "scanner_promotion_reason": "price_jump_multisource_confirmation",
+        "source_signature": (
+            "PRICE_JUMP_START,VOLUME_SURGE_POSITIVE,REALTIME_RANK_START"
+        ),
+        "price_delta_since_first_seen_pct": "0.51",
+    }
+
+    result = (
+        kiwoom_sniper_v2.sniper_state_handlers._find_scanner_rising_strength_context(
+            stock,
+            min_delta=1.0,
+            require_bid_imbalance=False,
+        )
+    )
+
+    assert result["allowed"] is False
+    assert result["skip_reason"] == "price_delta_below_min"
+    assert result["scanner_context_source"] == "current_generation_only"
+    assert result["historical_promotion_fallback_blocked"] is True
+
+
+def test_scalping_fifo_overflow_preserves_unevaluated_scanner_before_generic_watching(
+    monkeypatch, tmp_path
+):
+    _disable_scanner_operator_runtime_overrides(monkeypatch, tmp_path)
+    targets = [
+        {
+            "id": "scanner_never_eval_old",
+            "code": "000001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1000.0,
+        },
+        {
+            "id": "generic_new",
+            "code": "000002",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "MIDDLE",
+            "added_time": 1400.0,
+        },
+        {
+            "id": "scanner_evaluated",
+            "code": "000003",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1300.0,
+            "_scanner_last_full_eval_epoch": 1450.0,
+        },
+    ]
+
+    overflow_order = kiwoom_sniper_v2._scalping_fifo_overflow_candidates(
+        targets, now_ts=1500.0
+    )
+
+    assert [target["id"] for target in overflow_order] == [
+        "generic_new",
+        "scanner_evaluated",
+        "scanner_never_eval_old",
+    ]
+
+
+def test_scalping_fifo_overflow_preserves_positive_scanner_before_zero_delta_scanner(
+    monkeypatch, tmp_path
+):
+    _disable_scanner_operator_runtime_overrides(monkeypatch, tmp_path)
+    targets = [
+        {
+            "id": "positive_delta_old",
+            "code": "000001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1000.0,
+            "price_delta_since_first_seen_pct": "13.95",
+        },
+        {
+            "id": "zero_delta_new",
+            "code": "000002",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1400.0,
+            "price_delta_since_first_seen_pct": "0.00",
+        },
+    ]
+
+    overflow_order = kiwoom_sniper_v2._scalping_fifo_overflow_candidates(
+        targets, now_ts=1500.0
+    )
+
+    assert [target["id"] for target in overflow_order] == [
+        "zero_delta_new",
+        "positive_delta_old",
+    ]
+
+
+def test_scalping_fifo_overflow_evicts_under_10000_scanner_before_same_state(
+    monkeypatch, tmp_path
+):
+    _disable_scanner_operator_runtime_overrides(monkeypatch, tmp_path)
+    targets = [
+        {
+            "id": "under_10000_positive",
+            "code": "000001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1000.0,
+            "buy_price": 9900,
+            "price_delta_since_first_seen_pct": "13.95",
+        },
+        {
+            "id": "tenk_zero",
+            "code": "000002",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1400.0,
+            "buy_price": 10000,
+            "price_delta_since_first_seen_pct": "0.00",
+        },
+    ]
+
+    overflow_order = kiwoom_sniper_v2._scalping_fifo_overflow_candidates(
+        targets, now_ts=1500.0
+    )
+
+    assert [target["id"] for target in overflow_order] == [
+        "under_10000_positive",
+        "tenk_zero",
+    ]
+
+
+def test_scalping_fifo_overflow_preserves_evaluated_rising_scanner_before_zero_delta_scanner(
+    monkeypatch, tmp_path
+):
+    _disable_scanner_operator_runtime_overrides(monkeypatch, tmp_path)
+    targets = [
+        {
+            "id": "evaluated_positive_delta_old",
+            "code": "000001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1000.0,
+            "_scanner_last_full_eval_epoch": 1200.0,
+            "price_delta_since_first_seen_pct": "2.35",
+        },
+        {
+            "id": "zero_delta_new",
+            "code": "000002",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1400.0,
+            "price_delta_since_first_seen_pct": "0.00",
+        },
+    ]
+
+    overflow_order = kiwoom_sniper_v2._scalping_fifo_overflow_candidates(
+        targets, now_ts=1500.0
+    )
+
+    assert [target["id"] for target in overflow_order] == [
+        "zero_delta_new",
+        "evaluated_positive_delta_old",
+    ]
+
+
+def test_scalping_fifo_overflow_preserves_recent_scanner_promotion_grace(
+    monkeypatch, tmp_path
+):
+    _disable_scanner_operator_runtime_overrides(monkeypatch, tmp_path)
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FIFO_NEW_PROMOTION_GRACE_SEC", "60")
+    targets = [
+        {
+            "id": "positive_delta_old",
+            "code": "000001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1000.0,
+            "price_delta_since_first_seen_pct": "1.20",
+        },
+        {
+            "id": "recent_zero_delta",
+            "code": "000002",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1495.0,
+            "price_delta_since_first_seen_pct": "0.00",
+        },
+    ]
+
+    overflow_order = kiwoom_sniper_v2._scalping_fifo_overflow_candidates(
+        targets, now_ts=1500.0
+    )
+
+    assert [target["id"] for target in overflow_order] == [
+        "positive_delta_old",
+        "recent_zero_delta",
+    ]
+
+
+def test_scalping_fifo_overflow_keeps_scanner_candidates_without_mutating_input_order(
+    monkeypatch, tmp_path
+):
+    _disable_scanner_operator_runtime_overrides(monkeypatch, tmp_path)
+    targets = [
+        {
+            "id": "scanner_never_eval",
+            "code": "000001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1200.0,
+        },
+        {
+            "id": "generic_old",
+            "code": "000002",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "MIDDLE",
+            "added_time": 1100.0,
+        },
+    ]
+
+    overflow_order = kiwoom_sniper_v2._scalping_fifo_overflow_candidates(
+        targets, now_ts=1500.0
+    )
+
+    assert [target["id"] for target in targets] == ["scanner_never_eval", "generic_old"]
+    assert [target["id"] for target in overflow_order] == [
+        "generic_old",
+        "scanner_never_eval",
+    ]
+
+
+def test_scanner_full_eval_max_per_loop_env(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_SCANNER_OPERATOR_RUNTIME_OVERRIDE_PATH",
+        tmp_path / "missing_operator_runtime_overrides.env",
+    )
+    _reset_scanner_hot_override_cache()
+    monkeypatch.delenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_MAX_PER_LOOP", raising=False)
+    assert kiwoom_sniper_v2._scanner_full_eval_max_per_loop() == 8
+
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_MAX_PER_LOOP", "3")
+    assert kiwoom_sniper_v2._scanner_full_eval_max_per_loop() == 3
+
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_MAX_PER_LOOP", "0")
+    assert kiwoom_sniper_v2._scanner_full_eval_max_per_loop() == 1
+    _reset_scanner_hot_override_cache()
+
+
+def test_scanner_rising_full_eval_relief_defaults_to_aggressive_budget_and_uses_env(
+    monkeypatch,
+):
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCANNER_RISING_FULL_EVAL_EXTRA_PER_LOOP", raising=False
+    )
+    assert kiwoom_sniper_v2._scanner_rising_full_eval_extra_per_loop() == 8
+
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_RISING_FULL_EVAL_EXTRA_PER_LOOP", "4")
+    assert kiwoom_sniper_v2._scanner_rising_full_eval_extra_per_loop() == 4
+
+
+def test_scalping_fifo_max_active_env(monkeypatch, tmp_path):
+    _disable_scanner_operator_runtime_overrides(monkeypatch, tmp_path)
+    kiwoom_sniper_v2._reset_scalping_dynamic_watch_cap_state()
+    monkeypatch.delenv("KORSTOCKSCAN_SCALPING_WATCHING_MAX_ACTIVE", raising=False)
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_CAP_ENABLED", raising=False
+    )
+    assert kiwoom_sniper_v2._scalping_fifo_max_active() == 16
+
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_MAX_ACTIVE", "12")
+    assert kiwoom_sniper_v2._scalping_fifo_max_active() == 12
+
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_MAX_ACTIVE", "0")
+    assert kiwoom_sniper_v2._scalping_fifo_max_active() == 1
+    kiwoom_sniper_v2._reset_scalping_dynamic_watch_cap_state()
+
+
+def test_scalping_watching_ttl_sec_env(monkeypatch, tmp_path):
+    _disable_scanner_operator_runtime_overrides(monkeypatch, tmp_path)
+    monkeypatch.delenv("KORSTOCKSCAN_SCALPING_WATCHING_TTL_SEC", raising=False)
+    assert kiwoom_sniper_v2._scalping_watching_ttl_sec() == 1800.0
+
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_TTL_SEC", "900")
+    assert kiwoom_sniper_v2._scalping_watching_ttl_sec() == 900.0
+
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_TTL_SEC", "60")
+    assert kiwoom_sniper_v2._scalping_watching_ttl_sec() == 300.0
+
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_TTL_SEC", "99999")
+    assert kiwoom_sniper_v2._scalping_watching_ttl_sec() == 7200.0
+
+
+def test_scalping_dynamic_watch_cap_reduces_without_restart(monkeypatch, tmp_path):
+    _disable_scanner_operator_runtime_overrides(monkeypatch, tmp_path)
+    kiwoom_sniper_v2._reset_scalping_dynamic_watch_cap_state()
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_MAX_ACTIVE", "24")
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_CAP_ENABLED", "true")
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_MIN_ACTIVE", "18")
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_PRESSURE_MS", "12000")
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_COOLDOWN_SEC", "0")
+
+    effective = kiwoom_sniper_v2._update_scalping_dynamic_watch_cap(
+        19000.0,
+        now_ts=1000.0,
+        buy_time_allowed=True,
+    )
+
+    assert effective == 22
+    assert kiwoom_sniper_v2._scalping_fifo_max_active() == 22
+    kiwoom_sniper_v2._reset_scalping_dynamic_watch_cap_state()
+
+
+def test_scalping_dynamic_watch_cap_recovers_gradually(monkeypatch, tmp_path):
+    _disable_scanner_operator_runtime_overrides(monkeypatch, tmp_path)
+    kiwoom_sniper_v2._reset_scalping_dynamic_watch_cap_state()
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_MAX_ACTIVE", "24")
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_CAP_ENABLED", "true")
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_MIN_ACTIVE", "18")
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_PRESSURE_MS", "12000")
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_RELIEF_MS", "7000")
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_COOLDOWN_SEC", "0")
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_RECOVERY_STREAK", "3")
+
+    assert (
+        kiwoom_sniper_v2._update_scalping_dynamic_watch_cap(
+            19000.0, now_ts=1000.0, buy_time_allowed=True
+        )
+        == 22
+    )
+    assert (
+        kiwoom_sniper_v2._update_scalping_dynamic_watch_cap(
+            6000.0, now_ts=1001.0, buy_time_allowed=True
+        )
+        == 22
+    )
+    assert (
+        kiwoom_sniper_v2._update_scalping_dynamic_watch_cap(
+            6000.0, now_ts=1002.0, buy_time_allowed=True
+        )
+        == 22
+    )
+    assert (
+        kiwoom_sniper_v2._update_scalping_dynamic_watch_cap(
+            6000.0, now_ts=1003.0, buy_time_allowed=True
+        )
+        == 23
+    )
+
+    kiwoom_sniper_v2._reset_scalping_dynamic_watch_cap_state()
+
+
+def test_scalping_dynamic_watch_cap_clamps_existing_state_to_hot_min(
+    monkeypatch, tmp_path
+):
+    _disable_scanner_operator_runtime_overrides(monkeypatch, tmp_path)
+    kiwoom_sniper_v2._reset_scalping_dynamic_watch_cap_state()
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_MAX_ACTIVE", "16")
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_CAP_ENABLED", "true")
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_MIN_ACTIVE", "8")
+    kiwoom_sniper_v2._SCALPING_DYNAMIC_WATCH_CAP_STATE["effective_cap"] = 8
+
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_MIN_ACTIVE", "10")
+
+    assert kiwoom_sniper_v2._scalping_fifo_max_active() == 10
+    assert kiwoom_sniper_v2._SCALPING_DYNAMIC_WATCH_CAP_STATE["effective_cap"] == 10
+    kiwoom_sniper_v2._reset_scalping_dynamic_watch_cap_state()
+
+
+def test_scalping_dynamic_watch_cap_disabled_keeps_base(monkeypatch, tmp_path):
+    _disable_scanner_operator_runtime_overrides(monkeypatch, tmp_path)
+    kiwoom_sniper_v2._reset_scalping_dynamic_watch_cap_state()
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_MAX_ACTIVE", "24")
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_CAP_ENABLED", "false")
+
+    assert (
+        kiwoom_sniper_v2._update_scalping_dynamic_watch_cap(
+            30000.0, now_ts=1000.0, buy_time_allowed=True
+        )
+        == 24
+    )
+    assert kiwoom_sniper_v2._scalping_fifo_max_active() == 24
+    kiwoom_sniper_v2._reset_scalping_dynamic_watch_cap_state()
+
+
+def test_initial_ws_registration_groups_caps_scanner_hot_tier(monkeypatch, tmp_path):
+    _disable_scanner_operator_runtime_overrides(monkeypatch, tmp_path)
+    kiwoom_sniper_v2._reset_scalping_dynamic_watch_cap_state()
+    monkeypatch.setenv("KORSTOCKSCAN_SWING_REAL_WATCHING_ENABLED", "true")
+    monkeypatch.setenv("KORSTOCKSCAN_SCALPING_WATCHING_MAX_ACTIVE", "2")
+    targets = [
+        {
+            "id": "hold",
+            "code": "000001",
+            "status": "HOLDING",
+            "strategy": "SCALPING",
+            "position_tag": "SCALP_BASE",
+        },
+        {
+            "id": "base",
+            "code": "000002",
+            "status": "WATCHING",
+            "strategy": "KOSPI_ML",
+            "position_tag": "META_V2",
+        },
+        {
+            "id": "scanner_old_eval",
+            "code": "100001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1000.0,
+            "_scanner_last_full_eval_epoch": 1010.0,
+        },
+        {
+            "id": "scanner_keep_fresh",
+            "code": "100002",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1020.0,
+        },
+        {
+            "id": "scanner_keep_rising",
+            "code": "100003",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "entry_armed_at_epoch": 1030.0,
+            "price_delta_since_first_seen_pct": "2.5",
+        },
+        {
+            "id": "expired",
+            "code": "999999",
+            "status": "EXPIRED",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+        },
+    ]
+
+    priority_codes, scanner_codes = kiwoom_sniper_v2._initial_ws_registration_groups(
+        targets, now_ts=1100.0
+    )
+
+    assert priority_codes == ["000001", "000002"]
+    assert scanner_codes == ["100002", "100003"]
+    kiwoom_sniper_v2._reset_scalping_dynamic_watch_cap_state()
+
+
+def test_micro_collection_feedback_publishes_exact_date_source_only_set(monkeypatch):
+    published = []
+    monkeypatch.setenv("SCALP_MICRO_REVERSION_OBSERVER_ENABLED", "true")
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "load_exact_date_collection_targets",
+        lambda effective_date: {
+            "status": "loaded",
+            "effective_date": effective_date,
+            "registration_items": ["111111_AL", "222222_NX"],
+        },
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.event_bus,
+        "publish",
+        lambda topic, payload: published.append((topic, payload)),
+    )
+
+    result = kiwoom_sniper_v2._publish_micro_reversion_collection_target_set(
+        now=datetime(2026, 8, 18, 8, 30),
+        protected_runtime_codes=["111111", "333333_AL", "bad"],
+    )
+
+    assert result["status"] == "loaded"
+    assert published[0][0] == "COMMAND_MICRO_REVERSION_OBSERVATION_SET"
+    assert published[0][1]["effective_date"] == "2026-08-18"
+    assert published[0][1]["registration_items"] == ["111111_AL", "222222_NX"]
+    assert published[0][1]["protected_runtime_codes"] == ["111111", "333333"]
+    assert published[0][1]["trading_runtime_effect"] is False
+    assert published[0][1]["market_data_subscription_effect"] is True
+    assert published[0][1]["manual_control_exclusion_applied"] is False
+
+
+def test_swing_watching_default_off_excludes_ws_and_runtime(monkeypatch):
+    monkeypatch.delenv("KORSTOCKSCAN_SWING_REAL_WATCHING_ENABLED", raising=False)
+    targets = [
+        {
+            "id": "swing",
+            "code": "000002",
+            "status": "WATCHING",
+            "strategy": "KOSPI_ML",
+            "position_tag": "META_V2",
+        },
+        {
+            "id": "kosdaq",
+            "code": "000003",
+            "status": "WATCHING",
+            "strategy": "KOSDAQ_ML",
+            "position_tag": "RUNNER",
+        },
+        {
+            "id": "hold",
+            "code": "000001",
+            "status": "HOLDING",
+            "strategy": "KOSPI_ML",
+            "position_tag": "META_V2",
+        },
+        {
+            "id": "scanner",
+            "code": "100001",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+        },
+    ]
+
+    priority_codes, scanner_codes = kiwoom_sniper_v2._initial_ws_registration_groups(
+        targets, now_ts=1100.0
+    )
+    iteration_codes = [
+        target["code"]
+        for target in kiwoom_sniper_v2._runtime_iteration_targets(
+            targets, now_ts=1100.0
+        )
+    ]
+
+    assert priority_codes == ["000001"]
+    assert scanner_codes == ["100001"]
+    assert iteration_codes == ["000001", "100001"]
+
+
+def test_runtime_scanner_ws_snapshot_cache_uses_bulk_lookup(monkeypatch):
+    calls = []
+
+    class FakeWS:
+        def get_all_data(self, codes):
+            calls.append(list(codes))
+            return {
+                "005930": {"curr": 70000, "last_ws_update_ts": 1000.0},
+                "000660": {"curr": 130000, "last_ws_update_ts": 1000.0},
+            }
+
+        def get_latest_data(self, code):
+            raise AssertionError("per-symbol lookup should not be used by cache helper")
+
+    targets = [
+        {
+            "code": "005930",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+        },
+        {
+            "code": "005930",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+        },
+        {
+            "code": "000660",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+        },
+        {"code": "035720", "status": "WATCHING", "strategy": "SCALPING"},
+    ]
+
+    monkeypatch.setattr(kiwoom_sniper_v2, "WS_MANAGER", FakeWS())
+
+    snapshots = kiwoom_sniper_v2._runtime_scanner_ws_snapshot_cache(targets)
+
+    assert calls == [["005930", "000660"]]
+    assert snapshots["005930"]["curr"] == 70000
+    assert snapshots["000660"]["curr"] == 130000
+
+
+def test_runtime_scanner_ws_snapshot_cache_fails_closed(monkeypatch):
+    class FakeWS:
+        def get_all_data(self, codes):
+            raise RuntimeError("ws lock unavailable")
+
+    monkeypatch.setattr(kiwoom_sniper_v2, "WS_MANAGER", FakeWS())
+
+    snapshots = kiwoom_sniper_v2._runtime_scanner_ws_snapshot_cache(
+        [
+            {
+                "code": "005930",
+                "status": "WATCHING",
+                "strategy": "SCALPING",
+                "position_tag": "SCANNER",
+            }
+        ]
+    )
+
+    assert snapshots == {}
+
+
+def test_runtime_scanner_ws_snapshot_cache_returns_code_misses_when_lock_busy(
+    monkeypatch,
+):
+    class FakeWS:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.realtime_data = {"005930": {"curr": 70000}}
+            self.lock.acquire()
+
+        def _normalize_code(self, code):
+            return str(code or "").strip()[:6]
+
+        def _snapshot_target(self, target):
+            return dict(target or {})
+
+        def get_all_data(self, codes):
+            raise AssertionError(
+                "busy lock should not fall through to blocking get_all_data"
+            )
+
+    fake_ws = FakeWS()
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_WS_CACHE_LOCK_WAIT_MS", "0")
+    monkeypatch.setattr(kiwoom_sniper_v2, "WS_MANAGER", fake_ws)
+    try:
+        snapshots = kiwoom_sniper_v2._runtime_scanner_ws_snapshot_cache(
+            [
+                {
+                    "code": "005930",
+                    "status": "WATCHING",
+                    "strategy": "SCALPING",
+                    "position_tag": "SCANNER",
+                },
+                {
+                    "code": "000660",
+                    "status": "WATCHING",
+                    "strategy": "SCALPING",
+                    "position_tag": "SCANNER",
+                },
+            ]
+        )
+    finally:
+        fake_ws.lock.release()
+
+    assert snapshots == {"005930": {}, "000660": {}}
+
+
+def test_runtime_scanner_ws_snapshot_cache_waits_briefly_for_busy_lock(monkeypatch):
+    class FakeWS:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.realtime_data = {
+                "005930": {"curr": 70000, "last_ws_update_ts": 1000.0}
+            }
+            self.lock.acquire()
+
+        def _normalize_code(self, code):
+            return str(code or "").strip()[:6]
+
+        def _snapshot_target(self, target):
+            return dict(target or {})
+
+        def get_all_data(self, codes):
+            raise AssertionError(
+                "direct snapshot path should use the existing lock acquisition"
+            )
+
+    fake_ws = FakeWS()
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_WS_CACHE_LOCK_WAIT_MS", "50")
+    monkeypatch.setattr(kiwoom_sniper_v2, "WS_MANAGER", fake_ws)
+
+    def release_lock():
+        time.sleep(0.01)
+        fake_ws.lock.release()
+
+    thread = threading.Thread(target=release_lock)
+    thread.start()
+    try:
+        snapshots = kiwoom_sniper_v2._runtime_scanner_ws_snapshot_cache(
+            [
+                {
+                    "code": "005930",
+                    "status": "WATCHING",
+                    "strategy": "SCALPING",
+                    "position_tag": "SCANNER",
+                }
+            ]
+        )
+    finally:
+        thread.join(timeout=1.0)
+
+    assert snapshots == {"005930": {"curr": 70000, "last_ws_update_ts": 1000.0}}
+
+
+def test_scanner_full_eval_effective_limit_expands_for_backlog(tmp_path, monkeypatch):
+    kiwoom_sniper_v2._reset_scanner_full_eval_pressure_state()
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_SCANNER_OPERATOR_RUNTIME_OVERRIDE_PATH",
+        tmp_path / "missing_operator_runtime_overrides.env",
+    )
+    _reset_scanner_hot_override_cache()
+    monkeypatch.delenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_MAX_PER_LOOP", raising=False)
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCANNER_FULL_EVAL_BACKLOG_EXTRA_PER_LOOP", raising=False
+    )
+
+    assert (
+        kiwoom_sniper_v2._scanner_full_eval_effective_limit(
+            {"scanner_watching_count": 8}
+        )
+        == 8
+    )
+    assert (
+        kiwoom_sniper_v2._scanner_full_eval_effective_limit(
+            {"scanner_watching_count": 20}
+        )
+        == 12
+    )
+    assert (
+        kiwoom_sniper_v2._scanner_full_eval_effective_limit(
+            {"scanner_watching_count": 40}
+        )
+        == 12
+    )
+
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_BACKLOG_EXTRA_PER_LOOP", "0")
+    assert (
+        kiwoom_sniper_v2._scanner_full_eval_effective_limit(
+            {"scanner_watching_count": 40}
+        )
+        == 8
+    )
+    _reset_scanner_hot_override_cache()
+    kiwoom_sniper_v2._reset_scanner_full_eval_pressure_state()
+
+
+def test_scanner_full_eval_effective_limit_respects_env_caps(tmp_path, monkeypatch):
+    kiwoom_sniper_v2._reset_scanner_full_eval_pressure_state()
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_SCANNER_OPERATOR_RUNTIME_OVERRIDE_PATH",
+        tmp_path / "missing_operator_runtime_overrides.env",
+    )
+    _reset_scanner_hot_override_cache()
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_MAX_PER_LOOP", "6")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_BACKLOG_EXTRA_PER_LOOP", "4")
+    assert (
+        kiwoom_sniper_v2._scanner_full_eval_effective_limit(
+            {"scanner_watching_count": 40}
+        )
+        == 10
+    )
+
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_MAX_PER_LOOP", "40")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_BACKLOG_EXTRA_PER_LOOP", "40")
+    assert (
+        kiwoom_sniper_v2._scanner_full_eval_effective_limit(
+            {"scanner_watching_count": 100}
+        )
+        == 40
+    )
+    _reset_scanner_hot_override_cache()
+    kiwoom_sniper_v2._reset_scanner_full_eval_pressure_state()
+
+
+def test_scanner_full_eval_pressure_reduces_loop_budget_without_restart(
+    tmp_path, monkeypatch
+):
+    _disable_scanner_operator_runtime_overrides(monkeypatch, tmp_path)
+    kiwoom_sniper_v2._reset_scanner_full_eval_pressure_state()
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_MAX_PER_LOOP", "8")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_BACKLOG_EXTRA_PER_LOOP", "4")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_AUTO_PRESSURE_ENABLED", "true")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_AUTO_PRESSURE_MIN_LIMIT", "6")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_AUTO_PRESSURE_MS", "12000")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_AUTO_COOLDOWN_SEC", "0")
+
+    queue_context = {"scanner_watching_count": 40}
+    assert kiwoom_sniper_v2._scanner_full_eval_effective_limit(queue_context) == 12
+
+    effective = kiwoom_sniper_v2._update_scanner_full_eval_pressure(
+        19000.0,
+        queue_context=queue_context,
+        now_ts=1000.0,
+        buy_time_allowed=True,
+    )
+
+    assert effective == 10
+    assert kiwoom_sniper_v2._scanner_full_eval_effective_limit(queue_context) == 10
+    kiwoom_sniper_v2._reset_scanner_full_eval_pressure_state()
+
+
+def test_scanner_full_eval_pressure_recovers_gradually(tmp_path, monkeypatch):
+    _disable_scanner_operator_runtime_overrides(monkeypatch, tmp_path)
+    kiwoom_sniper_v2._reset_scanner_full_eval_pressure_state()
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_MAX_PER_LOOP", "8")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_BACKLOG_EXTRA_PER_LOOP", "4")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_AUTO_PRESSURE_ENABLED", "true")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_AUTO_PRESSURE_MIN_LIMIT", "6")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_AUTO_PRESSURE_MS", "12000")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_AUTO_RELIEF_MS", "7000")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_AUTO_COOLDOWN_SEC", "0")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_AUTO_RECOVERY_STREAK", "3")
+
+    queue_context = {"scanner_watching_count": 40}
+    assert (
+        kiwoom_sniper_v2._update_scanner_full_eval_pressure(
+            19000.0,
+            queue_context=queue_context,
+            now_ts=1000.0,
+            buy_time_allowed=True,
+        )
+        == 10
+    )
+    assert (
+        kiwoom_sniper_v2._update_scanner_full_eval_pressure(
+            6000.0,
+            queue_context=queue_context,
+            now_ts=1001.0,
+            buy_time_allowed=True,
+        )
+        == 10
+    )
+    assert (
+        kiwoom_sniper_v2._update_scanner_full_eval_pressure(
+            6000.0,
+            queue_context=queue_context,
+            now_ts=1002.0,
+            buy_time_allowed=True,
+        )
+        == 10
+    )
+    assert (
+        kiwoom_sniper_v2._update_scanner_full_eval_pressure(
+            6000.0,
+            queue_context=queue_context,
+            now_ts=1003.0,
+            buy_time_allowed=True,
+        )
+        == 11
+    )
+
+    kiwoom_sniper_v2._reset_scanner_full_eval_pressure_state()
+
+
+def test_scanner_full_eval_pressure_disabled_keeps_base_limit(tmp_path, monkeypatch):
+    _disable_scanner_operator_runtime_overrides(monkeypatch, tmp_path)
+    kiwoom_sniper_v2._reset_scanner_full_eval_pressure_state()
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_MAX_PER_LOOP", "8")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_BACKLOG_EXTRA_PER_LOOP", "4")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_AUTO_PRESSURE_ENABLED", "false")
+
+    queue_context = {"scanner_watching_count": 40}
+
+    assert (
+        kiwoom_sniper_v2._update_scanner_full_eval_pressure(
+            30000.0,
+            queue_context=queue_context,
+            now_ts=1000.0,
+            buy_time_allowed=True,
+        )
+        == 12
+    )
+    assert kiwoom_sniper_v2._scanner_full_eval_effective_limit(queue_context) == 12
+    kiwoom_sniper_v2._reset_scanner_full_eval_pressure_state()
+
+
+def test_scanner_full_eval_budget_defers_before_watching_handler():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    effective_limit_idx = source.index(
+        "scanner_full_eval_limit = _scanner_full_eval_effective_limit("
+    )
+    budget_check_idx = source.index(
+        "and scanner_full_eval_count >= scanner_full_eval_limit",
+        effective_limit_idx,
+    )
+    append_idx = source.index("delayed_scanner_heavy_eval.append", budget_check_idx)
+    continue_idx = source.index("continue", append_idx)
+    inline_handle_idx = source.index(
+        "handle_watching_state(\n                        stock,", append_idx
+    )
+
+    assert effective_limit_idx < budget_check_idx
+    assert budget_check_idx < append_idx < continue_idx < inline_handle_idx
+
+
+def test_scanner_rising_full_eval_relief_is_checked_before_budget_defer():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    budget_check_idx = source.index(
+        "and scanner_full_eval_count >= scanner_full_eval_limit"
+    )
+    relief_idx = source.index("relief_allowed = (", budget_check_idx)
+    skip_idx = source.index(
+        '"skip_reason": "scanner_full_eval_loop_budget_deferred"', relief_idx
+    )
+    append_idx = source.index("delayed_scanner_heavy_eval.append", skip_idx)
+
+    assert budget_check_idx < relief_idx < skip_idx < append_idx
+
+
+def test_scanner_rising_strength_recheck_queues_ws_recovery_only_for_stale_snapshot_before_watch_eviction():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    handle_idx = source.index("handle_watching_state(")
+    recheck_idx = source.index('entry_strength_momentum_recheck_pending"))', handle_idx)
+    source_reason_idx = source.index(
+        "entry_strength_momentum_recheck_source_quality_block_reason", recheck_idx
+    )
+    stale_reason_idx = source.index('== "stale_ws_snapshot"', source_reason_idx)
+    queue_idx = source.index(
+        "scanner_strength_recheck_stale_ws_recovery", stale_reason_idx
+    )
+    eviction_idx = source.index(
+        "_maybe_expire_scanner_watch_after_full_eval", queue_idx
+    )
+
+    assert (
+        handle_idx
+        < recheck_idx
+        < source_reason_idx
+        < stale_reason_idx
+        < queue_idx
+        < eviction_idx
+    )
+
+
+def test_scanner_rest_quote_loop_budget_is_checked_before_recovery_calls():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    limit_idx = source.index("scanner_rest_quote_fallback_loop_limit =")
+    helper_idx = source.index("def _scanner_rest_quote_recovery_options", limit_idx)
+    first_call_idx = source.index(
+        "_scanner_rest_quote_recovery_options(stock, now_ts)", helper_idx
+    )
+    first_recover_idx = source.index("_recover_missing_ws_snapshot(", first_call_idx)
+    second_call_idx = source.index(
+        "_scanner_rest_quote_recovery_options(", first_recover_idx
+    )
+    second_recover_idx = source.index("_recover_missing_ws_snapshot(", second_call_idx)
+
+    assert (
+        limit_idx
+        < helper_idx
+        < first_call_idx
+        < first_recover_idx
+        < second_call_idx
+        < second_recover_idx
+    )
+
+
+def test_run_sniper_builds_scanner_ws_cache_before_target_iteration():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    context_idx = source.index("queue_context = _runtime_queue_context(")
+    cache_idx = source.index(
+        "scanner_ws_snapshot_cache = _runtime_scanner_ws_snapshot_cache", context_idx
+    )
+    helper_idx = source.index("def _admit_runtime_live_attaches", cache_idx)
+    admit_idx = source.index("_runtime_admit_live_scanner_attaches(", helper_idx)
+    accounting_extend_idx = source.index(
+        "runtime_iteration_accounting_targets.extend(", admit_idx
+    )
+    admitted_accounting_idx = source.index(
+        "for target in admitted_targets", accounting_extend_idx
+    )
+    preserved_loop_anchor_idx = source.index(
+        'now_ts=queue_context["loop_started_epoch"]', admitted_accounting_idx
+    )
+    loop_idx = source.index("while True:", admit_idx)
+    empty_guard_idx = source.index("if not runtime_work_queue:", loop_idx)
+    select_idx = source.index("stock = runtime_work_queue.pop(0)", admit_idx)
+    cached_lookup_idx = source.index("scanner_ws_snapshot_cache.get(code)", loop_idx)
+    fallback_lookup_idx = source.index(
+        "WS_MANAGER.get_latest_data(code)", cached_lookup_idx
+    )
+
+    assert context_idx < cache_idx < helper_idx < admit_idx
+    assert admit_idx < accounting_extend_idx < admitted_accounting_idx
+    assert admitted_accounting_idx < preserved_loop_anchor_idx
+    assert preserved_loop_anchor_idx < loop_idx < empty_guard_idx < select_idx
+    assert select_idx < cached_lookup_idx < fallback_lookup_idx
+
+
+def test_run_sniper_batches_scanner_ws_recovery_reg_before_loop_end():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    pending_idx = source.index("pending_scanner_ws_reg")
+    queue_idx = source.index("def _queue_scanner_ws_reg", pending_idx)
+    missing_recovery_idx = source.index("publish_ws_reg=False", queue_idx)
+    missing_queue_idx = source.index(
+        '_queue_scanner_ws_reg(\n                                    code, "scanner_watching_ws_snapshot_recovery"',
+        missing_recovery_idx,
+    )
+    stale_recovery_idx = source.index(
+        "scanner_fast_precheck_stale_ws_recovery", missing_queue_idx
+    )
+    stale_no_publish_idx = source.index("publish_ws_reg=False", stale_recovery_idx)
+    stale_queue_idx = source.index(
+        '_queue_scanner_ws_reg(\n                                    code, "scanner_fast_precheck_stale_ws_recovery"',
+        stale_no_publish_idx,
+    )
+    final_flush_idx = source.rindex("_flush_pending_scanner_ws_reg()")
+    prune_idx = source.index("targets[:] = [", final_flush_idx)
+
+    assert pending_idx < queue_idx < missing_recovery_idx < missing_queue_idx
+    assert missing_queue_idx < stale_no_publish_idx < stale_queue_idx
+    assert stale_queue_idx < final_flush_idx < prune_idx
+
+
+def test_run_sniper_defers_scanner_skip_event_emits_until_loop_tail():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    defer_def_idx = source.index("def _defer_scanner_watching_runtime_skip")
+    missing_idx = source.index(
+        "_defer_scanner_watching_runtime_skip(\n                                stock",
+        defer_def_idx,
+    )
+    final_flush_idx = source.rindex("_flush_deferred_scanner_skip_events()")
+    executor_submit_idx = source.index(
+        "_SCANNER_OBSERVATION_EXECUTOR.submit", defer_def_idx
+    )
+    prune_idx = source.index("targets[:] = [", final_flush_idx)
+    direct_emit_after_defer = source.find(
+        "sniper_state_handlers.emit_scanner_watching_runtime_skip",
+        defer_def_idx,
+        final_flush_idx,
+    )
+
+    assert defer_def_idx < missing_idx < final_flush_idx < prune_idx
+    assert defer_def_idx < executor_submit_idx < final_flush_idx
+    assert direct_emit_after_defer == source.index(
+        "sniper_state_handlers.emit_scanner_watching_runtime_skip", defer_def_idx
+    )
+
+
+def test_run_sniper_defers_scanner_precheck_and_lag_event_emits_until_loop_tail():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    defer_log_def_idx = source.index("def _defer_scanner_entry_pipeline_log")
+    fast_def_idx = source.index(
+        "def _defer_emit_scanner_fast_precheck", defer_log_def_idx
+    )
+    queue_def_idx = source.index(
+        "def _defer_emit_scanner_runtime_queue_lag", fast_def_idx
+    )
+    heavy_def_idx = source.index(
+        "def _defer_emit_scanner_heavy_eval_lag", queue_def_idx
+    )
+    loop_idx = source.index("while True:", heavy_def_idx)
+    fast_call_idx = source.index("_defer_emit_scanner_fast_precheck(", loop_idx)
+    queue_call_idx = source.index(
+        "_defer_emit_scanner_runtime_queue_lag(", fast_call_idx
+    )
+    heavy_call_idx = source.index("_defer_emit_scanner_heavy_eval_lag(", heavy_def_idx)
+    final_flush_idx = source.rindex("_flush_deferred_scanner_pipeline_events()")
+    skip_flush_idx = source.rindex("_flush_deferred_scanner_skip_events()")
+    direct_fast_emit = source.find(
+        "sniper_state_handlers.emit_scanner_fast_precheck(", loop_idx, final_flush_idx
+    )
+    direct_queue_emit = source.find(
+        "sniper_state_handlers.emit_scanner_runtime_queue_lag(",
+        loop_idx,
+        final_flush_idx,
+    )
+    direct_heavy_emit = source.find(
+        "sniper_state_handlers.emit_scanner_heavy_eval_lag(", loop_idx, final_flush_idx
+    )
+
+    assert defer_log_def_idx < fast_def_idx < queue_def_idx < heavy_def_idx < loop_idx
+    assert heavy_def_idx < heavy_call_idx < final_flush_idx
+    assert loop_idx < fast_call_idx < queue_call_idx < final_flush_idx < skip_flush_idx
+    assert direct_fast_emit == -1
+    assert direct_queue_emit == -1
+    assert direct_heavy_emit == -1
+
+
+def test_run_sniper_disables_legacy_queue_lag_eviction_in_scheduler_mode():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    work_queue_idx = source.index(
+        'runtime_work_queue = list(queue_context["iteration_targets"])'
+    )
+    loop_idx = source.index("while True:", work_queue_idx)
+    queue_assignment_idx = source.index("queue_lag_fields = (", loop_idx)
+    scheduler_archive_guard_idx = source.index(
+        "if scheduler_generation is not None", queue_assignment_idx
+    )
+    queue_call_idx = source.index(
+        "else _defer_emit_scanner_runtime_queue_lag(", scheduler_archive_guard_idx
+    )
+    fast_result_idx = source.index(
+        'fast_precheck_result = str(\n                            stock.get("_scanner_fast_precheck_result")',
+        queue_call_idx,
+    )
+    scheduler_complete_idx = source.index(
+        "_scanner_scheduler_complete_target(", fast_result_idx
+    )
+    recovery_enqueue_idx = source.index(
+        "lane=ScannerLane.RECOVERY", scheduler_complete_idx
+    )
+    stale_recovery_idx = source.index(
+        "scanner_fast_precheck_stale_ws_recovery", fast_result_idx
+    )
+
+    assert queue_assignment_idx < scheduler_archive_guard_idx < queue_call_idx
+    assert queue_call_idx < fast_result_idx < scheduler_complete_idx
+    assert scheduler_complete_idx < recovery_enqueue_idx < stale_recovery_idx
+
+
+def test_scanner_pipeline_events_flush_before_heavy_eval_handler():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    flush_def_idx = source.index("def _flush_delayed_scanner_heavy_eval")
+    heavy_lag_idx = source.index("_defer_emit_scanner_heavy_eval_lag(", flush_def_idx)
+    pipeline_flush_idx = source.index(
+        "_flush_deferred_scanner_pipeline_events()", heavy_lag_idx
+    )
+    heavy_handle_idx = source.index(
+        "handle_watching_state(\n                            delayed_stock",
+        pipeline_flush_idx,
+    )
+
+    assert flush_def_idx < heavy_lag_idx < pipeline_flush_idx < heavy_handle_idx
+
+
+def test_scanner_heavy_eval_completion_flushes_on_success_and_exception():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    flush_def_idx = source.index("def _flush_delayed_scanner_heavy_eval")
+    snapshot_idx = source.index(
+        "heavy_eval_completion_stock = dict(delayed_stock)", flush_def_idx
+    )
+    handler_idx = source.index(
+        "handle_watching_state(\n                            delayed_stock",
+        flush_def_idx,
+    )
+    exception_idx = source.index("except Exception:", handler_idx)
+    exception_completion_idx = source.index(
+        "_defer_emit_scanner_heavy_eval_completion(", exception_idx
+    )
+    exception_flush_idx = source.index(
+        "_flush_deferred_scanner_pipeline_events()", exception_completion_idx
+    )
+    success_completion_idx = source.index(
+        "_defer_emit_scanner_heavy_eval_completion(", exception_flush_idx
+    )
+    success_flush_idx = source.index(
+        "_flush_deferred_scanner_pipeline_events()", success_completion_idx
+    )
+
+    assert snapshot_idx < handler_idx < exception_idx
+    assert exception_idx < exception_completion_idx < exception_flush_idx
+    assert exception_flush_idx < success_completion_idx < success_flush_idx
+    completion_slice = source[exception_completion_idx:success_flush_idx]
+    assert completion_slice.count("heavy_eval_completion_stock") == 2
+
+
+def test_run_sniper_processes_one_delayed_heavy_eval_before_live_attach_yield():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    flush_idx = source.index("def _flush_delayed_scanner_heavy_eval")
+    attempted_init_idx = source.index("heavy_eval_attempted = False", flush_idx)
+    delayed_loop_idx = source.index("while delayed_scanner_heavy_eval:", flush_idx)
+    attempted_gate_idx = source.index(
+        "if heavy_eval_attempted and _admit_runtime_live_attaches():",
+        delayed_loop_idx,
+    )
+    live_admit_idx = source.index("_admit_runtime_live_attaches()", attempted_gate_idx)
+    return_idx = source.index("return", live_admit_idx)
+    pop_idx = source.index("delayed_scanner_heavy_eval.pop(0)", return_idx)
+    same_symbol_pending_idx = source.index(
+        "_SCANNER_PROMOTION_INBOX.pending_for(delayed_code)", pop_idx
+    )
+    same_symbol_admit_idx = source.index(
+        "_admit_runtime_live_attaches()", same_symbol_pending_idx
+    )
+    scheduler_dispatch_idx = source.index(
+        'if scheduler_claim.action != "dispatch":', same_symbol_admit_idx
+    )
+    attempted_set_idx = source.index("heavy_eval_attempted = True", pop_idx)
+    handler_idx = source.index("handle_watching_state(", pop_idx)
+    flushed_idx = source.index("scanner_heavy_eval_flushed = True", handler_idx)
+
+    assert flush_idx < attempted_init_idx < delayed_loop_idx < attempted_gate_idx
+    assert attempted_gate_idx < live_admit_idx < return_idx < pop_idx
+    assert pop_idx < same_symbol_pending_idx < same_symbol_admit_idx
+    assert same_symbol_admit_idx < scheduler_dispatch_idx < attempted_set_idx
+    assert attempted_set_idx < handler_idx < flushed_idx
+
+
+def test_async_heavy_eval_dispatch_yields_before_another_runtime_target():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    state_idx = source.index("scanner_async_commit_yield_requested = False")
+    flush_idx = source.index("def _flush_delayed_scanner_heavy_eval", state_idx)
+    flush_gate_idx = source.index("if scanner_async_commit_yield_requested:", flush_idx)
+    handler_idx = source.index("handle_watching_state(", flush_idx)
+    async_key_idx = source.index(
+        'delayed_stock.get("_scanner_async_cache_key")', handler_idx
+    )
+    request_idx = source.index(
+        "scanner_async_commit_yield_requested = True", async_key_idx
+    )
+    return_idx = source.index("return", request_idx)
+    runtime_loop_idx = source.index("while True:", return_idx)
+    loop_gate_idx = source.index(
+        "scanner_async_commit_yield_requested",
+        runtime_loop_idx,
+    )
+    pop_idx = source.index("runtime_work_queue.pop(0)", loop_gate_idx)
+
+    assert state_idx < flush_idx < flush_gate_idx < handler_idx < async_key_idx
+    assert async_key_idx < request_idx < return_idx < runtime_loop_idx
+    assert runtime_loop_idx < loop_gate_idx < pop_idx
+
+
+def test_async_heavy_eval_yield_skips_one_normal_polling_sleep():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    yield_idx = source.index("scanner_async_commit_yield_requested = True")
+    sleep_budget_idx = source.index(
+        "_sleep_ms = 0 if scanner_async_commit_yield_requested else 1000",
+        yield_idx,
+    )
+    sleep_idx = source.index("time.sleep(_sleep_ms / 1000.0)", sleep_budget_idx)
+
+    assert yield_idx < sleep_budget_idx < sleep_idx
+
+
+def test_async_commit_routes_rising_missed_before_generic_watching_handler():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    commit_idx = source.index("if scheduled_lane is ScannerLane.COMMIT:")
+    opening_adapter_idx = source.index(
+        "handle_scanner_async_opening_rotation_commit(", commit_idx
+    )
+    rising_adapter_idx = source.index(
+        "handle_scanner_async_rising_missed_commit(", opening_adapter_idx
+    )
+    generic_handler_idx = source.index("handle_watching_state(", rising_adapter_idx)
+
+    assert commit_idx < opening_adapter_idx < rising_adapter_idx < generic_handler_idx
+
+
+def test_opening_rotation_ttl_sweep_is_independent_and_precedes_general_fifo():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    sweep_interval_idx = source.index(
+        'getattr(run_sniper, "last_opening_rotation_ttl_sweep_time", 0)'
+    )
+    sweep_idx = source.index(
+        "sweep_expired_opening_rotation_watch_slots(", sweep_interval_idx
+    )
+    sweep_checkpoint_idx = source.index(
+        "run_sniper.last_opening_rotation_ttl_sweep_time = now_ts", sweep_idx
+    )
+    fifo_interval_idx = source.index(
+        'getattr(run_sniper, "last_fifo_time", 0) > 10', sweep_checkpoint_idx
+    )
+
+    assert sweep_interval_idx < sweep_idx < sweep_checkpoint_idx < fifo_interval_idx
+
+
+def test_opening_rotation_async_strategy_miss_handoffs_to_generic_watching_owner():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    commit_idx = source.index("if scheduled_lane is ScannerLane.COMMIT:")
+    opening_adapter_idx = source.index(
+        "opening_rotation_commit_handled = "
+        "sniper_state_handlers.handle_scanner_async_opening_rotation_commit(",
+        commit_idx,
+    )
+    generation_marker_idx = source.index(
+        "opening_rotation_handoff_generation_id = str(", opening_adapter_idx
+    )
+    handoff_gate_idx = source.index(
+        "not opening_rotation_commit_handled", generation_marker_idx
+    )
+    generation_match_idx = source.index(
+        "== scheduler_generation.generation_id", handoff_gate_idx
+    )
+    generic_handler_idx = source.index("handle_watching_state(", generation_match_idx)
+    skip_direct_scout_idx = source.index(
+        "skip_rising_missed_hook=True", generic_handler_idx
+    )
+    normal_commit_phase_idx = source.index(
+        "scanner_async_commit_phase=False", skip_direct_scout_idx
+    )
+
+    assert (
+        opening_adapter_idx
+        < generation_marker_idx
+        < handoff_gate_idx
+        < generation_match_idx
+        < generic_handler_idx
+    )
+    assert generic_handler_idx < skip_direct_scout_idx < normal_commit_phase_idx
+
+
+def test_async_commit_preserves_same_generation_followup_before_warm_parking():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    commit_idx = source.index("if scheduled_lane is ScannerLane.COMMIT:")
+    followup_wait_idx = source.index(
+        "followup_async_wait_state = (",
+        commit_idx,
+    )
+    claimed_generation_idx = source.index(
+        "scheduler_claim.item.generation",
+        followup_wait_idx,
+    )
+    pending_gate_idx = source.index(
+        "followup_async_wait_state in {",
+        followup_wait_idx,
+    )
+    yield_idx = source.index(
+        "scanner_async_commit_yield_requested = True",
+        pending_gate_idx,
+    )
+    park_idx = source.index(
+        "_scanner_scheduler_continue_bounded_recheck_or_park(",
+        yield_idx,
+    )
+
+    assert (
+        commit_idx
+        < followup_wait_idx
+        < claimed_generation_idx
+        < pending_gate_idx
+        < yield_idx
+        < park_idx
+    )
+
+
+def test_scheduler_ready_heavy_eval_flushes_before_next_promotion_attach():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    enqueue_idx = source.index(
+        'owner="eligible_precheck_heavy_eval"',
+    )
+    delayed_append_idx = source.index("delayed_scanner_heavy_eval.append", enqueue_idx)
+    scheduler_guard_idx = source.index(
+        "# Stage-1 deadline mode keeps preparation", delayed_append_idx
+    )
+    immediate_flush_idx = source.index(
+        "_flush_delayed_scanner_heavy_eval()", scheduler_guard_idx
+    )
+    legacy_budget_flush_idx = source.index(
+        "scanner_full_eval_count >= scanner_full_eval_limit", immediate_flush_idx
+    )
+
+    assert enqueue_idx < delayed_append_idx < scheduler_guard_idx
+    assert scheduler_guard_idx < immediate_flush_idx < legacy_budget_flush_idx
+
+
+def test_runtime_live_attach_reopens_delayed_heavy_eval_flush():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    helper_idx = source.index("def _admit_runtime_live_attaches")
+    nonlocal_idx = source.index(
+        "nonlocal runtime_work_queue, scanner_heavy_eval_flushed", helper_idx
+    )
+    attached_idx = source.index("if admitted_targets:", nonlocal_idx)
+    reopen_idx = source.index("scanner_heavy_eval_flushed = False", attached_idx)
+    queue_update_idx = source.index("runtime_live_attach_ids.update(", reopen_idx)
+
+    assert helper_idx < nonlocal_idx < attached_idx < reopen_idx < queue_update_idx
+
+
+def test_run_sniper_rechecks_work_queue_after_delayed_heavy_eval_flush():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    work_queue_idx = source.index(
+        'runtime_work_queue = list(queue_context["iteration_targets"])'
+    )
+    main_loop_idx = source.index("while True:", work_queue_idx)
+    empty_idx = source.index("if not runtime_work_queue:", main_loop_idx)
+    flush_idx = source.index("_flush_delayed_scanner_heavy_eval()", empty_idx)
+    recheck_idx = source.index("if runtime_work_queue:", flush_idx)
+    continue_idx = source.index("continue", recheck_idx)
+    live_admit_idx = source.index("_admit_runtime_live_attaches()", continue_idx)
+    second_empty_idx = source.index("if not runtime_work_queue:", live_admit_idx)
+    break_idx = source.index("break", second_empty_idx)
+
+    assert main_loop_idx < empty_idx < flush_idx < recheck_idx
+    assert recheck_idx < continue_idx < live_admit_idx
+    assert live_admit_idx < second_empty_idx < break_idx
+
+
+def test_scanner_heavy_eval_refreshes_ws_snapshot_before_handler():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    flush_def_idx = source.index("def _flush_delayed_scanner_heavy_eval")
+    eval_ws_idx = source.index("eval_ws_data = delayed_ws_data", flush_def_idx)
+    recheck_idx = source.index(
+        "_scanner_ws_subscription_recheck_snapshot_and_fields(", eval_ws_idx
+    )
+    assign_idx = source.index("eval_ws_data = recheck_snapshot", recheck_idx)
+    handle_idx = source.index(
+        "handle_watching_state(\n                            delayed_stock",
+        assign_idx,
+    )
+    eval_arg_idx = source.index("eval_ws_data", handle_idx)
+
+    assert (
+        flush_def_idx
+        < eval_ws_idx
+        < recheck_idx
+        < assign_idx
+        < handle_idx
+        < eval_arg_idx
+    )
+
+
+def test_scanner_heavy_eval_stale_recheck_repairs_before_handler():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    flush_def_idx = source.index("def _flush_delayed_scanner_heavy_eval")
+    recheck_idx = source.index(
+        "_scanner_ws_subscription_recheck_snapshot_and_fields(", flush_def_idx
+    )
+    fresh_idx = source.index("_scanner_heavy_eval_recheck_fresh_sec()", recheck_idx)
+    stale_idx = source.index("heavy_recheck_repair_needed = (", fresh_idx)
+    recover_idx = source.index("scanner_heavy_eval_stale_ws_recovery", stale_idx)
+    merge_idx = source.index("heavy_recheck_skip_fields = {", recover_idx)
+    skip_idx = source.index(
+        'skip_reason="scanner_heavy_eval_stale_snapshot_recheck"', recover_idx
+    )
+    merged_arg_idx = source.index("**heavy_recheck_skip_fields", skip_idx)
+    continue_idx = source.index("continue", skip_idx)
+    handle_idx = source.index(
+        "handle_watching_state(\n                            delayed_stock",
+        continue_idx,
+    )
+
+    assert recheck_idx < fresh_idx < stale_idx < recover_idx < merge_idx < skip_idx
+    assert skip_idx < merged_arg_idx < continue_idx < handle_idx
+
+
+def test_scanner_heavy_eval_allows_bounded_opening_handoff_before_recovery():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    flush_def_idx = source.index("def _flush_delayed_scanner_heavy_eval")
+    stale_idx = source.index("heavy_recheck_repair_needed = (", flush_def_idx)
+    handoff_idx = source.index("_opening_rotation_upstream_handoff_fields(", stale_idx)
+    bounded_branch_idx = source.index(
+        "and opening_rotation_handoff_allowed", handoff_idx
+    )
+    recover_idx = source.index(
+        "scanner_heavy_eval_stale_ws_recovery", bounded_branch_idx
+    )
+    handle_idx = source.index(
+        "handle_watching_state(\n                            delayed_stock",
+        recover_idx,
+    )
+    fresh_clock_idx = source.index(
+        "time.time() if opening_rotation_handoff_allowed else now_ts",
+        recover_idx,
+    )
+
+    assert (
+        stale_idx
+        < handoff_idx
+        < bounded_branch_idx
+        < recover_idx
+        < fresh_clock_idx
+        < handle_idx
+    )
+
+
+def test_scanner_market_data_enrichment_accepts_opening_bounded_handoff(monkeypatch):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.sniper_state_handlers,
+        "_opening_rotation_upstream_handoff_fields",
+        lambda *args, **kwargs: {"opening_rotation_upstream_handoff_allowed": True},
+    )
+    stock = {
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "price_delta_since_first_seen_pct": "0.0",
+    }
+
+    assert kiwoom_sniper_v2._scanner_market_data_enrichment_candidate(
+        stock,
+        {"curr": 10_000, "last_ws_update_ts": 900.0},
+        1000.0,
+    )
+
+
+def test_scanner_strength_recheck_waiting_skips_before_full_eval_budget():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    waiting_idx = source.index("if _scanner_strength_recheck_waiting(")
+    budget_idx = source.index(
+        "and scanner_full_eval_count >= scanner_full_eval_limit", waiting_idx
+    )
+    append_idx = source.index("delayed_scanner_heavy_eval.append", budget_idx)
+
+    assert waiting_idx < budget_idx < append_idx
+
+
+def test_scanner_fast_precheck_not_eligible_skips_before_heavy_eval():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    precheck_idx = source.index("fast_precheck_result = str(")
+    not_eligible_idx = source.index(
+        'fast_precheck_result != "eligible_for_heavy_entry_eval"', precheck_idx
+    )
+    fields_store_idx = source.index(
+        'stock_value["_scanner_fast_precheck_fields"] = dict(fields)'
+    )
+    fields_arg_idx = source.index("fast_precheck_fields=dict(", not_eligible_idx)
+    ws_reg_idx = source.index(
+        "scanner_fast_precheck_stale_ws_recovery", not_eligible_idx
+    )
+    recovered_idx = source.index("scanner_fast_precheck_stale_ws_recovered", ws_reg_idx)
+    recheck_idx = source.index("throttle_sec=0", recovered_idx)
+    waiting_idx = source.index(
+        "if _scanner_strength_recheck_waiting(", not_eligible_idx
+    )
+    budget_idx = source.index(
+        "and scanner_full_eval_count >= scanner_full_eval_limit", waiting_idx
+    )
+    append_idx = source.index("delayed_scanner_heavy_eval.append", budget_idx)
+
+    assert precheck_idx < not_eligible_idx < waiting_idx < budget_idx < append_idx
+    assert fields_store_idx < precheck_idx < fields_arg_idx < waiting_idx
+    assert not_eligible_idx < ws_reg_idx < waiting_idx
+    assert ws_reg_idx < recovered_idx < recheck_idx < waiting_idx
+
+
+def test_scanner_fast_precheck_deferred_call_preserves_code_for_backoff_lookup():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    helper_idx = source.index("def _defer_emit_scanner_fast_precheck(")
+    fields_call_idx = source.index(
+        "sniper_state_handlers._scanner_fast_precheck_fields(", helper_idx
+    )
+    code_arg_idx = source.index("code=code_value", fields_call_idx)
+    ws_arg_idx = source.index("ws_data=ws_snapshot", fields_call_idx)
+
+    assert fields_call_idx < code_arg_idx < ws_arg_idx
+
+
+def test_scanner_fast_precheck_is_flushed_before_non_scanner_targets():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    transition_flush_idx = source.index("and not _is_scanner_watching_target(stock)")
+    flush_call_idx = source.index(
+        "_flush_delayed_scanner_heavy_eval()", transition_flush_idx
+    )
+    buy_ordered_idx = source.index('if status == "BUY_ORDERED":', flush_call_idx)
+    final_flush_idx = source.rindex("_flush_delayed_scanner_heavy_eval()")
+    prune_idx = source.index("targets[:] = [", final_flush_idx)
+
+    assert transition_flush_idx < flush_call_idx < buy_ordered_idx
+    assert final_flush_idx < prune_idx
+
+
+def test_holding_missing_ws_snapshot_reaches_holding_freshness_guard():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    missing_ws_branch_idx = source.index(
+        'if not ws_data or ws_data.get("curr", 0) == 0:'
+    )
+    holding_guard_idx = source.index('if status == "HOLDING":', missing_ws_branch_idx)
+    handler_call_idx = source.index("handle_holding_state(", holding_guard_idx)
+    continue_idx = source.index("continue", handler_call_idx)
+
+    assert missing_ws_branch_idx < holding_guard_idx < handler_call_idx < continue_idx
+
+
+def test_recover_missing_ws_snapshot_reissues_ws_reg_before_fallback(monkeypatch):
+    kiwoom_sniper_v2._reset_scanner_rest_quote_fallback_rate_limit_for_tests()
+    published = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_fetch_rest_quote_snapshot_for_ws_gap",
+        lambda *args, **kwargs: {},
+    )
+    stock = {}
+
+    ws_data, fields = kiwoom_sniper_v2._recover_missing_ws_snapshot(
+        stock, "005930", 1000.0, {}
+    )
+
+    assert ws_data == {}
+    assert published == [
+        (
+            "COMMAND_WS_REG",
+            {"codes": ["005930"], "source": "scanner_watching_ws_snapshot_recovery"},
+        )
+    ]
+    assert fields["ws_recovery_outcome"] == "ws_reg_reissued_waiting_snapshot"
+
+
+def _scanner_watch_stock(**overrides):
+    stock = {
+        "id": 77,
+        "code": "123456",
+        "name": "TEST",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "buy_qty": 0,
+        "buy_time": None,
+        "entry_armed_at_epoch": 1000.0,
+        "scanner_promotion_id": "SCANPROM-123456-1000",
+    }
+    stock.update(overrides)
+    return stock
+
+
+def test_scanner_watch_ai_terminal_blocker_requires_two_fresh_repeats():
+    stock = _scanner_watch_stock()
+    stock["_scanner_watch_last_terminal_block"] = {
+        "stage": "blocked_ai_score",
+        "reason": "below_ai_score",
+        "fresh_input_confirmed": True,
+        "observed_epoch": 1100.0,
+    }
+
+    first = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_terminal(
+        stock, now_ts=1100.0
+    )
+    stock["_scanner_watch_last_terminal_block"] = {
+        "stage": "blocked_ai_score",
+        "reason": "below_ai_score",
+        "fresh_input_confirmed": True,
+        "observed_epoch": 1110.0,
+    }
+    second = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_terminal(
+        stock, now_ts=1110.0
+    )
+
+    assert first["should_evict"] is False
+    assert first["eviction_attempt_count"] == 1
+    assert second["should_evict"] is True
+    assert second["eviction_attempt_count"] == 2
+    assert second["terminal_stage"] == "blocked_ai_score"
+
+
+def test_scanner_watch_strength_and_liquidity_hardgates_evict_non_rising_after_one_fresh_block(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "scalping_buy_time_block_reason",
+        lambda _now_t: "",
+    )
+    for stage, reason in (
+        ("blocked_strength_momentum", "below_window_buy_value"),
+        ("blocked_liquidity", "below_min_liquidity"),
+    ):
+        stock = _scanner_watch_stock(price_delta_since_first_seen_pct="0.00")
+        stock["_scanner_watch_last_terminal_block"] = {
+            "stage": stage,
+            "reason": reason,
+            "fresh_input_confirmed": True,
+            "observed_epoch": 1100.0,
+        }
+
+        decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_terminal(
+            stock, now_ts=1100.0
+        )
+
+        assert decision["should_evict"] is True
+        assert decision["eviction_attempt_count"] == 1
+        assert decision["eviction_reason"] == "scanner_hardgate_prefilter"
+        assert decision["terminal_stage"] == stage
+
+
+def test_scanner_watch_rising_strength_hardgate_defers_for_terminal_recheck(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_RISING_TERMINAL_HARDGATE_RECHECK_ENABLED", "true"
+    )
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_RISING_TERMINAL_HARDGATE_RECHECK_DELAY_SEC", "5"
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "scalping_buy_time_block_reason",
+        lambda _now_t: "",
+    )
+    stock = _scanner_watch_stock(price_delta_since_first_seen_pct="1.20")
+    stock["_scanner_watch_last_terminal_block"] = {
+        "stage": "blocked_strength_momentum",
+        "reason": "below_buy_ratio",
+        "fresh_input_confirmed": True,
+        "observed_epoch": 1100.0,
+    }
+
+    decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_terminal(
+        stock, now_ts=1100.0
+    )
+
+    assert decision["should_evict"] is False
+    assert decision["eviction_reason"] == "terminal_hardgate_recheck_pending"
+    assert decision["eviction_attempt_count"] == 1
+    assert (
+        decision["scanner_full_eval_budget_source"]
+        == "not_applicable_terminal_hardgate"
+    )
+    assert stock["_scanner_rising_terminal_hardgate_recheck_after_epoch"] == 1105.0
+    assert (
+        stock["_scanner_rising_recheck_reason"] == "terminal_hardgate_recheck_pending"
+    )
+
+
+def test_scanner_watch_rising_strength_hardgate_evicts_after_terminal_recheck_attempt_limit(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_RISING_TERMINAL_HARDGATE_RECHECK_ENABLED", "true"
+    )
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_RISING_TERMINAL_HARDGATE_RECHECK_MAX_ATTEMPTS", "1"
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "scalping_buy_time_block_reason",
+        lambda _now_t: "",
+    )
+    stock = _scanner_watch_stock(price_delta_since_first_seen_pct="1.20")
+    stock["_scanner_watch_last_terminal_block"] = {
+        "stage": "blocked_strength_momentum",
+        "reason": "below_buy_ratio",
+        "fresh_input_confirmed": True,
+        "observed_epoch": 1100.0,
+    }
+
+    first = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_terminal(
+        stock, now_ts=1100.0
+    )
+    stock["_scanner_watch_last_terminal_block"] = {
+        "stage": "blocked_strength_momentum",
+        "reason": "below_buy_ratio",
+        "fresh_input_confirmed": True,
+        "observed_epoch": 1106.0,
+    }
+    second = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_terminal(
+        stock, now_ts=1106.0
+    )
+
+    assert first["should_evict"] is False
+    assert second["should_evict"] is True
+    assert second["eviction_attempt_count"] == 2
+    assert second["eviction_reason"] == "scanner_hardgate_prefilter"
+
+
+def test_scanner_watch_terminal_blocker_does_not_double_count_same_observation():
+    stock = _scanner_watch_stock()
+    stock["_scanner_watch_last_terminal_block"] = {
+        "stage": "blocked_vpw",
+        "reason": "below_vpw",
+        "fresh_input_confirmed": True,
+        "observed_epoch": 1100.0,
+    }
+
+    first = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_terminal(
+        stock, now_ts=1100.0
+    )
+    second = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_terminal(
+        stock, now_ts=1101.0
+    )
+
+    assert first["eviction_attempt_count"] == 1
+    assert second["should_evict"] is False
+    assert second["eviction_attempt_count"] == 1
+
+
+def test_scanner_watch_fresh_terminal_resets_source_quality_eviction_counter():
+    stock = _scanner_watch_stock(
+        _scanner_watch_eviction_stale_first_seen_epoch=1000.0,
+        _scanner_watch_eviction_stale_count=2,
+    )
+    stock["_scanner_watch_last_terminal_block"] = {
+        "stage": "blocked_strength_momentum",
+        "reason": "below_window_buy_value",
+        "fresh_input_confirmed": True,
+        "observed_epoch": 1100.0,
+    }
+
+    decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_terminal(
+        stock, now_ts=1100.0
+    )
+
+    assert decision["should_evict"] is False
+    assert "_scanner_watch_eviction_stale_count" not in stock
+    assert "_scanner_watch_eviction_stale_first_seen_epoch" not in stock
+
+
+def test_scanner_watch_terminal_eviction_rejects_real_order_or_holding_rows():
+    for stock in (
+        _scanner_watch_stock(status="BUY_ORDERED"),
+        _scanner_watch_stock(status="SELL_ORDERED"),
+        _scanner_watch_stock(status="HOLDING"),
+        _scanner_watch_stock(buy_qty=1),
+        _scanner_watch_stock(buy_time="2026-06-22 09:10:00"),
+    ):
+        stock["_scanner_watch_last_terminal_block"] = {
+            "stage": "blocked_vpw",
+            "reason": "below_vpw",
+            "fresh_input_confirmed": True,
+        }
+        decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_terminal(
+            stock, now_ts=1100.0
+        )
+        assert decision["should_evict"] is False
+
+
+def test_scanner_watch_stale_eviction_requires_three_attempts_and_age():
+    stock = _scanner_watch_stock()
+    first = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_stale(
+        stock,
+        now_ts=1000.0,
+        stale_reason="ws_snapshot_missing_or_zero",
+        recovery_fields={"ws_recovery_outcome": "ws_reg_reissued_waiting_snapshot"},
+    )
+    second = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_stale(
+        stock,
+        now_ts=1050.0,
+        stale_reason="ws_snapshot_missing_or_zero",
+        recovery_fields={"ws_recovery_outcome": "rest_quote_unavailable"},
+    )
+    third = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_stale(
+        stock,
+        now_ts=1091.0,
+        stale_reason="ws_snapshot_missing_or_zero",
+        recovery_fields={"ws_recovery_outcome": "rest_quote_unavailable"},
+    )
+
+    assert first["should_evict"] is False
+    assert second["should_evict"] is False
+    assert third["should_evict"] is True
+    assert third["eviction_attempt_count"] == 3
+    assert third["stale_age_sec"] == 91.0
+
+
+def test_scanner_fast_precheck_missing_curr_routes_to_recovery_contract():
+    assert (
+        "missing_or_zero_curr" in kiwoom_sniper_v2.SCANNER_WATCH_EVICTION_STALE_REASONS
+    )
+
+    assert kiwoom_sniper_v2._scanner_fast_precheck_requires_recovery(
+        "source_quality_blocked",
+        "missing_or_zero_curr",
+    )
+    assert not kiwoom_sniper_v2._scanner_fast_precheck_requires_recovery(
+        "eligible_for_heavy_entry_eval",
+        "fast_precheck_pass",
+    )
+
+
+def test_scanner_watch_insufficient_history_eviction_requires_three_attempts_and_age():
+    stock = _scanner_watch_stock()
+    for observed_epoch in (1000.0, 1050.0, 1091.0):
+        stock["_scanner_watch_last_terminal_block"] = {
+            "stage": "blocked_strength_momentum",
+            "reason": "insufficient_history",
+            "fresh_input_confirmed": False,
+            "observed_epoch": observed_epoch,
+        }
+        decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_terminal(
+            stock,
+            now_ts=observed_epoch,
+        )
+        assert decision["should_evict"] is False
+        last_decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_stale(
+            stock,
+            now_ts=observed_epoch,
+            stale_reason="insufficient_history",
+            recovery_fields={
+                "ws_recovery_outcome": "source_quality_unresolved_no_ws_recovery"
+            },
+        )
+
+    assert last_decision["should_evict"] is True
+    assert last_decision["eviction_reason"] == "source_quality_unresolved"
+    assert last_decision["terminal_stage"] == "not_applicable_terminal_stage"
+    assert last_decision["terminal_reason"] == "insufficient_history"
+    assert last_decision["fresh_input_confirmed"] is False
+    assert last_decision["eviction_attempt_count"] == 3
+    assert last_decision["stale_age_sec"] == 91.0
+
+
+def test_scanner_watch_rest_quote_price_only_strength_gap_evicts_without_priority_recheck(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_RISING_WS_GAP_PRIORITY_RECOVERY_ENABLED", "true"
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "scalping_buy_time_block_reason",
+        lambda _now_t: "",
+    )
+    stock = _scanner_watch_stock(price_delta_since_first_seen_pct="5.40")
+
+    for observed_epoch in (1000.0, 1050.0, 1091.0):
+        last_decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_stale(
+            stock,
+            now_ts=observed_epoch,
+            stale_reason="rising_rest_quote_recovery_without_realtime_strength",
+            recovery_fields={
+                "ws_recovery_outcome": "rest_quote_applied",
+                "source_quality_detail_route": "price_only_rest_quote_strength_history_missing",
+                "rest_quote_price_recovery_only": True,
+                "scanner_source_quality_reallocation_candidate": True,
+            },
+        )
+
+    assert last_decision["should_evict"] is True
+    assert last_decision["eviction_reason"] == "source_quality_unresolved"
+    assert (
+        last_decision["terminal_reason"]
+        == "rising_rest_quote_recovery_without_realtime_strength"
+    )
+    assert (
+        last_decision["ws_recovery_outcome"]
+        == "source_quality_unresolved_price_only_rest_quote"
+    )
+    assert (
+        last_decision["source_quality_detail_route"]
+        == "price_only_rest_quote_strength_history_missing"
+    )
+    assert last_decision["rest_quote_price_recovery_only"] is True
+    assert last_decision["scanner_source_quality_reallocation_candidate"] is True
+    assert last_decision["eviction_attempt_count"] == 3
+    assert last_decision["stale_age_sec"] == 91.0
+    assert "_scanner_rising_ws_gap_priority_recheck_after_epoch" not in stock
+
+    event_fields = kiwoom_sniper_v2._scanner_watch_eviction_event_fields(
+        stock,
+        decision=last_decision,
+    )
+    assert (
+        event_fields["source_quality_route"]
+        == "runtime_watchlist_eviction_pool_management_only"
+    )
+    assert (
+        event_fields["source_quality_detail_route"]
+        == "price_only_rest_quote_strength_history_missing"
+    )
+
+
+def test_scanner_watch_cooldown_pool_block_requires_repeat_and_remaining_time():
+    short = _scanner_watch_stock(
+        _scanner_watch_last_pool_block={
+            "reason": "entry_cooldown_active",
+            "observed_epoch": 1000.0,
+            "cooldown_remaining_sec": 59,
+        }
+    )
+    short_decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_pool_block(
+        short,
+        now_ts=1000.0,
+    )
+    assert short_decision["should_evict"] is False
+    assert short_decision["eviction_attempt_count"] == 0
+
+    stock = _scanner_watch_stock()
+    stock["_scanner_watch_last_pool_block"] = {
+        "reason": "entry_cooldown_active",
+        "observed_epoch": 1000.0,
+        "cooldown_remaining_sec": 120,
+    }
+    first = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_pool_block(
+        stock, now_ts=1000.0
+    )
+    stock["_scanner_watch_last_pool_block"] = {
+        "reason": "entry_cooldown_active",
+        "observed_epoch": 1031.0,
+        "cooldown_remaining_sec": 89,
+    }
+    second = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_pool_block(
+        stock, now_ts=1031.0
+    )
+
+    assert first["should_evict"] is False
+    assert first["eviction_attempt_count"] == 1
+    assert second["should_evict"] is True
+    assert second["eviction_reason"] == "safety_cooldown_pool_blocked"
+    assert second["terminal_reason"] == "entry_cooldown_active"
+    assert second["cooldown_remaining_sec"] == 89
+
+
+def test_scanner_watch_after_full_eval_routes_cooldown_pool_block_to_eviction(
+    monkeypatch,
+):
+    stock = _scanner_watch_stock(
+        _scanner_watch_last_pool_block={
+            "reason": "entry_cooldown_active",
+            "observed_epoch": 1031.0,
+            "cooldown_remaining_sec": 89,
+        },
+        _scanner_watch_eviction_pool_block_reason="entry_cooldown_active",
+        _scanner_watch_eviction_pool_block_count=1,
+        _scanner_watch_eviction_last_pool_block_observed_epoch=1000.0,
+    )
+    captured = {}
+
+    def fake_expire(target, code, targets, *, decision, emit_event_fn=None):
+        captured["decision"] = decision
+        return True
+
+    monkeypatch.setattr(kiwoom_sniper_v2, "_expire_scanner_watch_target", fake_expire)
+
+    expired = kiwoom_sniper_v2._maybe_expire_scanner_watch_after_full_eval(
+        stock,
+        "123456",
+        [stock],
+        now_ts=1031.0,
+    )
+
+    assert expired is True
+    assert captured["decision"]["eviction_reason"] == "safety_cooldown_pool_blocked"
+    assert captured["decision"]["terminal_reason"] == "entry_cooldown_active"
+
+
+def test_scanner_rising_cooldown_relief_blocks_watch_eviction(monkeypatch):
+    _enable_scanner_rising_ws_gap_test_mode(monkeypatch)
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_RISING_COOLDOWN_EVICTION_RELIEF_ENABLED", "true"
+    )
+    stock = {
+        "id": 88,
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "scanner_promotion_id": "SCANPROM-005930-1000000",
+        "price_delta_since_first_seen_pct": "0.80",
+        "_scanner_watch_last_pool_block": {
+            "reason": "entry_cooldown_active",
+            "observed_epoch": 1000.0,
+            "cooldown_remaining_sec": 120,
+        },
+    }
+
+    decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_pool_block(
+        stock, now_ts=1000.0
+    )
+
+    assert decision["should_evict"] is False
+    assert decision["eviction_reason"] == "cooldown_recheck_pending"
+    assert stock["_scanner_rising_cooldown_recheck_after_epoch"] == 1120.0
+
+
+def test_scanner_rising_stale_ws_gap_defers_eviction_for_priority_recovery(monkeypatch):
+    _enable_scanner_rising_ws_gap_test_mode(monkeypatch)
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_RISING_WS_GAP_PRIORITY_RECOVERY_ENABLED", "true"
+    )
+    stock = {
+        "id": 89,
+        "code": "010690",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "price_delta_since_first_seen_pct": "0.80",
+    }
+
+    decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_stale(
+        stock,
+        now_ts=2000.0,
+        stale_reason="stale_ws_snapshot",
+        recovery_fields={"ws_recovery_outcome": "ws_reg_reissued_waiting_snapshot"},
+    )
+
+    assert decision["should_evict"] is False
+    assert decision["eviction_reason"] == "ws_gap_recovery_deferred_priority"
+    assert decision["ws_gap_recovery_deferred_priority"] is True
+    assert stock["_scanner_rising_ws_gap_priority_recheck_after_epoch"] == 2005.0
+
+
+def test_scanner_rising_stale_ws_gap_priority_expires_after_standard_stale_guard(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_RISING_WS_GAP_PRIORITY_RECOVERY_ENABLED", "true"
+    )
+    stock = {
+        "id": 90,
+        "code": "010690",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "price_delta_since_first_seen_pct": "0.80",
+        "_scanner_watch_eviction_stale_first_seen_epoch": 2000.0,
+        "_scanner_watch_eviction_stale_count": 2,
+    }
+
+    decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_stale(
+        stock,
+        now_ts=2091.0,
+        stale_reason="stale_ws_snapshot",
+        recovery_fields={"ws_recovery_outcome": "ws_reg_reissued_waiting_snapshot"},
+    )
+
+    assert decision["should_evict"] is True
+    assert decision["eviction_reason"] == "stale_recovery_failed"
+    assert decision["eviction_attempt_count"] == 3
+    assert decision["stale_age_sec"] == 91.0
+
+
+def test_scanner_initial_attach_without_0b_or_0d_keeps_existing_stale_lifetime():
+    stock = {
+        "id": 90,
+        "code": "399720",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "scanner_attach_epoch": 2000.0,
+        "_scanner_fast_precheck_fields": {
+            "fast_precheck_result": "budget_reallocated",
+            "fast_precheck_reason": "scanner_ws_stale_backoff_active",
+            "scanner_ws_stale_backoff_until": 2035.0,
+            "ws_received_types": "",
+        },
+        "_scanner_ws_backoff_watch_retention_first_epoch": 2000.0,
+        "_scanner_ws_backoff_watch_retention_count": 1,
+    }
+
+    retained = (
+        kiwoom_sniper_v2._scanner_watch_eviction_decision_from_fast_precheck_budget(
+            stock,
+            now_ts=2031.0,
+        )
+    )
+    expired = (
+        kiwoom_sniper_v2._scanner_watch_eviction_decision_from_fast_precheck_budget(
+            stock,
+            now_ts=2091.0,
+        )
+    )
+
+    assert retained["should_evict"] is False
+    assert retained["initial_entry_ws_receipt_pending"] is True
+    assert retained["initial_entry_ws_receipt_lifetime_contract_sec"] == 90.0
+    assert expired["should_evict"] is True
+    assert expired["ws_backoff_retention_age_sec"] == 91.0
+
+
+def test_scanner_initial_attach_lifetime_contract_accepts_post_attach_0b():
+    stock = {
+        "id": 91,
+        "code": "399720",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "scanner_attach_epoch": 2000.0,
+        "_scanner_fast_precheck_fields": {
+            "fast_precheck_result": "budget_reallocated",
+            "fast_precheck_reason": "scanner_ws_stale_backoff_active",
+            "scanner_ws_stale_backoff_until": 2035.0,
+            "ws_received_types": "0B,0D",
+            "ws_last_0b_epoch": "2025.000000",
+            "ws_last_0d_epoch": "1999.000000",
+        },
+        "_scanner_ws_backoff_watch_retention_first_epoch": 2000.0,
+        "_scanner_ws_backoff_watch_retention_count": 1,
+    }
+
+    retained = (
+        kiwoom_sniper_v2._scanner_watch_eviction_decision_from_fast_precheck_budget(
+            stock,
+            now_ts=2031.0,
+        )
+    )
+
+    assert retained["initial_entry_ws_receipt_pending"] is False
+    assert retained["initial_entry_ws_receipt_required_types"] == (
+        "0B|strength_history"
+    )
+    assert retained["should_evict"] is True
+    assert retained["ws_backoff_retention_max_sec"] == 30.0
+
+
+def test_scanner_first_entry_realtime_anchors_lifetime_to_post_attach_strength():
+    stock = {
+        "id": 92,
+        "code": "399720",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "scanner_attach_epoch": 2000.0,
+        "entry_armed_at_epoch": 1990.0,
+    }
+
+    pending = kiwoom_sniper_v2._scanner_record_first_entry_realtime(
+        stock,
+        {
+            "last_realtime_type_ts": {"0D": 2001.0},
+            "strength_momentum_history": [{"ts": 1999.0}],
+        },
+        now_ts=2002.0,
+    )
+    received = kiwoom_sniper_v2._scanner_record_first_entry_realtime(
+        stock,
+        {
+            "last_realtime_type_ts": {"0D": 2001.0},
+            "strength_momentum_history": [{"ts": 2003.25}],
+        },
+        now_ts=2003.5,
+    )
+
+    assert pending["scanner_entry_realtime_state"] == (
+        "awaiting_first_post_attach_trade_input"
+    )
+    assert received["scanner_entry_realtime_state"] == "received"
+    assert received["scanner_first_entry_realtime_type"] == "strength_history"
+    assert received["scanner_first_entry_realtime_latency_ms"] == 3250.0
+    assert kiwoom_sniper_v2._scanner_evaluation_lifetime_anchor(stock) == 2003.25
+    assert kiwoom_sniper_v2._runtime_added_time_for_target(stock) == 1990.0
+
+
+def test_scanner_rising_insufficient_history_evicts_after_buy_window(monkeypatch):
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_RISING_WS_GAP_PRIORITY_RECOVERY_ENABLED", "true"
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "scalping_buy_time_block_reason",
+        lambda _now_t: "scalping_new_buy_cutoff",
+    )
+    stock = {
+        "id": 90,
+        "code": "095500",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "price_delta_since_first_seen_pct": "7.12",
+    }
+
+    first = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_stale(
+        stock,
+        now_ts=2000.0,
+        stale_reason="insufficient_history",
+        recovery_fields={
+            "ws_recovery_outcome": "source_quality_unresolved_no_ws_recovery"
+        },
+    )
+    second = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_stale(
+        stock,
+        now_ts=2061.0,
+        stale_reason="insufficient_history",
+        recovery_fields={
+            "ws_recovery_outcome": "source_quality_unresolved_no_ws_recovery"
+        },
+    )
+
+    assert first["should_evict"] is False
+    assert first["eviction_reason"] == "ws_gap_recovery_deferred_priority"
+    assert second["should_evict"] is True
+    assert second["eviction_reason"] == "source_quality_unresolved_after_buy_window"
+    assert second["terminal_reason"] == "insufficient_history"
+    assert second["eviction_attempt_count"] == 2
+    assert second["stale_age_sec"] == 61.0
+    assert second["after_buy_window_source_quality_expired"] is True
+
+
+def test_scanner_rising_insufficient_history_keeps_priority_recheck_before_cutoff(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_RISING_WS_GAP_PRIORITY_RECOVERY_ENABLED", "true"
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "scalping_buy_time_block_reason",
+        lambda _now_t: "outside_scalping_buy_window",
+    )
+    stock = {
+        "id": 91,
+        "code": "372320",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "price_delta_since_first_seen_pct": "3.82",
+        "_scanner_watch_eviction_stale_first_seen_epoch": 2000.0,
+        "_scanner_watch_eviction_stale_count": 1,
+    }
+
+    decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_stale(
+        stock,
+        now_ts=2061.0,
+        stale_reason="insufficient_history",
+        recovery_fields={
+            "ws_recovery_outcome": "source_quality_unresolved_no_ws_recovery"
+        },
+    )
+
+    assert decision["should_evict"] is False
+    assert decision["eviction_reason"] == "ws_gap_recovery_deferred_priority"
+    assert decision["ws_gap_recovery_deferred_priority"] is True
+    assert stock["_scanner_watch_eviction_stale_count"] == 2
+
+
+def test_scanner_rising_insufficient_history_keeps_priority_recheck_after_standard_stale_guard_before_cutoff(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_RISING_WS_GAP_PRIORITY_RECOVERY_ENABLED", "true"
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "scalping_buy_time_block_reason",
+        lambda _now_t: "",
+    )
+    stock = {
+        "id": 93,
+        "code": "037710",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "price_delta_since_first_seen_pct": "11.15",
+        "_scanner_watch_eviction_stale_first_seen_epoch": 2000.0,
+        "_scanner_watch_eviction_stale_count": 2,
+    }
+
+    decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_stale(
+        stock,
+        now_ts=2091.0,
+        stale_reason="insufficient_history",
+        recovery_fields={
+            "ws_recovery_outcome": "source_quality_unresolved_no_ws_recovery"
+        },
+    )
+
+    assert decision["should_evict"] is False
+    assert decision["eviction_reason"] == "ws_gap_recovery_deferred_priority"
+    assert decision["ws_gap_recovery_deferred_priority"] is True
+    assert stock["_scanner_watch_eviction_stale_count"] == 3
+
+
+def test_scanner_rising_insufficient_history_evicts_after_operator_start_time(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_RISING_WS_GAP_PRIORITY_RECOVERY_ENABLED", "true"
+    )
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_AFTER_BUY_WINDOW_SOURCE_QUALITY_EVICTION_START_TIME",
+        "00:00:00",
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "scalping_buy_time_block_reason",
+        lambda _now_t: "outside_scalping_buy_window",
+    )
+    stock = {
+        "id": 92,
+        "code": "095500",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "price_delta_since_first_seen_pct": "7.12",
+        "_scanner_watch_eviction_stale_first_seen_epoch": 2000.0,
+        "_scanner_watch_eviction_stale_count": 1,
+    }
+
+    decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_stale(
+        stock,
+        now_ts=2061.0,
+        stale_reason="insufficient_history",
+        recovery_fields={
+            "ws_recovery_outcome": "source_quality_unresolved_no_ws_recovery"
+        },
+    )
+
+    assert decision["should_evict"] is True
+    assert decision["eviction_reason"] == "source_quality_unresolved_after_buy_window"
+    assert decision["after_buy_window_source_quality_expired"] is True
+
+
+def test_scanner_watch_after_full_eval_routes_nonfresh_insufficient_history_to_source_quality_eviction(
+    monkeypatch,
+):
+    stock = _scanner_watch_stock()
+    stock["_scanner_watch_last_terminal_block"] = {
+        "stage": "blocked_strength_momentum",
+        "reason": "insufficient_history",
+        "fresh_input_confirmed": False,
+        "observed_epoch": 1091.0,
+    }
+    stock["_scanner_watch_eviction_stale_first_seen_epoch"] = 1000.0
+    stock["_scanner_watch_eviction_stale_count"] = 2
+    captured = {}
+
+    def fake_expire(target, code, targets, *, decision, emit_event_fn=None):
+        captured["decision"] = decision
+        return True
+
+    monkeypatch.setattr(kiwoom_sniper_v2, "_expire_scanner_watch_target", fake_expire)
+
+    expired = kiwoom_sniper_v2._maybe_expire_scanner_watch_after_full_eval(
+        stock,
+        "123456",
+        [stock],
+        now_ts=1091.0,
+    )
+
+    assert expired is True
+    assert captured["decision"]["eviction_reason"] == "source_quality_unresolved"
+    assert captured["decision"]["terminal_reason"] == "insufficient_history"
+
+
+def test_scanner_watch_stale_recovery_resets_eviction_counter():
+    stock = _scanner_watch_stock()
+    kiwoom_sniper_v2._scanner_watch_eviction_decision_from_stale(
+        stock,
+        now_ts=1000.0,
+        stale_reason="stale_ws_snapshot",
+        recovery_fields={"ws_recovery_outcome": "ws_reg_reissued_waiting_snapshot"},
+    )
+
+    recovered = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_stale(
+        stock,
+        now_ts=1010.0,
+        stale_reason="stale_ws_snapshot",
+        recovery_fields={"ws_recovery_outcome": "rest_quote_applied"},
+    )
+
+    assert recovered["should_evict"] is False
+    assert "_scanner_watch_eviction_stale_count" not in stock
+    assert "_scanner_watch_eviction_stale_first_seen_epoch" not in stock
+
+
+def test_scanner_watch_budget_deferred_is_not_eviction_reason():
+    stock = _scanner_watch_stock()
+    decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_stale(
+        stock,
+        now_ts=1000.0,
+        stale_reason="scanner_full_eval_loop_budget_deferred",
+        recovery_fields={"ws_recovery_outcome": "not_applicable_ws_recovery_outcome"},
+    )
+
+    assert decision["should_evict"] is False
+    assert decision["eviction_attempt_count"] == 0
+
+
+def test_expire_scanner_watch_target_updates_db_and_memory_by_record_id(monkeypatch):
+    class FakeQuery:
+        def __init__(self):
+            self.updated = False
+
+        def filter(self, *conditions):
+            self.conditions = conditions
+            return self
+
+        def update(self, values, synchronize_session=False):
+            self.updated = (
+                values == {"status": "EXPIRED"} and synchronize_session is False
+            )
+            return 1
+
+    class FakeSession:
+        def __init__(self):
+            self.query_obj = FakeQuery()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def query(self, model):
+            self.model = model
+            return self.query_obj
+
+    class FakeDB:
+        def __init__(self):
+            self.session = FakeSession()
+
+        def get_session(self):
+            return self.session
+
+    fake_db = FakeDB()
+    monkeypatch.setattr(kiwoom_sniper_v2, "DB", fake_db)
+    stock = _scanner_watch_stock()
+    emitted = []
+    decision = {
+        "eviction_reason": "terminal_blocker_repeated",
+        "eviction_attempt_count": 2,
+        "terminal_stage": "blocked_vpw",
+        "terminal_reason": "below_vpw",
+        "fresh_input_confirmed": True,
+        "stale_first_seen_epoch": "not_applicable_stale_first_seen_epoch",
+        "stale_age_sec": "not_applicable_stale_age_sec",
+        "ws_recovery_outcome": "not_applicable_ws_recovery_outcome",
+        "observed_epoch": "1100.000",
+    }
+
+    expired = kiwoom_sniper_v2._expire_scanner_watch_target(
+        stock,
+        "123456",
+        [stock],
+        decision=decision,
+        emit_event_fn=lambda *args: emitted.append(args),
+    )
+
+    assert expired is True
+    assert fake_db.session.query_obj.updated is True
+    assert stock["status"] == "EXPIRED"
+    assert emitted[-1][2] == "scalping_scanner_watch_eviction"
+    assert emitted[-1][3]["target_status"] == "WATCHING"
+    assert emitted[-1][3]["actual_order_submitted"] is False
+    assert emitted[-1][3]["broker_order_forbidden"] is True
+
+
+def test_scanner_watch_eviction_releases_exact_opening_slot_with_provenance(
+    monkeypatch,
+):
+    fake_db = _ExpireDB()
+    monkeypatch.setattr(kiwoom_sniper_v2, "DB", fake_db)
+    promotion_id = "SCANPROM-123456-OPENING"
+    stock = _scanner_watch_stock(
+        scanner_promotion_id=promotion_id,
+        opening_rotation_watch_slot_promotion_id=promotion_id,
+        opening_rotation_watch_slot_claimed_at_epoch=1000.0,
+    )
+    opening_events = []
+    scanner_events = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.sniper_state_handlers,
+        "_log_entry_pipeline",
+        lambda *args, **fields: opening_events.append((args[2], fields)),
+    )
+    decision = {
+        "eviction_reason": "source_quality_unresolved",
+        "eviction_attempt_count": 2,
+        "terminal_stage": "opening_rotation_1pct_observed",
+        "terminal_reason": "stale_market_context",
+        "fresh_input_confirmed": False,
+        "observed_epoch": "1125.000",
+    }
+
+    expired = kiwoom_sniper_v2._expire_scanner_watch_target(
+        stock,
+        "123456",
+        [stock],
+        decision=decision,
+        emit_event_fn=lambda *args: scanner_events.append(args),
+    )
+
+    assert expired is True
+    assert stock["status"] == "EXPIRED"
+    assert "opening_rotation_watch_slot_promotion_id" not in stock
+    assert stock["opening_rotation_consumed_promotion_id"] == promotion_id
+    assert stock["opening_rotation_watch_phase"] == "SCANNER_WATCH_EVICTED"
+    assert opening_events[-1][0] == "opening_rotation_watch_slot_released"
+    assert (
+        opening_events[-1][1]["reason"]
+        == "scanner_watch_eviction:source_quality_unresolved"
+    )
+    assert scanner_events[-1][3]["opening_rotation_watch_slot_released"] is True
+    assert (
+        scanner_events[-1][3]["opening_rotation_watch_slot_release_reason"]
+        == "scanner_watch_eviction:source_quality_unresolved"
+    )
+
+
+def test_expire_scanner_watch_target_rejects_bought_rows_before_db(monkeypatch):
+    class FailingDB:
+        def get_session(self):
+            raise AssertionError("DB should not be touched for bought rows")
+
+    monkeypatch.setattr(kiwoom_sniper_v2, "DB", FailingDB())
+    stock = _scanner_watch_stock(buy_qty=1)
+    expired = kiwoom_sniper_v2._expire_scanner_watch_target(
+        stock,
+        "123456",
+        [stock],
+        decision={"eviction_reason": "terminal_blocker_repeated"},
+    )
+
+    assert expired is False
+    assert stock["status"] == "WATCHING"
+
+
+def test_krx_open_watchlist_reset_expires_only_unbought_watching_rows(monkeypatch):
+    fake_db = _ExpireDB()
+    monkeypatch.setattr(kiwoom_sniper_v2, "DB", fake_db)
+    emitted = []
+    pre_open_epoch = kiwoom_sniper_v2.datetime(2026, 6, 24, 8, 50, 0).timestamp()
+    targets = [
+        _scanner_watch_stock(id=101, code="111111", name="PREOPEN1"),
+        _scanner_watch_stock(
+            id=102, code="222222", name="HELD", status="HOLDING", buy_qty=1
+        ),
+        _scanner_watch_stock(
+            id=103, code="333333", name="ORDERED", status="BUY_ORDERED"
+        ),
+        _scanner_watch_stock(id=104, code="444444", name="BOUGHT_WATCH", buy_qty=1),
+        _scanner_watch_stock(
+            id=105,
+            code="555555",
+            name="SWING",
+            strategy="KOSDAQ_ML",
+            position_tag="SWING",
+            added_time=pre_open_epoch,
+        ),
+    ]
+
+    reset_codes = kiwoom_sniper_v2._reset_krx_open_watch_targets(
+        targets,
+        now_dt=kiwoom_sniper_v2.datetime(2026, 6, 24, 9, 0, 1),
+        emit_event_fn=lambda *args: emitted.append(args),
+    )
+
+    assert reset_codes == ["111111", "555555"]
+    assert targets[0]["status"] == "EXPIRED"
+    assert targets[1]["status"] == "HOLDING"
+    assert targets[2]["status"] == "BUY_ORDERED"
+    assert targets[3]["status"] == "WATCHING"
+    assert targets[4]["status"] == "EXPIRED"
+    assert fake_db.calls == [({"status": "EXPIRED"}, False)]
+    assert [event[2] for event in emitted] == [
+        "krx_open_watchlist_reset",
+        "krx_open_watchlist_reset",
+    ]
+    assert emitted[0][3]["reset_reason"] == "krx_open_reprice_watchlist_reset"
+    assert emitted[0][3]["actual_order_submitted"] is False
+    assert emitted[0][3]["broker_order_forbidden"] is True
+
+
+def test_krx_open_watchlist_reset_waits_until_market_open(monkeypatch):
+    fake_db = _ExpireDB()
+    monkeypatch.setattr(kiwoom_sniper_v2, "DB", fake_db)
+    stock = _scanner_watch_stock(id=106, code="666666")
+
+    reset_codes = kiwoom_sniper_v2._reset_krx_open_watch_targets(
+        [stock],
+        now_dt=kiwoom_sniper_v2.datetime(2026, 6, 24, 8, 59, 59),
+    )
+
+    assert reset_codes == []
+    assert stock["status"] == "WATCHING"
+    assert fake_db.calls == []
+
+
+def test_krx_open_watchlist_reset_keeps_post_open_scanner_targets(monkeypatch):
+    fake_db = _ExpireDB()
+    monkeypatch.setattr(kiwoom_sniper_v2, "DB", fake_db)
+    now_dt = kiwoom_sniper_v2.datetime(2026, 6, 24, 9, 3, 0)
+    post_open_epoch = kiwoom_sniper_v2.datetime(2026, 6, 24, 9, 1, 0).timestamp()
+    stock = _scanner_watch_stock(
+        id=107,
+        code="777777",
+        added_time=post_open_epoch,
+        entry_armed_at_epoch=post_open_epoch,
+        scanner_promotion_emitted_epoch=str(post_open_epoch),
+    )
+
+    reset_codes = kiwoom_sniper_v2._reset_krx_open_watch_targets([stock], now_dt=now_dt)
+
+    assert reset_codes == []
+    assert stock["status"] == "WATCHING"
+    assert fake_db.calls == []
+
+
+def test_recover_missing_ws_snapshot_skips_rest_quote_for_non_rising_repeated_miss(
+    monkeypatch,
+):
+    kiwoom_sniper_v2._reset_scanner_rest_quote_fallback_rate_limit_for_tests()
+    published = []
+    calls = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_fetch_rest_quote_snapshot_for_ws_gap",
+        lambda code, now_ts: calls.append((code, now_ts))
+        or {
+            "curr": 70000,
+            "ws_snapshot_recovery_source": "ka10001_rest_quote_fallback",
+        },
+    )
+    stock = {
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "price_delta_since_first_seen_pct": "0.00",
+        "_scanner_ws_snapshot_recovery": {"miss_count": 1, "last_fallback_ts": 900.0},
+    }
+
+    ws_data, fields = kiwoom_sniper_v2._recover_missing_ws_snapshot(
+        stock, "005930", 1000.0, {}
+    )
+
+    assert ws_data == {}
+    assert fields["ws_recovery_action"] == "ws_reg_reissued"
+    assert fields["ws_recovery_outcome"] == "ws_reg_reissued_waiting_snapshot"
+    assert fields["rest_quote_fallback_eligible"] is False
+    assert calls == []
+    assert len(published) == 1
+
+
+def test_recover_missing_ws_snapshot_applies_rest_quote_on_first_positive_scanner_miss(
+    monkeypatch,
+):
+    kiwoom_sniper_v2._reset_scanner_rest_quote_fallback_rate_limit_for_tests()
+    _enable_scanner_rising_ws_gap_test_mode(monkeypatch)
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_RISING_WS_GAP_PRIORITY_RECOVERY_ENABLED", "true"
+    )
+    calls = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(publish=lambda *args, **kwargs: None),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_fetch_rest_quote_snapshot_for_ws_gap",
+        lambda code, now_ts: calls.append((code, now_ts))
+        or {
+            "curr": 70000,
+            "ws_snapshot_recovery_source": "ka10001_rest_quote_fallback",
+        },
+    )
+    stock = {
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "scanner_promotion_id": "SCANPROM-005930-1000000",
+        "price_delta_since_first_seen_pct": "0.60",
+    }
+
+    ws_data, fields = kiwoom_sniper_v2._recover_missing_ws_snapshot(
+        stock,
+        "005930",
+        1000.0,
+        {},
+        allow_early_rest_fallback=kiwoom_sniper_v2._scanner_ws_gap_early_rest_fallback_allowed(
+            stock
+        ),
+    )
+
+    assert ws_data["curr"] == 70000
+    assert fields["ws_recovery_action"] == "ws_reg_reissued_rest_quote_fallback"
+    assert fields["ws_recovery_outcome"] == "rest_quote_applied"
+    assert fields["rest_quote_fallback_eligible"] is True
+    assert stock["_scanner_ws_snapshot_recovery"]["miss_count"] == 1
+    assert calls == [("005930", 1000.0)]
+
+
+def test_recover_missing_ws_snapshot_defers_rest_quote_when_loop_budget_exhausted(
+    monkeypatch,
+):
+    kiwoom_sniper_v2._reset_scanner_rest_quote_fallback_rate_limit_for_tests()
+    _enable_scanner_rising_ws_gap_test_mode(monkeypatch)
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_RISING_WS_GAP_PRIORITY_RECOVERY_ENABLED", "true"
+    )
+    calls = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(publish=lambda *args, **kwargs: None),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_fetch_rest_quote_snapshot_for_ws_gap",
+        lambda code, now_ts: calls.append((code, now_ts)) or {"curr": 70000},
+    )
+    stock = {
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "price_delta_since_first_seen_pct": "0.70",
+        "_scanner_ws_snapshot_recovery": {"miss_count": 1, "last_fallback_ts": 900.0},
+    }
+
+    ws_data, fields = kiwoom_sniper_v2._recover_missing_ws_snapshot(
+        stock,
+        "005930",
+        1000.0,
+        {},
+        allow_early_rest_fallback=kiwoom_sniper_v2._scanner_rest_quote_fallback_allowed_for_ws_gap(
+            stock
+        ),
+        rest_quote_deferred_reason="rest_quote_loop_budget_deferred",
+    )
+
+    assert ws_data == {}
+    assert fields["ws_recovery_action"] == "ws_reg_reissued_rest_quote_fallback"
+    assert fields["ws_recovery_outcome"] == "rest_quote_loop_budget_deferred"
+    assert fields["ws_gap_recovery_deferred_priority"] is True
+    assert (
+        fields["rest_quote_fallback_deferred_reason"]
+        == "rest_quote_loop_budget_deferred"
+    )
+    assert (
+        stock["_scanner_ws_snapshot_recovery"]["last_fallback_outcome"]
+        == "rest_quote_loop_budget_deferred"
+    )
+    assert (
+        kiwoom_sniper_v2._scanner_rest_quote_fallback_due(
+            stock,
+            1004.0,
+            allow_early_rest_fallback=True,
+        )
+        is False
+    )
+    assert calls == []
+    kiwoom_sniper_v2._reset_scanner_rest_quote_fallback_rate_limit_for_tests()
+
+
+def test_recover_missing_ws_snapshot_rate_limits_rest_quote_burst(monkeypatch):
+    kiwoom_sniper_v2._reset_scanner_rest_quote_fallback_rate_limit_for_tests()
+    _enable_scanner_rising_ws_gap_test_mode(monkeypatch)
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_RISING_WS_GAP_PRIORITY_RECOVERY_ENABLED", "true"
+    )
+    calls = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(publish=lambda *args, **kwargs: None),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_fetch_rest_quote_snapshot_for_ws_gap",
+        lambda code, now_ts: calls.append((code, now_ts)) or {"curr": 70000},
+    )
+
+    for idx, code in enumerate(
+        (
+            "005930",
+            "000660",
+            "035420",
+            "051910",
+            "068270",
+            "247540",
+            "373220",
+            "005380",
+            "012330",
+        ),
+        start=1,
+    ):
+        stock = {
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "price_delta_since_first_seen_pct": "0.70",
+            "_scanner_ws_snapshot_recovery": {
+                "miss_count": 1,
+                "last_fallback_ts": 900.0,
+            },
+        }
+        ws_data, fields = kiwoom_sniper_v2._recover_missing_ws_snapshot(
+            stock,
+            code,
+            1000.0 + idx,
+            {},
+            allow_early_rest_fallback=kiwoom_sniper_v2._scanner_rest_quote_fallback_allowed_for_ws_gap(
+                stock
+            ),
+        )
+        if idx <= 8:
+            assert ws_data["curr"] == 70000
+            assert fields["ws_recovery_outcome"] == "rest_quote_applied"
+            assert fields["rest_quote_rate_limit_decision"] in {
+                "rest_quote_allowed",
+                "rest_quote_allowed_dynamic_boost",
+            }
+            assert fields["rest_quote_dynamic_budget_boosted"] == (idx >= 7)
+        else:
+            assert ws_data == {}
+            assert fields["ws_recovery_outcome"] == "rest_quote_rate_limited"
+
+    assert calls == [
+        ("005930", 1001.0),
+        ("000660", 1002.0),
+        ("035420", 1003.0),
+        ("051910", 1004.0),
+        ("068270", 1005.0),
+        ("247540", 1006.0),
+        ("373220", 1007.0),
+        ("005380", 1008.0),
+    ]
+    kiwoom_sniper_v2._reset_scanner_rest_quote_fallback_rate_limit_for_tests()
+
+
+def test_scanner_rest_quote_rate_limit_uses_bounded_operator_override(
+    tmp_path, monkeypatch
+):
+    kiwoom_sniper_v2._reset_scanner_rest_quote_fallback_rate_limit_for_tests()
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_SCANNER_OPERATOR_RUNTIME_OVERRIDE_PATH",
+        tmp_path / "missing_operator_runtime_overrides.env",
+    )
+    _reset_scanner_hot_override_cache()
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_MAX_CALLS_PER_WINDOW", "4"
+    )
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_POSITIVE_RESERVE_CALLS", "2"
+    )
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_DYNAMIC_MAX_EXTRA_CALLS", "0"
+    )
+
+    outcomes = [
+        kiwoom_sniper_v2._scanner_rest_quote_fallback_rate_limit(
+            1000.0 + idx, priority=True
+        )
+        for idx in range(7)
+    ]
+
+    assert outcomes[:6] == [(True, "rest_quote_allowed")] * 6
+    assert outcomes[6] == (False, "rest_quote_rate_limited")
+    kiwoom_sniper_v2._reset_scanner_rest_quote_fallback_rate_limit_for_tests()
+
+
+def test_scanner_rest_quote_rate_limit_dynamic_boosts_on_pressure(
+    tmp_path, monkeypatch
+):
+    kiwoom_sniper_v2._reset_scanner_rest_quote_fallback_rate_limit_for_tests()
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_SCANNER_OPERATOR_RUNTIME_OVERRIDE_PATH",
+        tmp_path / "missing_operator_runtime_overrides.env",
+    )
+    _reset_scanner_hot_override_cache()
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_MAX_CALLS_PER_WINDOW", "4"
+    )
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_POSITIVE_RESERVE_CALLS", "2"
+    )
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_DYNAMIC_MAX_EXTRA_CALLS", "2"
+    )
+
+    outcomes = [
+        kiwoom_sniper_v2._scanner_rest_quote_fallback_rate_limit(
+            1000.0 + idx, priority=True
+        )
+        for idx in range(9)
+    ]
+
+    assert outcomes[:6] == [(True, "rest_quote_allowed")] * 6
+    assert outcomes[6:8] == [(True, "rest_quote_allowed_dynamic_boost")] * 2
+    assert outcomes[8] == (False, "rest_quote_rate_limited")
+    kiwoom_sniper_v2._reset_scanner_rest_quote_fallback_rate_limit_for_tests()
+
+
+def test_scanner_rest_quote_rate_limit_hard_ceiling_bounds_priority_and_boost(
+    tmp_path, monkeypatch
+):
+    kiwoom_sniper_v2._reset_scanner_rest_quote_fallback_rate_limit_for_tests()
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_SCANNER_OPERATOR_RUNTIME_OVERRIDE_PATH",
+        tmp_path / "missing_operator_runtime_overrides.env",
+    )
+    _reset_scanner_hot_override_cache()
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_MAX_CALLS_PER_WINDOW", "4"
+    )
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_POSITIVE_RESERVE_CALLS", "2"
+    )
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_DYNAMIC_MAX_EXTRA_CALLS", "2"
+    )
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_HARD_MAX_CALLS_PER_WINDOW", "5"
+    )
+
+    outcomes = [
+        kiwoom_sniper_v2._scanner_rest_quote_fallback_rate_limit(
+            1000.0 + idx, priority=True
+        )
+        for idx in range(6)
+    ]
+
+    assert outcomes[:5] == [(True, "rest_quote_allowed")] * 5
+    assert outcomes[5] == (False, "rest_quote_hard_rate_limited")
+    kiwoom_sniper_v2._reset_scanner_rest_quote_fallback_rate_limit_for_tests()
+
+
+def test_scanner_rest_quote_loop_limit_allows_bounded_intraday_recovery_override(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_SCANNER_OPERATOR_RUNTIME_OVERRIDE_PATH",
+        tmp_path / "missing_operator_runtime_overrides.env",
+    )
+    _reset_scanner_hot_override_cache()
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_MAX_PER_LOOP", raising=False
+    )
+    assert kiwoom_sniper_v2._scanner_rest_quote_fallback_max_per_loop() == 6
+
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_MAX_PER_LOOP", "8")
+    assert kiwoom_sniper_v2._scanner_rest_quote_fallback_max_per_loop() == 8
+
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_MAX_PER_LOOP", "99")
+    assert kiwoom_sniper_v2._scanner_rest_quote_fallback_max_per_loop() == 24
+
+
+def test_scanner_rest_quote_budget_caps_cover_intraday_observation_override(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_SCANNER_OPERATOR_RUNTIME_OVERRIDE_PATH",
+        tmp_path / "missing_operator_runtime_overrides.env",
+    )
+    _reset_scanner_hot_override_cache()
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_MAX_PER_LOOP", "24")
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_MAX_CALLS_PER_WINDOW", "12"
+    )
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_POSITIVE_RESERVE_CALLS", "6"
+    )
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_DYNAMIC_MAX_EXTRA_CALLS", "8"
+    )
+
+    assert kiwoom_sniper_v2._scanner_rest_quote_fallback_max_per_loop() == 24
+    assert kiwoom_sniper_v2._scanner_rest_quote_fallback_max_calls_per_window() == 12
+    assert kiwoom_sniper_v2._scanner_rest_quote_fallback_positive_reserve_calls() == 6
+    assert kiwoom_sniper_v2._scanner_rest_quote_fallback_dynamic_max_extra_calls() == 8
+
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_MAX_PER_LOOP", "99")
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_MAX_CALLS_PER_WINDOW", "99"
+    )
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_POSITIVE_RESERVE_CALLS", "99"
+    )
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_DYNAMIC_MAX_EXTRA_CALLS", "99"
+    )
+
+    assert kiwoom_sniper_v2._scanner_rest_quote_fallback_max_per_loop() == 24
+    assert kiwoom_sniper_v2._scanner_rest_quote_fallback_max_calls_per_window() == 12
+    assert kiwoom_sniper_v2._scanner_rest_quote_fallback_positive_reserve_calls() == 6
+    assert kiwoom_sniper_v2._scanner_rest_quote_fallback_dynamic_max_extra_calls() == 8
+
+
+def test_scanner_rest_quote_budget_hot_reloads_operator_override_file(
+    tmp_path, monkeypatch
+):
+    kiwoom_sniper_v2._reset_scanner_full_eval_pressure_state()
+    override_path = tmp_path / "operator_runtime_overrides.env"
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_SCANNER_OPERATOR_RUNTIME_OVERRIDE_PATH", override_path
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_SCANNER_HOT_RUNTIME_OVERRIDE_REFRESH_SEC", 0.0
+    )
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_MAX_PER_LOOP", raising=False
+    )
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_DYNAMIC_MAX_EXTRA_CALLS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_DEFER_SEC", raising=False
+    )
+    monkeypatch.delenv("KORSTOCKSCAN_SCANNER_WS_REPAIR_CYCLE_WAIT_SEC", raising=False)
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCANNER_WS_REPAIR_CYCLE_PERSISTENT_SEC", raising=False
+    )
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCANNER_WS_PERSISTENT_REPAIR_MIN_INTERVAL_SEC", raising=False
+    )
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCANNER_WS_SUBSCRIPTION_RECHECK_FRESH_SEC", raising=False
+    )
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCANNER_HEAVY_EVAL_RECHECK_FRESH_SEC", raising=False
+    )
+    monkeypatch.delenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_MAX_PER_LOOP", raising=False)
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCANNER_FULL_EVAL_BACKLOG_EXTRA_PER_LOOP", raising=False
+    )
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCANNER_FULL_EVAL_AUTO_PRESSURE_ENABLED", raising=False
+    )
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCANNER_FULL_EVAL_AUTO_PRESSURE_MIN_LIMIT", raising=False
+    )
+    monkeypatch.delenv("KORSTOCKSCAN_SCALPING_WATCHING_MAX_ACTIVE", raising=False)
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_CAP_ENABLED", raising=False
+    )
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_MIN_ACTIVE", raising=False
+    )
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_PRESSURE_MS", raising=False
+    )
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_RELIEF_MS", raising=False
+    )
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_COOLDOWN_SEC", raising=False
+    )
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_RECOVERY_STREAK", raising=False
+    )
+    _reset_scanner_hot_override_cache()
+
+    override_path.write_text(
+        "\n".join(
+            [
+                "export KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_MAX_PER_LOOP=7",
+                "export KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_DYNAMIC_MAX_EXTRA_CALLS=3",
+                "export KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_DEFER_SEC=4",
+                "export KORSTOCKSCAN_SCANNER_WS_REPAIR_CYCLE_WAIT_SEC=9",
+                "export KORSTOCKSCAN_SCANNER_WS_REPAIR_CYCLE_PERSISTENT_SEC=21",
+                "export KORSTOCKSCAN_SCANNER_WS_PERSISTENT_REPAIR_MIN_INTERVAL_SEC=11",
+                "export KORSTOCKSCAN_SCANNER_WS_SUBSCRIPTION_RECHECK_FRESH_SEC=12",
+                "export KORSTOCKSCAN_SCANNER_HEAVY_EVAL_RECHECK_FRESH_SEC=6",
+                "export KORSTOCKSCAN_SCANNER_FULL_EVAL_MAX_PER_LOOP=18",
+                "export KORSTOCKSCAN_SCANNER_FULL_EVAL_BACKLOG_EXTRA_PER_LOOP=10",
+                "export KORSTOCKSCAN_SCANNER_FULL_EVAL_AUTO_PRESSURE_ENABLED=false",
+                "export KORSTOCKSCAN_SCANNER_FULL_EVAL_AUTO_PRESSURE_MIN_LIMIT=9",
+                "export KORSTOCKSCAN_SCANNER_COMMON_WATCH_BUDGET_PRIORITY_ENABLED=false",
+                "export KORSTOCKSCAN_SCALPING_WATCHING_MAX_ACTIVE=28",
+                "export KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_CAP_ENABLED=true",
+                "export KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_MIN_ACTIVE=14",
+                "export KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_PRESSURE_MS=10000",
+                "export KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_RELIEF_MS=5000",
+                "export KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_COOLDOWN_SEC=20",
+                "export KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_RECOVERY_STREAK=4",
+                "export KORSTOCKSCAN_BUY_SCORE_THRESHOLD=1",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    os.utime(override_path, ns=(1_000_000_000, 1_000_000_000))
+
+    assert kiwoom_sniper_v2._scanner_rest_quote_fallback_max_per_loop() == 7
+    assert kiwoom_sniper_v2._scanner_rest_quote_fallback_dynamic_max_extra_calls() == 3
+    assert kiwoom_sniper_v2._scanner_rest_quote_fallback_defer_sec() == 4.0
+    assert kiwoom_sniper_v2._scanner_ws_repair_cycle_wait_sec() == 9.0
+    assert kiwoom_sniper_v2._scanner_ws_repair_cycle_persistent_sec() == 21.0
+    assert kiwoom_sniper_v2._scanner_ws_persistent_repair_min_interval_sec() == 11.0
+    assert kiwoom_sniper_v2._scanner_ws_subscription_recheck_fresh_sec() == 12.0
+    assert kiwoom_sniper_v2._scanner_heavy_eval_recheck_fresh_sec() == 6.0
+    assert kiwoom_sniper_v2._scanner_full_eval_max_per_loop() == 18
+    assert kiwoom_sniper_v2._scanner_full_eval_backlog_extra_per_loop() == 10
+    assert kiwoom_sniper_v2._scanner_full_eval_auto_pressure_enabled() is False
+    assert kiwoom_sniper_v2._scanner_full_eval_auto_pressure_min_limit(28) == 9
+    assert (
+        kiwoom_sniper_v2._scanner_full_eval_effective_limit(
+            {"scanner_watching_count": 40}
+        )
+        == 28
+    )
+    assert kiwoom_sniper_v2._scanner_common_watch_budget_priority_enabled() is False
+    assert kiwoom_sniper_v2._scalping_fifo_base_max_active() == 28
+    assert kiwoom_sniper_v2._scalping_dynamic_watch_cap_enabled() is True
+    assert kiwoom_sniper_v2._scalping_dynamic_watch_cap_min(28) == 14
+    assert kiwoom_sniper_v2._scalping_dynamic_watch_cap_pressure_ms() == 10000.0
+    assert kiwoom_sniper_v2._scalping_dynamic_watch_cap_relief_ms() == 5000.0
+    assert kiwoom_sniper_v2._scalping_dynamic_watch_cap_cooldown_sec() == 20.0
+    assert kiwoom_sniper_v2._scalping_dynamic_watch_cap_recovery_streak() == 4
+    assert (
+        kiwoom_sniper_v2._scanner_hot_runtime_override_value(
+            "KORSTOCKSCAN_BUY_SCORE_THRESHOLD"
+        )
+        is None
+    )
+
+    override_path.write_text(
+        "\n".join(
+            [
+                "export KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_MAX_PER_LOOP=4",
+                "export KORSTOCKSCAN_SCANNER_REST_QUOTE_FALLBACK_DYNAMIC_MAX_EXTRA_CALLS=1",
+                "export KORSTOCKSCAN_SCANNER_WS_REPAIR_CYCLE_WAIT_SEC=6",
+                "export KORSTOCKSCAN_SCANNER_HEAVY_EVAL_RECHECK_FRESH_SEC=2",
+                "export KORSTOCKSCAN_SCANNER_FULL_EVAL_MAX_PER_LOOP=9",
+                "export KORSTOCKSCAN_SCANNER_FULL_EVAL_BACKLOG_EXTRA_PER_LOOP=3",
+                "export KORSTOCKSCAN_SCANNER_FULL_EVAL_AUTO_PRESSURE_ENABLED=true",
+                "export KORSTOCKSCAN_SCANNER_FULL_EVAL_AUTO_PRESSURE_MIN_LIMIT=5",
+                "export KORSTOCKSCAN_SCANNER_COMMON_WATCH_BUDGET_PRIORITY_ENABLED=true",
+                "export KORSTOCKSCAN_SCALPING_WATCHING_MAX_ACTIVE=20",
+                "export KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_MIN_ACTIVE=12",
+                "export KORSTOCKSCAN_SCALPING_WATCHING_DYNAMIC_COOLDOWN_SEC=5",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    os.utime(override_path, ns=(2_000_000_000, 2_000_000_000))
+
+    assert kiwoom_sniper_v2._scanner_rest_quote_fallback_max_per_loop() == 4
+    assert kiwoom_sniper_v2._scanner_rest_quote_fallback_dynamic_max_extra_calls() == 1
+    assert kiwoom_sniper_v2._scanner_ws_repair_cycle_wait_sec() == 6.0
+    assert kiwoom_sniper_v2._scanner_heavy_eval_recheck_fresh_sec() == 2.0
+    assert kiwoom_sniper_v2._scanner_full_eval_max_per_loop() == 9
+    assert kiwoom_sniper_v2._scanner_full_eval_backlog_extra_per_loop() == 3
+    assert kiwoom_sniper_v2._scanner_full_eval_auto_pressure_enabled() is True
+    assert kiwoom_sniper_v2._scanner_full_eval_auto_pressure_min_limit(12) == 5
+    assert (
+        kiwoom_sniper_v2._scanner_full_eval_effective_limit(
+            {"scanner_watching_count": 40}
+        )
+        == 12
+    )
+    assert kiwoom_sniper_v2._scanner_common_watch_budget_priority_enabled() is True
+    assert kiwoom_sniper_v2._scalping_fifo_base_max_active() == 20
+    assert kiwoom_sniper_v2._scalping_dynamic_watch_cap_min(20) == 12
+    assert kiwoom_sniper_v2._scalping_dynamic_watch_cap_cooldown_sec() == 5.0
+    _reset_scanner_hot_override_cache()
+    kiwoom_sniper_v2._reset_scanner_full_eval_pressure_state()
+
+
+def test_non_rising_ws_misses_do_not_consume_positive_rest_quote_slot(monkeypatch):
+    kiwoom_sniper_v2._reset_scanner_rest_quote_fallback_rate_limit_for_tests()
+    _enable_scanner_rising_ws_gap_test_mode(monkeypatch)
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_RISING_WS_GAP_PRIORITY_RECOVERY_ENABLED", "true"
+    )
+    calls = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(publish=lambda *args, **kwargs: None),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_fetch_rest_quote_snapshot_for_ws_gap",
+        lambda code, now_ts: calls.append((code, now_ts)) or {"curr": 70000},
+    )
+
+    for idx, code in enumerate(("005930", "000660"), start=1):
+        stock = {
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "price_delta_since_first_seen_pct": "0.00",
+            "_scanner_ws_snapshot_recovery": {
+                "miss_count": 1,
+                "last_fallback_ts": 900.0,
+            },
+        }
+        ws_data, fields = kiwoom_sniper_v2._recover_missing_ws_snapshot(
+            stock, code, 1000.0 + idx, {}
+        )
+        assert ws_data == {}
+        assert fields["ws_recovery_outcome"] == "ws_reg_reissued_waiting_snapshot"
+
+    positive_stock = {
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "price_delta_since_first_seen_pct": "0.72",
+    }
+    ws_data, fields = kiwoom_sniper_v2._recover_missing_ws_snapshot(
+        positive_stock,
+        "035420",
+        1003.0,
+        {},
+        allow_early_rest_fallback=kiwoom_sniper_v2._scanner_ws_gap_early_rest_fallback_allowed(
+            positive_stock
+        ),
+    )
+
+    assert ws_data["curr"] == 70000
+    assert fields["ws_recovery_outcome"] == "rest_quote_applied"
+    assert calls == [("035420", 1003.0)]
+    kiwoom_sniper_v2._reset_scanner_rest_quote_fallback_rate_limit_for_tests()
+
+
+def test_expired_scanner_ws_miss_does_not_consume_rest_quote_slot(monkeypatch):
+    kiwoom_sniper_v2._reset_scanner_rest_quote_fallback_rate_limit_for_tests()
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_RISING_WS_GAP_PRIORITY_RECOVERY_ENABLED", "true"
+    )
+    calls = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(publish=lambda *args, **kwargs: None),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_fetch_rest_quote_snapshot_for_ws_gap",
+        lambda code, now_ts: calls.append((code, now_ts)) or {"curr": 70000},
+    )
+    stock = {
+        "status": "EXPIRED",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "price_delta_since_first_seen_pct": "1.20",
+        "_scanner_ws_snapshot_recovery": {"miss_count": 9, "last_fallback_ts": 900.0},
+    }
+
+    ws_data, fields = kiwoom_sniper_v2._recover_missing_ws_snapshot(
+        stock,
+        "005930",
+        1000.0,
+        {},
+        allow_early_rest_fallback=kiwoom_sniper_v2._scanner_rest_quote_fallback_allowed_for_ws_gap(
+            stock
+        ),
+    )
+
+    assert ws_data == {}
+    assert fields["rest_quote_fallback_eligible"] is False
+    assert fields["ws_recovery_outcome"] == "ws_reg_reissued_waiting_snapshot"
+    assert fields["ws_subscription_repair_required"] is True
+    assert calls == []
+    kiwoom_sniper_v2._reset_scanner_rest_quote_fallback_rate_limit_for_tests()
+
+
+def test_recover_missing_ws_snapshot_sets_cooldown_after_rest_quote_failure(
+    monkeypatch,
+):
+    kiwoom_sniper_v2._reset_scanner_rest_quote_fallback_rate_limit_for_tests()
+    _enable_scanner_rising_ws_gap_test_mode(monkeypatch)
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_RISING_WS_GAP_PRIORITY_RECOVERY_ENABLED", "true"
+    )
+    calls = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(publish=lambda *args, **kwargs: None),
+    )
+    monkeypatch.setattr(kiwoom_sniper_v2, "KIWOOM_TOKEN", "token")
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.kiwoom_utils,
+        "get_api_url",
+        lambda path: "https://example.invalid",
+    )
+
+    def fail_fetch(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise RuntimeError("429")
+
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.kiwoom_utils, "fetch_kiwoom_api_continuous", fail_fetch
+    )
+
+    stock1 = {
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "price_delta_since_first_seen_pct": "0.70",
+        "_scanner_ws_snapshot_recovery": {"miss_count": 1, "last_fallback_ts": 900.0},
+    }
+    ws_data1, fields1 = kiwoom_sniper_v2._recover_missing_ws_snapshot(
+        stock1,
+        "005930",
+        1000.0,
+        {},
+        allow_early_rest_fallback=kiwoom_sniper_v2._scanner_rest_quote_fallback_allowed_for_ws_gap(
+            stock1
+        ),
+    )
+    stock2 = {
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "price_delta_since_first_seen_pct": "0.70",
+        "_scanner_ws_snapshot_recovery": {"miss_count": 1, "last_fallback_ts": 900.0},
+    }
+    ws_data2, fields2 = kiwoom_sniper_v2._recover_missing_ws_snapshot(
+        stock2,
+        "000660",
+        1001.0,
+        {},
+        allow_early_rest_fallback=kiwoom_sniper_v2._scanner_rest_quote_fallback_allowed_for_ws_gap(
+            stock2
+        ),
+    )
+
+    assert ws_data1 == {}
+    assert fields1["ws_recovery_outcome"] == "rest_quote_unavailable"
+    assert ws_data2 == {}
+    assert fields2["ws_recovery_outcome"] == "rest_quote_rate_limited_cooldown"
+    assert len(calls) == 1
+    kiwoom_sniper_v2._reset_scanner_rest_quote_fallback_rate_limit_for_tests()
+
+
+def test_scanner_ws_gap_early_rest_fallback_rejects_observed_price_without_positive_delta():
+    stock = {
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "scanner_promotion_id": "SCANPROM-005930-1000000",
+        "buy_price": 70000,
+        "price_delta_since_first_seen_pct": "0.60",
+    }
+
+    assert kiwoom_sniper_v2._scanner_ws_gap_early_rest_fallback_allowed(stock) is False
+
+
+def test_scanner_ws_gap_early_rest_fallback_rejects_observed_price_without_positive_delta_when_enabled(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_RISING_WS_GAP_PRIORITY_RECOVERY_ENABLED", "true"
+    )
+    stock = {
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "scanner_promotion_id": "SCANPROM-005930-1000000",
+        "buy_price": 70000,
+        "price_delta_since_first_seen_pct": "0.00",
+    }
+
+    assert kiwoom_sniper_v2._scanner_ws_gap_early_rest_fallback_allowed(stock) is False
+
+
+def test_scanner_ws_gap_early_rest_fallback_hydrates_restored_scanner_context(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_RISING_WS_GAP_PRIORITY_RECOVERY_ENABLED", "true"
+    )
+
+    def fake_hydrate(stock):
+        stock["price_delta_since_first_seen_pct"] = "1.11"
+        return stock
+
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.sniper_state_handlers,
+        "_hydrate_scanner_promotion_runtime_context",
+        fake_hydrate,
+    )
+    stock = {
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "scanner_promotion_id": "SCANPROM-089790-1782104558056",
+        "entry_armed_at_epoch": 1782104558.056512,
+    }
+
+    assert kiwoom_sniper_v2._scanner_ws_gap_early_rest_fallback_allowed(stock) is True
+    assert stock["price_delta_since_first_seen_pct"] == "1.11"
+
+
+def test_recover_missing_ws_snapshot_uses_custom_ws_reg_source(monkeypatch):
+    published = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_fetch_rest_quote_snapshot_for_ws_gap",
+        lambda *args, **kwargs: {},
+    )
+
+    kiwoom_sniper_v2._recover_missing_ws_snapshot(
+        {},
+        "005930",
+        1000.0,
+        {"curr": 70000},
+        ws_reg_source="scanner_fast_precheck_stale_ws_recovery",
+    )
+
+    assert published == [
+        (
+            "COMMAND_WS_REG",
+            {"codes": ["005930"], "source": "scanner_fast_precheck_stale_ws_recovery"},
+        )
+    ]
+
+
+def test_recover_missing_ws_snapshot_can_defer_ws_reg_publish(monkeypatch):
+    published = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_fetch_rest_quote_snapshot_for_ws_gap",
+        lambda *args, **kwargs: {},
+    )
+
+    ws_data, fields = kiwoom_sniper_v2._recover_missing_ws_snapshot(
+        {},
+        "005930",
+        1000.0,
+        {},
+        publish_ws_reg=False,
+    )
+
+    assert ws_data == {}
+    assert published == []
+    assert fields["ws_recovery_action"] == "ws_reg_reissued"
+    assert fields["ws_recovery_outcome"] == "ws_reg_reissued_waiting_snapshot"
+
+
+def test_recover_missing_ws_snapshot_keeps_repair_cycle_from_repeating_reg(monkeypatch):
+    published = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_fetch_rest_quote_snapshot_for_ws_gap",
+        lambda *args, **kwargs: {},
+    )
+    stock = {}
+
+    _, first_fields = kiwoom_sniper_v2._recover_missing_ws_snapshot(
+        stock, "005930", 1000.0, {}
+    )
+    _, second_fields = kiwoom_sniper_v2._recover_missing_ws_snapshot(
+        stock, "005930", 1005.0, {}
+    )
+
+    assert len(published) == 1
+    assert first_fields["ws_repair_cycle_reg_allowed"] is True
+    assert second_fields["ws_repair_cycle_reg_allowed"] is False
+    assert second_fields["ws_repair_cycle_suppressed_duplicate_reg"] is True
+    assert second_fields["ws_recovery_outcome"] == "ws_repair_cycle_waiting_snapshot"
+
+
+def test_recover_missing_ws_snapshot_marks_persistent_ws_gap_after_cycle_timeout(
+    monkeypatch,
+):
+    published = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_fetch_rest_quote_snapshot_for_ws_gap",
+        lambda *args, **kwargs: {},
+    )
+    stock = {
+        "_scanner_ws_snapshot_recovery": {
+            "repair_cycle_id": "005930:1000000",
+            "repair_cycle_started_ts": 1000.0,
+            "last_ws_reg_ts": 1000.0,
+            "miss_count": 4,
+        }
+    }
+
+    _, fields = kiwoom_sniper_v2._recover_missing_ws_snapshot(
+        stock, "005930", 1065.0, {}
+    )
+
+    assert fields["ws_recovery_outcome"] == "persistent_ws_gap"
+    assert fields["ws_subscription_repair_required"] is True
+    assert fields["ws_repair_cycle_reg_allowed"] is False
+    assert fields["ws_repair_batch_required"] is True
+    assert len(published) == 0
+
+
+def test_recover_missing_ws_snapshot_cycle_store_survives_target_object_refresh(
+    monkeypatch,
+):
+    published = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_fetch_rest_quote_snapshot_for_ws_gap",
+        lambda *args, **kwargs: {},
+    )
+    cycle_store = {}
+
+    _, first_fields = kiwoom_sniper_v2._recover_missing_ws_snapshot(
+        {},
+        "005930",
+        1000.0,
+        {},
+        cycle_state_store=cycle_store,
+    )
+    _, second_fields = kiwoom_sniper_v2._recover_missing_ws_snapshot(
+        {},
+        "005930",
+        1065.0,
+        {},
+        cycle_state_store=cycle_store,
+    )
+
+    assert first_fields["ws_repair_cycle_state"] == "ws_reg_reissued_waiting_snapshot"
+    assert second_fields["ws_repair_cycle_state"] == "persistent_ws_gap"
+    assert second_fields["ws_repair_batch_required"] is True
+    assert len(published) == 1
+
+
+def test_scanner_ws_subscription_recheck_closes_when_subscribed_snapshot_fresh():
+    manager = SimpleNamespace(
+        subscribed_codes={"005930"},
+        get_latest_data=lambda code: {
+            "curr": 70000,
+            "last_ws_update_ts": 1000.0,
+            "received_types": ["0B"],
+        },
+    )
+
+    fields = kiwoom_sniper_v2._scanner_ws_subscription_recheck_fields(
+        manager,
+        "005930",
+        {},
+        now_ts=1001.0,
+    )
+
+    assert fields["ws_subscription_recheck_status"] == "subscribed_fresh_snapshot"
+    assert fields["ws_subscription_repair_needed"] is False
+    assert fields["ws_subscription_recheck_received_types"] == "0B"
+    assert fields["ws_subscription_recheck_entry_realtime_fresh"] is True
+    assert (
+        fields["ws_subscription_recheck_entry_realtime_source"]
+        == "last_ws_update_ts_with_0B"
+    )
+
+
+def test_scanner_ws_subscription_recheck_prefers_fresher_manager_snapshot():
+    manager = SimpleNamespace(
+        subscribed_codes={"005930"},
+        get_latest_data=lambda code: {
+            "curr": 71000,
+            "last_ws_update_ts": 1029.0,
+            "received_types": ["0B", "0D"],
+        },
+    )
+
+    snapshot, fields = (
+        kiwoom_sniper_v2._scanner_ws_subscription_recheck_snapshot_and_fields(
+            manager,
+            "005930",
+            {"curr": 70000, "last_ws_update_ts": 1000.0, "received_types": ["0B"]},
+            now_ts=1030.0,
+        )
+    )
+
+    assert snapshot["curr"] == 71000
+    assert fields["ws_subscription_recheck_status"] == "subscribed_fresh_snapshot"
+    assert fields["ws_subscription_repair_needed"] is False
+    assert fields["ws_subscription_recheck_age_sec"] == 1.0
+    assert fields["ws_subscription_recheck_received_types"] == "0B,0D"
+
+
+def test_scanner_ws_subscription_recheck_normalizes_entry_price_timestamp():
+    manager = SimpleNamespace(
+        subscribed_codes={"005930"},
+        get_latest_data=lambda code: {
+            "curr": 71000,
+            "last_ws_update_ts": 1020.0,
+            "last_realtime_type_ts": {"0B": 1028.5, "0D": 1029.0},
+            "strength_momentum_history": [{"ts": 1028.5, "price": 71000}],
+            "received_types": ["0B", "0D"],
+        },
+    )
+
+    snapshot, fields = (
+        kiwoom_sniper_v2._scanner_ws_subscription_recheck_snapshot_and_fields(
+            manager,
+            "005930",
+            {"curr": 70000, "last_ws_update_ts": 1000.0, "received_types": ["0B"]},
+            now_ts=1030.0,
+        )
+    )
+
+    assert snapshot["last_ws_update_ts"] == 1028.5
+    assert snapshot["entry_eval_last_ws_update_ts_normalized_from"] in {
+        "last_realtime_type_ts_0B",
+        "strength_momentum_history",
+    }
+    assert fields["ws_subscription_recheck_status"] == "subscribed_fresh_snapshot"
+    assert fields["ws_subscription_recheck_age_sec"] == 1.5
+    assert fields["ws_subscription_recheck_entry_timestamp_normalized"] is True
+    assert fields["ws_subscription_recheck_entry_normalized_age_sec"] == 1.5
+
+
+def test_scanner_ws_subscription_recheck_selects_manager_snapshot_by_normalized_entry_timestamp():
+    manager = SimpleNamespace(
+        subscribed_codes={"005930"},
+        get_latest_data=lambda code: {
+            "curr": 71000,
+            "last_ws_update_ts": 1020.0,
+            "last_realtime_type_ts": {"0B": 1029.0},
+            "received_types": ["0B"],
+        },
+    )
+
+    snapshot, fields = (
+        kiwoom_sniper_v2._scanner_ws_subscription_recheck_snapshot_and_fields(
+            manager,
+            "005930",
+            {"curr": 70000, "last_ws_update_ts": 1025.0, "received_types": ["0B"]},
+            now_ts=1030.0,
+        )
+    )
+
+    assert snapshot["curr"] == 71000
+    assert snapshot["last_ws_update_ts"] == 1029.0
+    assert fields["ws_subscription_recheck_age_sec"] == 1.0
+    assert (
+        fields["ws_subscription_recheck_entry_timestamp_source"]
+        == "last_realtime_type_ts_0B"
+    )
+
+
+def test_scanner_ws_subscription_recheck_does_not_normalize_from_non_price_type_only():
+    manager = SimpleNamespace(
+        subscribed_codes={"005930"},
+        get_latest_data=lambda code: {
+            "curr": 71000,
+            "last_ws_update_ts": 1020.0,
+            "last_realtime_type_ts": {"0D": 1029.0, "0w": 1029.5},
+            "received_types": ["0D", "0w"],
+        },
+    )
+
+    snapshot, fields = (
+        kiwoom_sniper_v2._scanner_ws_subscription_recheck_snapshot_and_fields(
+            manager,
+            "005930",
+            {},
+            now_ts=1030.0,
+        )
+    )
+
+    assert snapshot["last_ws_update_ts"] == 1020.0
+    assert "entry_eval_last_ws_update_ts_normalized_from" not in snapshot
+    assert (
+        fields["ws_subscription_recheck_status"]
+        == "subscribed_snapshot_stale_or_missing"
+    )
+    assert fields["ws_subscription_repair_needed"] is True
+    assert fields["ws_subscription_recheck_entry_realtime_fresh"] is False
+    assert (
+        fields["ws_subscription_recheck_entry_realtime_source"]
+        == "missing_fresh_0B_or_strength_history"
+    )
+    assert fields["ws_subscription_recheck_entry_timestamp_normalized"] is False
+    assert (
+        fields["ws_subscription_recheck_entry_timestamp_source"] == "last_ws_update_ts"
+    )
+    assert fields["ws_subscription_recheck_age_sec"] == 10.0
+
+
+def test_scanner_ws_subscription_recheck_requires_fresh_entry_realtime_source():
+    manager = SimpleNamespace(
+        subscribed_codes={"005930"},
+        get_latest_data=lambda code: {
+            "curr": 71000,
+            "last_ws_update_ts": 1029.0,
+            "last_realtime_type_ts": {"0B": 900.0, "0D": 1029.0, "0w": 1029.0},
+            "strength_momentum_history": [{"ts": 900.0, "price": 71000}],
+            "received_types": ["0B", "0D", "0w"],
+        },
+    )
+
+    snapshot, fields = (
+        kiwoom_sniper_v2._scanner_ws_subscription_recheck_snapshot_and_fields(
+            manager,
+            "005930",
+            {},
+            now_ts=1030.0,
+        )
+    )
+
+    assert snapshot["curr"] == 71000
+    assert fields["ws_subscription_recheck_age_sec"] == 1.0
+    assert (
+        fields["ws_subscription_recheck_status"]
+        == "subscribed_snapshot_stale_or_missing"
+    )
+    assert fields["ws_subscription_repair_needed"] is True
+    assert fields["ws_subscription_recheck_entry_realtime_fresh"] is False
+    assert (
+        fields["ws_subscription_recheck_entry_realtime_source"]
+        == "last_realtime_type_ts_0B"
+    )
+
+
+def test_scanner_ws_subscription_recheck_requires_repair_when_subscribed_but_zero_curr():
+    manager = SimpleNamespace(subscribed_codes={"005930"})
+
+    fields = kiwoom_sniper_v2._scanner_ws_subscription_recheck_fields(
+        manager,
+        "005930",
+        {"curr": 0, "last_ws_update_ts": 1000.0, "received_types": ["0D"]},
+        now_ts=1001.0,
+    )
+
+    assert (
+        fields["ws_subscription_recheck_status"]
+        == "subscribed_snapshot_stale_or_missing"
+    )
+    assert fields["ws_subscription_repair_needed"] is True
+    assert fields["ws_subscription_recheck_received_types"] == "0D"
+
+
+def test_scanner_rest_quote_applied_keeps_entry_realtime_stale_outcome():
+    fields = kiwoom_sniper_v2._scanner_rest_quote_entry_realtime_outcome_fields(
+        {
+            "ws_recovery_outcome": "rest_quote_applied",
+            "ws_subscription_repair_needed": True,
+            "ws_subscription_recheck_status": "subscribed_snapshot_stale_or_missing",
+        }
+    )
+
+    assert (
+        fields["ws_recovery_outcome"] == "rest_quote_applied_entry_realtime_still_stale"
+    )
+    assert fields["rest_quote_price_recovery_only"] is True
+    assert fields["entry_evaluable_fresh_after_rest_quote"] is False
+
+
+def test_scanner_rest_quote_applied_preserves_fresh_entry_realtime_outcome():
+    fields = kiwoom_sniper_v2._scanner_rest_quote_entry_realtime_outcome_fields(
+        {
+            "ws_recovery_outcome": "rest_quote_applied",
+            "ws_subscription_repair_needed": False,
+            "ws_subscription_recheck_status": "subscribed_fresh_snapshot",
+        }
+    )
+
+    assert fields["ws_recovery_outcome"] == "rest_quote_applied"
+    assert "rest_quote_price_recovery_only" not in fields
+
+
+def test_scanner_ws_subscription_recheck_requires_repair_without_timestamp():
+    manager = SimpleNamespace(
+        subscribed_codes={"005930"},
+        get_latest_data=lambda code: {"curr": 70000},
+    )
+
+    fields = kiwoom_sniper_v2._scanner_ws_subscription_recheck_fields(
+        manager,
+        "005930",
+        {},
+        now_ts=1001.0,
+    )
+
+    assert (
+        fields["ws_subscription_recheck_status"]
+        == "subscribed_snapshot_stale_or_missing"
+    )
+    assert fields["ws_subscription_repair_needed"] is True
+    assert fields["ws_subscription_recheck_age_sec"] == "not_available_ws_age_sec"
+    assert fields["ws_subscription_recheck_received_types"] == "-"
+
+
+def test_scanner_ws_subscription_recheck_requires_repair_when_snapshot_stale(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_SCANNER_OPERATOR_RUNTIME_OVERRIDE_PATH",
+        tmp_path / "missing_operator_runtime_overrides.env",
+    )
+    _reset_scanner_hot_override_cache()
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCANNER_WS_SUBSCRIPTION_RECHECK_FRESH_SEC", raising=False
+    )
+    manager = SimpleNamespace(subscribed_codes={"005930"})
+
+    fields = kiwoom_sniper_v2._scanner_ws_subscription_recheck_fields(
+        manager,
+        "005930",
+        {"curr": 70000, "last_ws_update_ts": 1000.0, "received_types": ["0B", "0D"]},
+        now_ts=1031.0,
+    )
+
+    assert (
+        fields["ws_subscription_recheck_status"]
+        == "subscribed_snapshot_stale_or_missing"
+    )
+    assert fields["ws_subscription_repair_needed"] is True
+    assert fields["ws_subscription_recheck_fresh_sec"] == 30.0
+    assert fields["ws_subscription_recheck_received_types"] == "0B,0D"
+
+
+def test_scanner_ws_persistent_repair_min_interval_allows_aggressive_source_refresh(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_SCANNER_OPERATOR_RUNTIME_OVERRIDE_PATH",
+        tmp_path / "missing_operator_runtime_overrides.env",
+    )
+    _reset_scanner_hot_override_cache()
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCANNER_WS_PERSISTENT_REPAIR_MIN_INTERVAL_SEC", raising=False
+    )
+    assert kiwoom_sniper_v2._scanner_ws_persistent_repair_min_interval_sec() == 20.0
+
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_WS_PERSISTENT_REPAIR_MIN_INTERVAL_SEC", "8"
+    )
+    assert kiwoom_sniper_v2._scanner_ws_persistent_repair_min_interval_sec() == 8.0
+
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_WS_PERSISTENT_REPAIR_MIN_INTERVAL_SEC", "1"
+    )
+    assert kiwoom_sniper_v2._scanner_ws_persistent_repair_min_interval_sec() == 5.0
+
+
+def test_scanner_ws_repair_cycle_defaults_are_aggressive_but_bounded(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_SCANNER_OPERATOR_RUNTIME_OVERRIDE_PATH",
+        tmp_path / "missing_operator_runtime_overrides.env",
+    )
+    _reset_scanner_hot_override_cache()
+    monkeypatch.delenv("KORSTOCKSCAN_SCANNER_WS_REPAIR_CYCLE_WAIT_SEC", raising=False)
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCANNER_WS_REPAIR_CYCLE_PERSISTENT_SEC", raising=False
+    )
+
+    assert kiwoom_sniper_v2._scanner_ws_repair_cycle_wait_sec() == 10.0
+    assert kiwoom_sniper_v2._scanner_ws_repair_cycle_persistent_sec() == 30.0
+
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_WS_REPAIR_CYCLE_WAIT_SEC", "1")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_WS_REPAIR_CYCLE_PERSISTENT_SEC", "5")
+    assert kiwoom_sniper_v2._scanner_ws_repair_cycle_wait_sec() == 5.0
+    assert kiwoom_sniper_v2._scanner_ws_repair_cycle_persistent_sec() == 10.0
+
+
+def test_scanner_heavy_eval_recheck_fresh_sec_defaults_to_pre_ai_freshness(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_SCANNER_OPERATOR_RUNTIME_OVERRIDE_PATH",
+        tmp_path / "missing_operator_runtime_overrides.env",
+    )
+    _reset_scanner_hot_override_cache()
+    monkeypatch.delenv(
+        "KORSTOCKSCAN_SCANNER_HEAVY_EVAL_RECHECK_FRESH_SEC", raising=False
+    )
+    assert kiwoom_sniper_v2._scanner_heavy_eval_recheck_fresh_sec() == 3.0
+
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_HEAVY_EVAL_RECHECK_FRESH_SEC", "0.5")
+    assert kiwoom_sniper_v2._scanner_heavy_eval_recheck_fresh_sec() == 1.0
+
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_HEAVY_EVAL_RECHECK_FRESH_SEC", "60")
+    assert kiwoom_sniper_v2._scanner_heavy_eval_recheck_fresh_sec() == 20.0
+
+
+def test_scanner_heavy_eval_min_retry_keeps_async_rechecks_at_or_above_deadline(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_SCANNER_OPERATOR_RUNTIME_OVERRIDE_PATH",
+        tmp_path / "missing_operator_runtime_overrides.env",
+    )
+    _reset_scanner_hot_override_cache()
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_HEAVY_EVAL_RECHECK_FRESH_SEC", "4")
+    assert kiwoom_sniper_v2._scanner_heavy_eval_min_retry_sec() == 15.0
+
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_HEAVY_EVAL_RECHECK_FRESH_SEC", "18")
+    assert kiwoom_sniper_v2._scanner_heavy_eval_min_retry_sec() == 18.0
+
+
+def test_scanner_heavy_eval_retry_due_does_not_allow_same_generation_tick_churn(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_SCANNER_OPERATOR_RUNTIME_OVERRIDE_PATH",
+        tmp_path / "missing_operator_runtime_overrides.env",
+    )
+    _reset_scanner_hot_override_cache()
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_HEAVY_EVAL_RECHECK_FRESH_SEC", "4")
+    target = {
+        "_scanner_last_heavy_eval_attempt_epoch": 100.0,
+        "_scanner_last_heavy_eval_evidence_fingerprint": "old-bbo",
+    }
+
+    due, retry_after = kiwoom_sniper_v2._scanner_heavy_eval_retry_due(
+        target,
+        now_epoch=105.0,
+    )
+    target["_scanner_last_heavy_eval_evidence_fingerprint"] = "new-bbo"
+    still_due, same_retry_after = kiwoom_sniper_v2._scanner_heavy_eval_retry_due(
+        target,
+        now_epoch=106.0,
+    )
+
+    assert due is False
+    assert still_due is False
+    assert retry_after == 115.0
+    assert same_retry_after == 115.0
+    assert target["_scanner_heavy_eval_retry_after_epoch"] == 115.0
+
+    released, released_after = kiwoom_sniper_v2._scanner_heavy_eval_retry_due(
+        target,
+        now_epoch=115.0,
+    )
+    assert released is True
+    assert released_after == 115.0
+    assert "_scanner_heavy_eval_retry_after_epoch" not in target
+
+
+def test_scanner_heavy_eval_retry_due_honors_explicit_future_recheck_without_attempt():
+    target = {"_scanner_heavy_eval_retry_after_epoch": 110.0}
+
+    due, retry_after = kiwoom_sniper_v2._scanner_heavy_eval_retry_due(
+        target,
+        now_epoch=105.0,
+    )
+
+    assert due is False
+    assert retry_after == 110.0
+
+
+def test_scanner_heavy_eval_retry_due_applies_to_legacy_promotion_without_generation(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_SCANNER_OPERATOR_RUNTIME_OVERRIDE_PATH",
+        tmp_path / "missing_operator_runtime_overrides.env",
+    )
+    _reset_scanner_hot_override_cache()
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_HEAVY_EVAL_RECHECK_FRESH_SEC", "4")
+    target = {
+        "scanner_promotion_id": "PROMO-LEGACY-1",
+        "_scanner_last_heavy_eval_attempt_epoch": 100.0,
+    }
+
+    due, retry_after = kiwoom_sniper_v2._scanner_heavy_eval_retry_due(
+        target,
+        now_epoch=101.0,
+        allow_explicit_recheck=True,
+        consume_explicit_recheck=True,
+    )
+
+    assert due is False
+    assert retry_after == 115.0
+    assert target["_scanner_heavy_eval_retry_after_epoch"] == 115.0
+
+
+def test_scanner_heavy_eval_explicit_recheck_bypasses_cadence_only_once(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_SCANNER_OPERATOR_RUNTIME_OVERRIDE_PATH",
+        tmp_path / "missing_operator_runtime_overrides.env",
+    )
+    _reset_scanner_hot_override_cache()
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_HEAVY_EVAL_RECHECK_FRESH_SEC", "4")
+    target = {
+        "_scanner_last_heavy_eval_attempt_epoch": 100.0,
+        "entry_strength_momentum_recheck_pending": True,
+        "entry_strength_momentum_recheck_count": 1,
+        "entry_strength_momentum_recheck_after_epoch": 102.0,
+        "entry_strength_momentum_recheck_reason": "below_strength_base",
+    }
+
+    preview_due, _ = kiwoom_sniper_v2._scanner_heavy_eval_retry_due(
+        target,
+        now_epoch=103.0,
+        allow_explicit_recheck=True,
+    )
+    admitted, _ = kiwoom_sniper_v2._scanner_heavy_eval_retry_due(
+        target,
+        now_epoch=103.0,
+        allow_explicit_recheck=True,
+        consume_explicit_recheck=True,
+    )
+    repeated, retry_after = kiwoom_sniper_v2._scanner_heavy_eval_retry_due(
+        target,
+        now_epoch=104.0,
+        allow_explicit_recheck=True,
+        consume_explicit_recheck=True,
+    )
+
+    assert preview_due is True
+    assert admitted is True
+    assert repeated is False
+    assert retry_after == 115.0
+    assert target["_scanner_last_heavy_eval_explicit_recheck_key"].startswith(
+        "strength:1:102.000000"
+    )
+
+
+def test_run_sniper_gates_legacy_heavy_eval_before_consuming_loop_budget():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    strength_wait_idx = source.index("if _scanner_strength_recheck_waiting(")
+    budget_start = source.index('budget_source = "standard"')
+    preview_gate_idx = source.index(
+        "legacy_retry_preview_due, legacy_retry_after_epoch = (",
+        strength_wait_idx,
+    )
+    common_gate_idx = source.index(
+        "heavy_retry_due, heavy_retry_after_epoch = (",
+        budget_start,
+    )
+    scheduler_enqueue_idx = source.index(
+        "heavy_decision = _scanner_scheduler_enqueue_target(",
+        common_gate_idx,
+    )
+    legacy_count_idx = source.index(
+        "scanner_full_eval_count += 1",
+        scheduler_enqueue_idx,
+    )
+
+    assert strength_wait_idx < preview_gate_idx < budget_start
+    assert budget_start < common_gate_idx < scheduler_enqueue_idx < legacy_count_idx
+    assert (
+        "consume_explicit_recheck=True" in source[common_gate_idx:scheduler_enqueue_idx]
+    )
+
+
+def test_scanner_deadline_expiry_parks_generation_without_immediate_retry(
+    monkeypatch,
+):
+    scheduler = kiwoom_sniper_v2.ScannerRuntimeScheduler(max_active=16)
+    registered = scheduler.register_generation(
+        code="000001",
+        promotion_id="PROMO-1",
+        record_id=1,
+        venue="KRX",
+        promotion_epoch=99.0,
+        attach_epoch=100.0,
+        observed_price=10_000,
+        source_signature="VALUE_TOP",
+    )
+    target = {
+        "id": 1,
+        "code": "000001",
+        "name": "TEST",
+        "strategy": "SCALPING",
+        "status": "WATCHING",
+        "position_tag": "SCANNER",
+        "effective_venue": "KRX",
+        "venue_resolution": "scanner_session_clock:krx_regular",
+        "scanner_generation_id": registered.item.generation.generation_id,
+    }
+    emitted = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_emit_scanner_scheduler_event",
+        lambda **kwargs: emitted.append(kwargs),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_async_eval_coordinator",
+        None,
+        raising=False,
+    )
+    expired = scheduler.claim(
+        registered.item.generation,
+        lane=kiwoom_sniper_v2.ScannerLane.FAST_PRECHECK,
+        now_epoch=111.0,
+    )
+
+    refreshed = kiwoom_sniper_v2._scanner_scheduler_refresh_claim_after_expiry(
+        scheduler,
+        target,
+        previous_decision=expired,
+        now_epoch=111.0,
+    )
+
+    assert refreshed is None
+    assert target["_scanner_scheduler_warm_parked"] is True
+    assert target["_scanner_scheduler_warm_generation_id"] == (
+        registered.item.generation.generation_id
+    )
+    assert scheduler.current_generation("000001") == registered.item.generation
+    assert scheduler.snapshot_metrics(now_epoch=111.0)["scheduler_queue_depth"] == 0
+    assert emitted[-1]["stage"] == "scalping_scanner_scheduler_work_completed"
+
+
+def test_scanner_explicit_bounded_recheck_continues_without_warm_parking(
+    monkeypatch,
+):
+    scheduler = kiwoom_sniper_v2.ScannerRuntimeScheduler(max_active=16)
+    registered = scheduler.register_generation(
+        code="000001",
+        promotion_id="PROMO-1",
+        record_id=1,
+        venue="KRX",
+        promotion_epoch=99.0,
+        attach_epoch=100.0,
+        observed_price=10_000,
+        source_signature="VALUE_TOP",
+    )
+    first = scheduler.next_decision(now_epoch=100.1)
+    scheduler.complete(first.item, completed_epoch=100.2, outcome="pass")
+    target = {
+        "id": 1,
+        "code": "000001",
+        "name": "TEST",
+        "strategy": "SCALPING",
+        "status": "WATCHING",
+        "position_tag": "SCANNER",
+        "effective_venue": "KRX",
+        "scanner_generation_id": registered.item.generation.generation_id,
+        "entry_strength_momentum_recheck_pending": True,
+    }
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_emit_scanner_scheduler_event",
+        lambda **kwargs: None,
+    )
+
+    continued = kiwoom_sniper_v2._scanner_scheduler_continue_bounded_recheck_or_park(
+        scheduler,
+        target,
+        now_epoch=101.0,
+        park_reason="would_park",
+        expected_generation=registered.item.generation,
+        evidence_snapshot={"curr": 10_010},
+    )
+
+    assert continued is True
+    assert "_scanner_scheduler_warm_parked" not in target
+    assert scheduler.snapshot_metrics(now_epoch=101.0)["scheduler_queue_depth"] == 1
+
+
+@pytest.mark.parametrize(
+    "fast_precheck_reason",
+    [
+        "missing_or_zero_curr",
+        "awaiting_first_post_attach_trade_input",
+    ],
+)
+def test_scanner_cold_warm_park_reactivates_on_first_post_attach_trade(
+    monkeypatch,
+    fast_precheck_reason,
+):
+    scheduler = kiwoom_sniper_v2.ScannerRuntimeScheduler(max_active=16)
+    coordinator = ScannerAsyncEvalCoordinator(
+        ai_dispatcher=HotPathAIDispatcher(loaded_key_count=1)
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_async_eval_coordinator",
+        coordinator,
+        raising=False,
+    )
+    registered = scheduler.register_generation(
+        code="000001",
+        promotion_id="PROMO-1",
+        record_id=1,
+        venue="KRX",
+        promotion_epoch=99.0,
+        attach_epoch=100.0,
+        observed_price=10_000,
+        source_signature="VALUE_TOP",
+    )
+    first = scheduler.next_decision(now_epoch=100.1)
+    scheduler.complete(
+        first.item, completed_epoch=100.2, outcome="source_quality_blocked"
+    )
+    target = {
+        "id": 1,
+        "code": "000001",
+        "name": "TEST",
+        "strategy": "SCALPING",
+        "status": "WATCHING",
+        "position_tag": "SCANNER",
+        "effective_venue": "KRX",
+        "scanner_attach_epoch": 100.0,
+        "scanner_generation_id": registered.item.generation.generation_id,
+        "_scanner_fast_precheck_fields": {
+            "fast_precheck_reason": fast_precheck_reason,
+        },
+    }
+    emitted = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_emit_scanner_scheduler_event",
+        lambda **kwargs: emitted.append(kwargs),
+    )
+    assert kiwoom_sniper_v2._scanner_scheduler_park_target_generation(
+        scheduler,
+        target,
+        now_epoch=100.2,
+        reason="precheck_not_eligible_generation_warm_parked",
+        expected_generation=registered.item.generation,
+    )
+
+    reactivated = kiwoom_sniper_v2._scanner_scheduler_reactivate_cold_park_on_fresh_ws(
+        scheduler,
+        target,
+        {
+            "curr": 10_050,
+            "received_types": ["0B"],
+            "last_realtime_type_ts": {"0B": 101.0},
+            "last_ws_update_ts": 101.0,
+        },
+        now_epoch=101.1,
+    )
+
+    assert reactivated is True
+    assert "_scanner_scheduler_warm_parked" not in target
+    assert target["scanner_warm_first_fresh_price"] == 10_050
+    assert target["scanner_first_entry_realtime_epoch"] == 101.0
+    assert scheduler.snapshot_metrics(now_epoch=101.1)["scheduler_queue_depth"] == 1
+    next_item = scheduler.next_decision(now_epoch=101.1)
+    assert next_item.item.owner == "first_fresh_ws_after_cold_warm_park"
+    assert emitted[-1]["stage"] == ("scalping_scanner_scheduler_warm_park_reactivated")
+    coordinator.shutdown()
+
+
+def test_scanner_opening_rotation_tick_source_gap_rechecks_once_on_new_0b(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.sniper_state_handlers,
+        "OPENING_ROTATION_RETIRED",
+        False,
+    )
+    scheduler = kiwoom_sniper_v2.ScannerRuntimeScheduler(max_active=16)
+    coordinator = ScannerAsyncEvalCoordinator(
+        ai_dispatcher=HotPathAIDispatcher(loaded_key_count=1)
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_async_eval_coordinator",
+        coordinator,
+        raising=False,
+    )
+    registered = scheduler.register_generation(
+        code="000001",
+        promotion_id="PROMO-OPENING",
+        record_id=1,
+        venue="KRX",
+        promotion_epoch=99.0,
+        attach_epoch=100.0,
+        observed_price=10_000,
+        source_signature="PRICE_JUMP_START",
+    )
+    first = scheduler.next_decision(now_epoch=100.1)
+    scheduler.complete(first.item, completed_epoch=100.2, outcome="WATCHING")
+    target = {
+        "id": 1,
+        "code": "000001",
+        "name": "TEST",
+        "strategy": "SCALPING",
+        "status": "WATCHING",
+        "position_tag": "SCANNER",
+        "effective_venue": "KRX",
+        "scanner_attach_epoch": 100.0,
+        "scanner_generation_id": registered.item.generation.generation_id,
+        "opening_rotation_1pct_last_reason": "trusted_tick_context_unavailable",
+    }
+    emitted = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_emit_scanner_scheduler_event",
+        lambda **kwargs: emitted.append(kwargs),
+    )
+    assert kiwoom_sniper_v2._scanner_scheduler_park_target_generation(
+        scheduler,
+        target,
+        now_epoch=100.3,
+        reason="async_commit_completed_generation_warm_parked",
+        expected_generation=registered.item.generation,
+    )
+
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_reactivate_opening_rotation_source_gap_on_fresh_ws(
+            scheduler,
+            target,
+            {
+                "curr": 10_080,
+                "last_realtime_type_ts": {"0B": 100.4},
+            },
+            now_epoch=105.0,
+        )
+        is False
+    )
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_reactivate_opening_rotation_source_gap_on_fresh_ws(
+            scheduler,
+            target,
+            {
+                "curr": 10_120,
+                "last_realtime_type_ts": {"0B": 105.1},
+            },
+            now_epoch=105.2,
+        )
+        is True
+    )
+    assert "_scanner_scheduler_warm_parked" not in target
+    assert target["_scanner_opening_rotation_source_gap_reactivation_count"] == 1
+    next_item = scheduler.next_decision(now_epoch=105.2)
+    assert next_item.item.owner == "opening_rotation_source_gap_fresh_0b_recheck"
+    assert next_item.item.priority == (
+        kiwoom_sniper_v2.SCANNER_OPENING_ROTATION_SOURCE_GAP_RECHECK_PRIORITY
+    )
+    assert emitted[-1]["stage"] == ("scalping_scanner_scheduler_warm_park_reactivated")
+    assert emitted[-1]["fields"][
+        "scanner_opening_rotation_source_gap_recheck_priority"
+    ] == (kiwoom_sniper_v2.SCANNER_OPENING_ROTATION_SOURCE_GAP_RECHECK_PRIORITY)
+    assert emitted[-1]["fields"]["actual_order_submitted"] is False
+    assert emitted[-1]["fields"]["broker_order_forbidden"] is True
+
+    target.update(
+        {
+            "_scanner_scheduler_warm_parked": True,
+            "_scanner_scheduler_warm_reason": (
+                "async_commit_completed_generation_warm_parked"
+            ),
+            "_scanner_scheduler_warm_since_epoch": 105.3,
+        }
+    )
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_reactivate_opening_rotation_source_gap_on_fresh_ws(
+            scheduler,
+            target,
+            {
+                "curr": 10_130,
+                "last_realtime_type_ts": {"0B": 106.0},
+            },
+            now_epoch=106.1,
+        )
+        is False
+    )
+    kiwoom_sniper_v2._reset_scanner_runtime_eval_state(target)
+    assert "_scanner_opening_rotation_source_gap_reactivation_key" not in target
+    assert "_scanner_opening_rotation_source_gap_reactivation_count" not in target
+    assert "scanner_opening_rotation_source_gap_fresh_price" not in target
+    assert "scanner_opening_rotation_source_gap_fresh_0b_epoch" not in target
+    coordinator.shutdown()
+
+
+def test_scanner_opening_rotation_source_gap_recheck_is_retired(monkeypatch):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.sniper_state_handlers,
+        "OPENING_ROTATION_RETIRED",
+        True,
+    )
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_reactivate_opening_rotation_source_gap_on_fresh_ws(
+            None,
+            {},
+            {},
+            now_epoch=1.0,
+        )
+        is False
+    )
+
+
+def test_scanner_warm_park_does_not_reactivate_non_cold_terminal_generation(
+    monkeypatch,
+):
+    scheduler = kiwoom_sniper_v2.ScannerRuntimeScheduler(max_active=16)
+    registered = scheduler.register_generation(
+        code="000001",
+        promotion_id="PROMO-1",
+        record_id=1,
+        venue="KRX",
+        promotion_epoch=99.0,
+        attach_epoch=100.0,
+        observed_price=10_000,
+        source_signature="VALUE_TOP",
+    )
+    first = scheduler.next_decision(now_epoch=100.1)
+    scheduler.complete(first.item, completed_epoch=100.2, outcome="pass")
+    target = {
+        "id": 1,
+        "code": "000001",
+        "strategy": "SCALPING",
+        "status": "WATCHING",
+        "position_tag": "SCANNER",
+        "effective_venue": "KRX",
+        "scanner_attach_epoch": 100.0,
+        "scanner_generation_id": registered.item.generation.generation_id,
+        "_scanner_fast_precheck_fields": {
+            "fast_precheck_reason": "missing_or_zero_curr",
+        },
+    }
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_emit_scanner_scheduler_event",
+        lambda **kwargs: None,
+    )
+    assert kiwoom_sniper_v2._scanner_scheduler_park_target_generation(
+        scheduler,
+        target,
+        now_epoch=100.2,
+        reason="heavy_eval_completed_generation_warm_parked",
+        expected_generation=registered.item.generation,
+    )
+
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_reactivate_cold_park_on_fresh_ws(
+            scheduler,
+            target,
+            {
+                "curr": 10_050,
+                "last_realtime_type_ts": {"0B": 101.0},
+            },
+            now_epoch=101.1,
+        )
+        is False
+    )
+    assert target["_scanner_scheduler_warm_parked"] is True
+    assert scheduler.snapshot_metrics(now_epoch=101.1)["scheduler_queue_depth"] == 0
+
+
+def test_scanner_async_deadline_park_reactivates_once_on_new_fresh_trade(
+    monkeypatch,
+):
+    scheduler = kiwoom_sniper_v2.ScannerRuntimeScheduler(max_active=16)
+    coordinator = ScannerAsyncEvalCoordinator(
+        ai_dispatcher=HotPathAIDispatcher(loaded_key_count=1)
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_async_eval_coordinator",
+        coordinator,
+        raising=False,
+    )
+    registered = scheduler.register_generation(
+        code="000001",
+        promotion_id="PROMO-1",
+        record_id=1,
+        venue="KRX",
+        promotion_epoch=99.0,
+        attach_epoch=100.0,
+        observed_price=10_000,
+        source_signature="VALUE_TOP",
+    )
+    first = scheduler.next_decision(now_epoch=100.1)
+    scheduler.complete(first.item, completed_epoch=100.2, outcome="pass")
+    target = {
+        "id": 1,
+        "code": "000001",
+        "name": "TEST",
+        "strategy": "SCALPING",
+        "status": "WATCHING",
+        "position_tag": "SCANNER",
+        "effective_venue": "KRX",
+        "scanner_generation_id": registered.item.generation.generation_id,
+    }
+    emitted = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_emit_scanner_scheduler_event",
+        lambda **kwargs: emitted.append(kwargs),
+    )
+    assert kiwoom_sniper_v2._scanner_scheduler_park_target_generation(
+        scheduler,
+        target,
+        now_epoch=101.0,
+        reason="async_preparation_deadline_expired_generation_warm_parked",
+        expected_generation=registered.item.generation,
+    )
+
+    stale_before_park = {
+        "curr": 10_050,
+        "received_types": ["0B"],
+        "last_realtime_type_ts": {"0B": 100.9},
+    }
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_reactivate_deadline_park_on_fresh_ws(
+            scheduler,
+            target,
+            stale_before_park,
+            now_epoch=101.1,
+        )
+        is False
+    )
+
+    fresh_after_park = {
+        "curr": 10_100,
+        "received_types": ["0B"],
+        "last_realtime_type_ts": {"0B": 101.2},
+    }
+    assert kiwoom_sniper_v2._scanner_scheduler_reactivate_deadline_park_on_fresh_ws(
+        scheduler,
+        target,
+        fresh_after_park,
+        now_epoch=101.3,
+    )
+    assert target["_scanner_deadline_park_reactivation_key"] == (
+        registered.item.generation.generation_id
+    )
+    assert scheduler.snapshot_metrics(now_epoch=101.3)["scheduler_queue_depth"] == 1
+    assert emitted[-1]["stage"] == ("scalping_scanner_scheduler_warm_park_reactivated")
+
+    scheduler.next_decision(now_epoch=101.3)
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_reactivate_deadline_park_on_fresh_ws(
+            scheduler,
+            target,
+            {
+                "curr": 10_150,
+                "received_types": ["0B"],
+                "last_realtime_type_ts": {"0B": 101.4},
+            },
+            now_epoch=101.5,
+        )
+        is False
+    )
+    coordinator.shutdown()
+
+
+def test_scanner_stale_snapshot_park_reactivates_once_on_new_fresh_trade(
+    monkeypatch,
+):
+    scheduler = kiwoom_sniper_v2.ScannerRuntimeScheduler(max_active=16)
+    coordinator = ScannerAsyncEvalCoordinator(
+        ai_dispatcher=HotPathAIDispatcher(loaded_key_count=1)
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_async_eval_coordinator",
+        coordinator,
+        raising=False,
+    )
+    registered = scheduler.register_generation(
+        code="000001",
+        promotion_id="PROMO-STALE",
+        record_id=1,
+        venue="KRX",
+        promotion_epoch=99.0,
+        attach_epoch=100.0,
+        observed_price=10_000,
+        source_signature="BID_IMBALANCE_SURGE,PRICE_JUMP_START",
+    )
+    first = scheduler.next_decision(now_epoch=100.1)
+    scheduler.complete(first.item, completed_epoch=100.2, outcome="pass")
+    target = {
+        "id": 1,
+        "code": "000001",
+        "name": "TEST",
+        "strategy": "SCALPING",
+        "status": "WATCHING",
+        "position_tag": "SCANNER",
+        "effective_venue": "KRX",
+        "scanner_generation_id": registered.item.generation.generation_id,
+    }
+    emitted = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_emit_scanner_scheduler_event",
+        lambda **kwargs: emitted.append(kwargs),
+    )
+    assert kiwoom_sniper_v2._scanner_scheduler_park_target_generation(
+        scheduler,
+        target,
+        now_epoch=101.0,
+        reason="heavy_eval_stale_snapshot_generation_warm_parked",
+        expected_generation=registered.item.generation,
+    )
+
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_reactivate_stale_snapshot_park_on_fresh_ws(
+            scheduler,
+            target,
+            {
+                "curr": 10_050,
+                "received_types": ["0B"],
+                "last_realtime_type_ts": {"0B": 100.9},
+            },
+            now_epoch=101.1,
+        )
+        is False
+    )
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_reactivate_stale_snapshot_park_on_fresh_ws(
+            scheduler,
+            target,
+            {
+                "curr": 10_100,
+                "received_types": ["0B"],
+                "last_realtime_type_ts": {"0B": 101.2},
+            },
+            now_epoch=101.3,
+        )
+        is True
+    )
+    assert target["_scanner_stale_snapshot_park_reactivation_key"] == (
+        registered.item.generation.generation_id
+    )
+    assert target["scanner_stale_snapshot_recovery_fresh_price"] == 10_100
+    next_item = scheduler.next_decision(now_epoch=101.3)
+    assert next_item.item.owner == "fresh_0b_after_heavy_eval_stale_snapshot"
+    assert emitted[-1]["fields"]["scheduler_action"] == (
+        "stale_snapshot_warm_park_reactivated"
+    )
+    assert emitted[-1]["fields"]["actual_order_submitted"] is False
+    assert emitted[-1]["fields"]["broker_order_forbidden"] is True
+
+    target.update(
+        {
+            "_scanner_scheduler_warm_parked": True,
+            "_scanner_scheduler_warm_reason": (
+                "heavy_eval_stale_snapshot_generation_warm_parked"
+            ),
+            "_scanner_scheduler_warm_since_epoch": 101.4,
+        }
+    )
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_reactivate_stale_snapshot_park_on_fresh_ws(
+            scheduler,
+            target,
+            {
+                "curr": 10_150,
+                "received_types": ["0B"],
+                "last_realtime_type_ts": {"0B": 101.5},
+            },
+            now_epoch=101.6,
+        )
+        is False
+    )
+    kiwoom_sniper_v2._reset_scanner_runtime_eval_state(target)
+    assert "_scanner_stale_snapshot_park_reactivation_key" not in target
+    assert "scanner_stale_snapshot_recovery_fresh_price" not in target
+    assert "scanner_stale_snapshot_recovery_fresh_0b_epoch" not in target
+    coordinator.shutdown()
+
+
+@pytest.mark.parametrize(
+    "park_reason",
+    [
+        "precheck_not_eligible_generation_warm_parked",
+        "heavy_eval_completed_generation_warm_parked",
+        "async_commit_completed_generation_warm_parked",
+    ],
+)
+def test_scanner_warm_park_reactivates_once_on_existing_rising_threshold_cross(
+    monkeypatch,
+    park_reason,
+):
+    scheduler = kiwoom_sniper_v2.ScannerRuntimeScheduler(max_active=16)
+    coordinator = ScannerAsyncEvalCoordinator(
+        ai_dispatcher=HotPathAIDispatcher(loaded_key_count=1)
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_async_eval_coordinator",
+        coordinator,
+        raising=False,
+    )
+    registered = scheduler.register_generation(
+        code="000001",
+        promotion_id="PROMO-1",
+        record_id=1,
+        venue="KRX",
+        promotion_epoch=99.0,
+        attach_epoch=100.0,
+        observed_price=10_000,
+        source_signature="PRICE_JUMP_START,VOLUME_SURGE_POSITIVE",
+    )
+    first = scheduler.next_decision(now_epoch=100.1)
+    scheduler.complete(first.item, completed_epoch=100.2, outcome="pass")
+    target = {
+        "id": 1,
+        "code": "000001",
+        "name": "TEST",
+        "strategy": "SCALPING",
+        "status": "WATCHING",
+        "position_tag": "SCANNER",
+        "effective_venue": "KRX",
+        "scanner_generation_id": registered.item.generation.generation_id,
+        "price_delta_since_first_seen_pct": "0.72",
+    }
+    emitted = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_emit_scanner_scheduler_event",
+        lambda **kwargs: emitted.append(kwargs),
+    )
+    assert kiwoom_sniper_v2._scanner_scheduler_park_target_generation(
+        scheduler,
+        target,
+        now_epoch=101.0,
+        reason=park_reason,
+        expected_generation=registered.item.generation,
+    )
+
+    below_threshold = {
+        "curr": 10_090,
+        "received_types": ["0B"],
+        "last_realtime_type_ts": {"0B": 101.1},
+    }
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_reactivate_rising_cross_park_on_fresh_ws(
+            scheduler,
+            target,
+            below_threshold,
+            now_epoch=101.2,
+        )
+        is False
+    )
+
+    crossed = {
+        "curr": 10_120,
+        "received_types": ["0B"],
+        "last_realtime_type_ts": {"0B": 101.3},
+    }
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_reactivate_rising_cross_park_on_fresh_ws(
+            scheduler,
+            target,
+            crossed,
+            now_epoch=101.4,
+        )
+        is True
+    )
+    assert target["_scanner_rising_cross_park_reactivation_key"] == (
+        registered.item.generation.generation_id
+    )
+    assert scheduler.snapshot_metrics(now_epoch=101.4)["scheduler_queue_depth"] == 1
+    assert emitted[-1]["fields"]["scheduler_action"] == (
+        "rising_cross_warm_park_reactivated"
+    )
+    assert emitted[-1]["fields"]["scanner_rising_cross_warm_reason"] == park_reason
+
+    scheduler.next_decision(now_epoch=101.4)
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_reactivate_rising_cross_park_on_fresh_ws(
+            scheduler,
+            target,
+            {
+                "curr": 10_200,
+                "received_types": ["0B"],
+                "last_realtime_type_ts": {"0B": 101.5},
+            },
+            now_epoch=101.6,
+        )
+        is False
+    )
+    coordinator.shutdown()
+
+
+@pytest.mark.parametrize(
+    "park_reason",
+    [
+        "heavy_eval_completed_generation_warm_parked",
+        "async_commit_completed_generation_warm_parked",
+    ],
+)
+def test_scanner_ai_contention_park_reactivates_once_on_new_fresh_trade(
+    monkeypatch,
+    park_reason,
+):
+    scheduler = kiwoom_sniper_v2.ScannerRuntimeScheduler(max_active=16)
+    coordinator = ScannerAsyncEvalCoordinator(
+        ai_dispatcher=HotPathAIDispatcher(loaded_key_count=1)
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_async_eval_coordinator",
+        coordinator,
+        raising=False,
+    )
+    registered = scheduler.register_generation(
+        code="000001",
+        promotion_id="PROMO-1",
+        record_id=1,
+        venue="KRX",
+        promotion_epoch=99.0,
+        attach_epoch=100.0,
+        observed_price=10_000,
+        source_signature="PRICE_JUMP_START,VOLUME_SURGE_POSITIVE",
+    )
+    first = scheduler.next_decision(now_epoch=100.1)
+    scheduler.complete(first.item, completed_epoch=100.2, outcome="pass")
+    target = {
+        "id": 1,
+        "code": "000001",
+        "name": "TEST",
+        "strategy": "SCALPING",
+        "status": "WATCHING",
+        "position_tag": "SCANNER",
+        "effective_venue": "KRX",
+        "scanner_generation_id": registered.item.generation.generation_id,
+        "last_watching_ai_result_source": "lock_contention",
+    }
+    emitted = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_emit_scanner_scheduler_event",
+        lambda **kwargs: emitted.append(kwargs),
+    )
+    assert kiwoom_sniper_v2._scanner_scheduler_park_target_generation(
+        scheduler,
+        target,
+        now_epoch=101.0,
+        reason=park_reason,
+        expected_generation=registered.item.generation,
+    )
+
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_reactivate_ai_contention_park_on_fresh_ws(
+            scheduler,
+            target,
+            {
+                "curr": 10_100,
+                "received_types": ["0B"],
+                "last_realtime_type_ts": {"0B": 100.9},
+            },
+            now_epoch=101.1,
+        )
+        is False
+    )
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_reactivate_ai_contention_park_on_fresh_ws(
+            scheduler,
+            target,
+            {
+                "curr": 10_120,
+                "received_types": ["0B"],
+                "last_realtime_type_ts": {"0B": 101.2},
+            },
+            now_epoch=101.3,
+        )
+        is True
+    )
+    assert target["_scanner_ai_contention_park_reactivation_key"] == (
+        registered.item.generation.generation_id
+    )
+    assert scheduler.snapshot_metrics(now_epoch=101.3)["scheduler_queue_depth"] == 1
+    assert emitted[-1]["fields"]["scheduler_action"] == (
+        "ai_contention_warm_park_reactivated"
+    )
+    assert emitted[-1]["fields"]["scanner_ai_contention_park_reason"] == park_reason
+
+    scheduler.next_decision(now_epoch=101.3)
+    assert (
+        kiwoom_sniper_v2._scanner_scheduler_reactivate_ai_contention_park_on_fresh_ws(
+            scheduler,
+            target,
+            {
+                "curr": 10_150,
+                "received_types": ["0B"],
+                "last_realtime_type_ts": {"0B": 101.4},
+            },
+            now_epoch=101.5,
+        )
+        is False
+    )
+    coordinator.shutdown()
+
+
+def test_scanner_warm_slot_can_be_reclaimed_without_general_attach_replacement(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_scalping_attach_replace_enabled",
+        lambda: False,
+    )
+    warm = {"_scanner_scheduler_warm_parked": True}
+    active = {"_scanner_scheduler_warm_parked": False}
+
+    assert kiwoom_sniper_v2._scalping_attach_replacements_allowed([warm]) is True
+    assert (
+        kiwoom_sniper_v2._scalping_attach_replacements_allowed([warm, active]) is False
+    )
+
+
+def test_scanner_new_generation_reset_clears_warm_park_state():
+    target = {
+        "_scanner_scheduler_warm_parked": True,
+        "_scanner_scheduler_warm_generation_id": "OLD",
+        "_scanner_scheduler_warm_since_epoch": 100.0,
+        "_scanner_scheduler_warm_reason": "expired",
+        "_scanner_ai_contention_park_reactivation_key": "OLD",
+    }
+
+    kiwoom_sniper_v2._reset_scanner_runtime_eval_state(target)
+
+    assert not any("warm_" in key for key in target)
+    assert "_scanner_ai_contention_park_reactivation_key" not in target
+
+
+def test_scanner_heavy_eval_evidence_fingerprint_ignores_receipt_timestamp():
+    baseline = kiwoom_sniper_v2._scanner_heavy_eval_evidence_fingerprint(
+        {"curr": 1000, "best_bid": 999, "best_ask": 1001, "last_ws_update_ts": 1}
+    )
+    heartbeat_only = kiwoom_sniper_v2._scanner_heavy_eval_evidence_fingerprint(
+        {"curr": 1000, "best_bid": 999, "best_ask": 1001, "last_ws_update_ts": 2}
+    )
+    changed_bbo = kiwoom_sniper_v2._scanner_heavy_eval_evidence_fingerprint(
+        {"curr": 1000, "best_bid": 1000, "best_ask": 1001, "last_ws_update_ts": 2}
+    )
+
+    assert baseline == heartbeat_only
+    assert baseline != changed_bbo
+
+
+def test_scanner_heavy_eval_coalesced_emits_scheduler_contract(monkeypatch):
+    emitted = []
+    generation = ScannerGeneration(
+        code="005930",
+        promotion_id="PROMO-1",
+        revision=1,
+        record_id=1,
+        venue="KRX",
+        promotion_epoch=100.0,
+        attach_epoch=101.0,
+        observed_price=1000,
+        source_signature="VALUE_TOP",
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_emit_scanner_scheduler_event",
+        lambda **kwargs: emitted.append(kwargs),
+    )
+
+    kiwoom_sniper_v2._emit_scanner_heavy_eval_coalesced(
+        {"code": "005930", "name": "삼성전자"},
+        generation=generation,
+        now_epoch=105.0,
+        reason="async_transport_pending",
+        retry_min_sec=15.0,
+        last_attempt_epoch=103.0,
+    )
+
+    fields = emitted[-1]["fields"]
+    assert fields["scheduler_action"] == "coalesced"
+    assert fields["scheduler_reason"] == "async_transport_pending"
+    assert fields["scanner_heavy_eval_coalesced_reason"] == fields["scheduler_reason"]
+
+
+def test_scanner_async_transport_wait_state_never_uses_ready_result_as_heavy_work(
+    monkeypatch,
+):
+    dispatcher = HotPathAIDispatcher(loaded_key_count=1)
+    coordinator = ScannerAsyncEvalCoordinator(ai_dispatcher=dispatcher)
+    try:
+        generation = ScannerGeneration(
+            code="005930",
+            promotion_id="PROMO-1",
+            revision=1,
+            record_id=1,
+            venue="KRX",
+            promotion_epoch=100.0,
+            attach_epoch=101.0,
+            observed_price=1000,
+            source_signature="VALUE_TOP",
+        )
+        cache_key = "watching:ready-result"
+        request_id = f"{generation.generation_id}:{cache_key}"
+        target = {
+            "_scanner_async_generation_id": generation.generation_id,
+            "_scanner_async_cache_key": cache_key,
+        }
+        with coordinator._lock:
+            coordinator._requests[request_id] = object()
+        assert (
+            kiwoom_sniper_v2._scanner_async_transport_wait_state(
+                target, generation, coordinator
+            )
+            == "pending"
+        )
+        with coordinator._lock:
+            coordinator._requests.pop(request_id, None)
+            coordinator._ready[request_id] = object()
+        assert (
+            kiwoom_sniper_v2._scanner_async_transport_wait_state(
+                target, generation, coordinator
+            )
+            == "ready_for_commit"
+        )
+    finally:
+        coordinator.shutdown(wait=True)
+
+
+def test_scanner_async_commit_window_covers_one_busy_outer_loop():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    enqueue_idx = source.index('owner="scanner_async_result_ready"')
+    deadline_idx = source.index(
+        "deadline_epoch=commit_enqueued_epoch + 5.0",
+        enqueue_idx,
+    )
+    quote_guard_idx = source.index(
+        "scanner_async_commit_phase",
+        deadline_idx,
+    )
+
+    assert enqueue_idx < deadline_idx < quote_guard_idx
+
+
+def test_watching_wrapper_forwards_general_entry_handoff_controls(monkeypatch):
+    forwarded = {}
+
+    def fake_handle_watching_state(*args, **kwargs):
+        forwarded.update(kwargs)
+        return "handled"
+
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.sniper_state_handlers,
+        "handle_watching_state",
+        fake_handle_watching_state,
+    )
+
+    result = kiwoom_sniper_v2.handle_watching_state(
+        {},
+        "005930",
+        {"curr": 1000},
+        1,
+        skip_rising_missed_hook=True,
+        scout_upgrade_entry=True,
+        scanner_async_commit_phase=False,
+    )
+
+    assert result == "handled"
+    assert forwarded["skip_rising_missed_hook"] is True
+    assert forwarded["scout_upgrade_entry"] is True
+    assert forwarded["scanner_async_commit_phase"] is False
+
+
+def test_persistent_ws_gap_uses_dedicated_repair_batch_queue():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    queue_def_idx = source.index("pending_scanner_ws_persistent_repair")
+    queue_call_idx = source.index("_queue_scanner_ws_persistent_repair(")
+    force_publish_idx = source.index('"repair_cycle": "persistent_ws_gap"')
+
+    assert queue_def_idx < queue_call_idx < force_publish_idx
+
+
+def test_subscription_recheck_snapshot_is_applied_before_fast_precheck_retry():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    helper_idx = source.index("_apply_subscription_recheck_snapshot_if_ready")
+    queue_idx = source.index("_queue_scanner_ws_persistent_repair(", helper_idx)
+    apply_idx = source.index('phase="fast_precheck"', queue_idx)
+    retry_idx = source.index("_defer_emit_scanner_fast_precheck", apply_idx)
+    skip_idx = source.index(
+        "scanner_fast_precheck_subscription_recheck_snapshot_applied", apply_idx
+    )
+    residual_idx = source.index("subscription_alive_but_entry_stale", retry_idx)
+
+    assert helper_idx < queue_idx < apply_idx < retry_idx
+    assert apply_idx < skip_idx
+    assert retry_idx < residual_idx
+
+
+def test_subscription_recheck_snapshot_is_applied_before_heavy_eval_recheck_skip():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    flush_idx = source.index("def _flush_delayed_scanner_heavy_eval")
+    repair_idx = source.index("scanner_heavy_eval_stale_ws_recovery", flush_idx)
+    apply_idx = source.index('phase="heavy_eval_repair"', repair_idx)
+    continue_idx = source.index("continue", apply_idx)
+    handle_idx = source.index("handle_watching_state(", apply_idx)
+
+    assert repair_idx < apply_idx < continue_idx
+    assert apply_idx < handle_idx
+
+
+def test_rest_quote_price_only_strength_gap_eviction_runs_before_full_eval_budget():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    reason_idx = source.index('"rising_rest_quote_recovery_without_realtime_strength"')
+    eviction_idx = source.index("_maybe_expire_scanner_watch_for_stale", reason_idx)
+    budget_idx = source.index(
+        "and scanner_full_eval_count >= scanner_full_eval_limit", eviction_idx
+    )
+
+    assert reason_idx < eviction_idx < budget_idx
+
+
+def test_scanner_no_trade_eviction_requires_grace_and_repeated_confirmation(
+    monkeypatch,
+):
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_NO_TRADE_EVICTION_ENABLED", "true")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_NO_TRADE_EVICTION_GRACE_SEC", "60")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_NO_TRADE_EVICTION_MIN_COUNT", "2")
+    target = {
+        "id": 77,
+        "code": "005930",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "buy_qty": 0,
+        "buy_time": None,
+        "entry_armed_at_epoch": 1000.0,
+    }
+    ws_data = {
+        "received_types": {"0D", "0w"},
+        "last_ws_update_ts": 1058.0,
+    }
+
+    decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_no_trade(
+        target,
+        ws_data,
+        now_ts=1059.0,
+    )
+    assert decision["should_evict"] is False
+    assert decision["eviction_reason"] == "scanner_no_trade_grace_active"
+
+    first_confirm = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_no_trade(
+        target,
+        ws_data,
+        now_ts=1061.0,
+    )
+    assert first_confirm["should_evict"] is False
+    assert first_confirm["eviction_attempt_count"] == 1
+
+    second_confirm = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_no_trade(
+        target,
+        ws_data,
+        now_ts=1067.0,
+    )
+    assert second_confirm["should_evict"] is True
+    assert second_confirm["eviction_reason"] == "scanner_no_trade_hot_slot_rotation"
+    assert second_confirm["terminal_reason"] == "no_0b_after_grace"
+    assert second_confirm["no_trade_received_types"] == "0D,0w"
+
+
+def test_scanner_stale_eviction_counts_old_rest_quote_with_stale_ws(monkeypatch):
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_REST_QUOTE_STALE_EVICTION_MAX_WATCH_AGE_SEC", "300"
+    )
+    target = {
+        "id": 77,
+        "code": "005930",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "buy_qty": 0,
+        "buy_time": None,
+        "entry_armed_at_epoch": 1000.0,
+        "_scanner_watch_eviction_stale_first_seen_epoch": 1000.0,
+        "_scanner_watch_eviction_stale_count": 2,
+    }
+
+    decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_stale(
+        target,
+        now_ts=1400.0,
+        stale_reason="stale_ws_snapshot",
+        recovery_fields={
+            "ws_recovery_outcome": "rest_quote_applied",
+            "ws_subscription_repair_needed": True,
+            "ws_subscription_recheck_status": "subscribed_snapshot_stale_or_missing",
+        },
+    )
+
+    assert decision["should_evict"] is True
+    assert decision["eviction_reason"] == "stale_recovery_failed"
+    assert decision["eviction_attempt_count"] == 3
+    assert decision["ws_recovery_outcome"] == "rest_quote_applied_ws_still_stale"
+
+
+def test_scanner_stale_eviction_resets_recent_rest_quote_recovery(monkeypatch):
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_REST_QUOTE_STALE_EVICTION_MAX_WATCH_AGE_SEC", "300"
+    )
+    target = {
+        "id": 77,
+        "code": "005930",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "buy_qty": 0,
+        "buy_time": None,
+        "entry_armed_at_epoch": 1300.0,
+        "_scanner_watch_eviction_stale_first_seen_epoch": 1300.0,
+        "_scanner_watch_eviction_stale_count": 2,
+    }
+
+    decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_stale(
+        target,
+        now_ts=1400.0,
+        stale_reason="stale_ws_snapshot",
+        recovery_fields={
+            "ws_recovery_outcome": "rest_quote_applied",
+            "ws_subscription_repair_needed": True,
+            "ws_subscription_recheck_status": "subscribed_snapshot_stale_or_missing",
+        },
+    )
+
+    assert decision["should_evict"] is False
+    assert decision["eviction_attempt_count"] == 0
+    assert "_scanner_watch_eviction_stale_count" not in target
+
+
+def test_scanner_no_trade_eviction_resets_when_0b_arrives(monkeypatch):
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_NO_TRADE_EVICTION_GRACE_SEC", "60")
+    target = {
+        "id": 77,
+        "code": "005930",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "buy_qty": 0,
+        "buy_time": None,
+        "entry_armed_at_epoch": 1000.0,
+        "_scanner_watch_no_trade_count": 3,
+        "_scanner_watch_no_trade_first_observed_epoch": 1061.0,
+        "_scanner_watch_no_trade_last_observed_epoch": 1067.0,
+    }
+
+    decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_no_trade(
+        target,
+        {"received_types": {"0B", "0D"}, "last_ws_update_ts": 1070.0},
+        now_ts=1070.0,
+    )
+
+    assert decision["should_evict"] is False
+    assert "_scanner_watch_no_trade_count" not in target
+    assert "_scanner_watch_no_trade_first_observed_epoch" not in target
+    assert "_scanner_watch_no_trade_last_observed_epoch" not in target
+
+
+def test_scanner_no_trade_does_not_accept_pre_attach_0b(monkeypatch):
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_NO_TRADE_EVICTION_GRACE_SEC", "60")
+    target = {
+        "id": 77,
+        "code": "005930",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "buy_qty": 0,
+        "buy_time": None,
+        "entry_armed_at_epoch": 1000.0,
+        "scanner_attach_epoch": 1050.0,
+    }
+
+    decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_no_trade(
+        target,
+        {
+            "received_types": {"0B", "0D"},
+            "last_realtime_type_ts": {"0B": 1049.0, "0D": 1060.0},
+            "last_ws_update_ts": 1060.0,
+        },
+        now_ts=1061.0,
+    )
+
+    assert decision["should_evict"] is False
+    assert decision["eviction_reason"] == "scanner_no_trade_grace_active"
+
+
+def test_scanner_no_trade_eviction_waits_for_realtime_type(monkeypatch):
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_NO_TRADE_EVICTION_GRACE_SEC", "60")
+    target = {
+        "id": 77,
+        "code": "005930",
+        "status": "WATCHING",
+        "strategy": "SCALPING",
+        "position_tag": "SCANNER",
+        "buy_qty": 0,
+        "buy_time": None,
+        "entry_armed_at_epoch": 1000.0,
+        "_scanner_watch_no_trade_count": 2,
+    }
+
+    decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_no_trade(
+        target,
+        {"curr": 70000, "ws_snapshot_recovery_source": "ka10001_rest_quote_fallback"},
+        now_ts=1100.0,
+    )
+
+    assert decision["should_evict"] is False
+    assert decision["eviction_reason"] == "scanner_no_trade_waiting_realtime_type"
+    assert "_scanner_watch_no_trade_count" not in target
+
+
+def test_scanner_queue_lag_eviction_reallocates_after_repeated_lag(monkeypatch):
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_QUEUE_LAG_EVICTION_MIN_SEC", "30")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_QUEUE_LAG_EVICTION_MIN_COUNT", "2")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_QUEUE_LAG_EVICTION_IMMEDIATE_SEC", "90")
+    target = _scanner_watch_stock(
+        code="005930",
+        entry_armed_at_epoch=1000.0,
+        _scanner_fast_precheck_result="stability_pending",
+        _scanner_fast_precheck_reason="scanner_fast_precheck_stability_pending",
+    )
+    fields = {
+        "queue_lag_sec": 35.0,
+        "queue_rank": 12,
+        "scanner_queue_rank": 8,
+        "watching_count": 20,
+        "scanner_watching_count": 16,
+        "queue_lag_anchor_field": "entry_armed_at_epoch",
+    }
+
+    first = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_queue_lag(
+        target,
+        now_ts=1035.0,
+        queue_lag_fields=fields,
+    )
+    second = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_queue_lag(
+        target,
+        now_ts=1045.0,
+        queue_lag_fields=fields,
+    )
+    event_fields = kiwoom_sniper_v2._scanner_watch_eviction_event_fields(
+        target, decision=second
+    )
+
+    assert first["should_evict"] is False
+    assert first["eviction_attempt_count"] == 1
+    assert second["should_evict"] is True
+    assert second["eviction_reason"] == "scanner_queue_lag_budget_reallocated"
+    assert second["terminal_stage"] == "scalping_scanner_runtime_queue_lag"
+    assert (
+        event_fields["decision_authority"]
+        == "real_scalping_scanner_watch_eviction_pool_management_only"
+    )
+    assert event_fields["runtime_effect"] is True
+    assert event_fields["actual_order_submitted"] is False
+    assert event_fields["broker_order_forbidden"] is True
+    assert event_fields["queue_lag_sec"] == 35.0
+    assert event_fields["queue_lag_min_count"] == 2
+    assert event_fields["queue_lag_anchor_field"] == "entry_armed_at_epoch"
+
+
+def test_market_gainer_reserved_watch_retains_until_first_evaluated_ai(monkeypatch):
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_MARKET_GAINER_FIRST_EVAL_RETENTION_SEC", "180"
+    )
+    target = _scanner_watch_stock(
+        code="005930",
+        source_signature="PREV_CLOSE_GAINER,VALUE_TOP",
+        scanner_promotion_emitted_epoch=1000.0,
+        _scanner_fast_precheck_result="budget_reallocated",
+        _scanner_fast_precheck_reason="candidate_gate_backoff_active",
+    )
+
+    queue_decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_queue_lag(
+        target,
+        now_ts=1065.0,
+        queue_lag_fields={"queue_lag_sec": 65.0},
+    )
+    budget_decision = (
+        kiwoom_sniper_v2._scanner_watch_eviction_decision_from_fast_precheck_budget(
+            target,
+            now_ts=1065.0,
+        )
+    )
+    no_trade_decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_no_trade(
+        target,
+        {"received_types": {"0D"}, "last_realtime_type_ts": {"0D": 1065.0}},
+        now_ts=1065.0,
+    )
+
+    for decision in (queue_decision, budget_decision, no_trade_decision):
+        assert decision["should_evict"] is False
+        assert decision["retention_active"] is True
+        assert (
+            decision["market_gainer_first_eval_retention_reason"]
+            == "awaiting_first_ai_evaluated"
+        )
+        assert decision["actual_order_submitted"] is False
+        assert decision["broker_order_forbidden"] is True
+
+    target["_scanner_last_heavy_eval_attempt_epoch"] = 1066.0
+    released = kiwoom_sniper_v2._market_gainer_first_eval_retention(
+        target,
+        now_ts=1067.0,
+    )
+    assert released["retention_active"] is True
+    assert released["market_gainer_first_eval_retention_reason"] == (
+        "heavy_eval_observed_awaiting_first_ai_evaluated"
+    )
+
+    target.update(
+        {
+            "last_watching_ai_attempt_completed_at": 1068.0,
+            "last_watching_ai_attempt_result_source": "live",
+            "last_watching_ai_attempt_evaluation_status": "evaluated",
+            "last_watching_ai_attempt_contract_status": "pass",
+            "last_watching_ai_attempt_trusted": True,
+        }
+    )
+    released = kiwoom_sniper_v2._market_gainer_first_eval_retention(
+        target,
+        now_ts=1069.0,
+    )
+    assert released["retention_active"] is False
+    assert released["market_gainer_first_eval_retention_reason"] == (
+        "first_ai_evaluated_observed"
+    )
+
+
+def test_market_gainer_reserved_watch_keeps_preflight_blocked_attempt(monkeypatch):
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_MARKET_GAINER_FIRST_EVAL_RETENTION_SEC", "180"
+    )
+    target = _scanner_watch_stock(
+        source_signature="PREV_CLOSE_GAINER",
+        scanner_promotion_emitted_epoch=1000.0,
+        _scanner_last_heavy_eval_attempt_epoch=1010.0,
+        last_watching_ai_attempt_completed_at=1011.0,
+        last_watching_ai_attempt_result_source="input_preflight_blocked",
+        last_watching_ai_attempt_evaluation_status=(
+            "not_evaluated_provider_or_preflight"
+        ),
+        last_watching_ai_attempt_trusted=False,
+    )
+
+    decision = kiwoom_sniper_v2._market_gainer_first_eval_retention(
+        target,
+        now_ts=1012.0,
+    )
+
+    assert decision["retention_active"] is True
+    assert decision["market_gainer_first_ai_evaluated_observed"] is False
+    assert decision["market_gainer_first_eval_retention_reason"] == (
+        "heavy_eval_observed_awaiting_first_ai_evaluated"
+    )
+
+
+def test_market_gainer_reserved_watch_keeps_semantic_rejected_live_attempt(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_MARKET_GAINER_FIRST_EVAL_RETENTION_SEC", "180"
+    )
+    target = _scanner_watch_stock(
+        source_signature="PREV_CLOSE_GAINER",
+        scanner_promotion_emitted_epoch=1000.0,
+        _scanner_last_heavy_eval_attempt_epoch=1010.0,
+        last_watching_ai_attempt_completed_at=1011.0,
+        last_watching_ai_attempt_result_source="live",
+        last_watching_ai_attempt_evaluation_status="evaluated",
+        last_watching_ai_attempt_contract_status="semantic_rejected",
+        last_watching_ai_attempt_trusted=False,
+    )
+
+    decision = kiwoom_sniper_v2._market_gainer_first_eval_retention(
+        target,
+        now_ts=1012.0,
+    )
+
+    assert decision["retention_active"] is True
+    assert decision["market_gainer_first_ai_evaluated_observed"] is False
+    assert decision["market_gainer_first_ai_attempt_contract_status"] == (
+        "semantic_rejected"
+    )
+
+
+def test_market_gainer_reserved_watch_retains_stale_recovery_until_trusted_ai(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_MARKET_GAINER_FIRST_EVAL_RETENTION_SEC", "180"
+    )
+    target = _scanner_watch_stock(
+        source_signature="PREV_CLOSE_GAINER",
+        scanner_promotion_emitted_epoch=1000.0,
+    )
+
+    retained = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_stale(
+        target,
+        now_ts=1065.0,
+        stale_reason="stale_ws_snapshot",
+        recovery_fields={"ws_recovery_outcome": "rest_quote_unavailable"},
+    )
+
+    assert retained["should_evict"] is False
+    assert retained["market_gainer_stale_retention_active"] is True
+    assert retained["market_gainer_ws_recovery_priority_requested"] is True
+    assert retained["fresh_input_confirmed"] is False
+    assert retained["ws_recovery_outcome"] == "rest_quote_unavailable"
+    assert retained["scanner_source_quality_reallocation_candidate"] is False
+    assert target["_scanner_watch_eviction_stale_first_seen_epoch"] == 1065.0
+    assert target["_scanner_watch_eviction_stale_count"] == 1
+
+    target.update(
+        {
+            "last_watching_ai_attempt_completed_at": 1068.0,
+            "last_watching_ai_attempt_result_source": "live",
+            "last_watching_ai_attempt_evaluation_status": "evaluated",
+            "last_watching_ai_attempt_contract_status": "pass",
+            "last_watching_ai_attempt_trusted": True,
+        }
+    )
+    second = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_stale(
+        target,
+        now_ts=1181.0,
+        stale_reason="stale_ws_snapshot",
+        recovery_fields={"ws_recovery_outcome": "rest_quote_unavailable"},
+    )
+    released = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_stale(
+        target,
+        now_ts=1182.0,
+        stale_reason="stale_ws_snapshot",
+        recovery_fields={"ws_recovery_outcome": "rest_quote_unavailable"},
+    )
+
+    assert second["should_evict"] is False
+    assert released["should_evict"] is True
+    assert released["eviction_reason"] == "stale_recovery_failed"
+
+
+def test_market_gainer_reserved_watch_retention_is_bounded(monkeypatch):
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_MARKET_GAINER_FIRST_EVAL_RETENTION_SEC", "60"
+    )
+    target = _scanner_watch_stock(
+        source_signature="PREV_CLOSE_GAINER",
+        scanner_promotion_emitted_epoch=1000.0,
+    )
+
+    decision = kiwoom_sniper_v2._market_gainer_first_eval_retention(
+        target,
+        now_ts=1061.0,
+    )
+
+    assert decision["retention_active"] is False
+    assert (
+        decision["market_gainer_first_eval_retention_reason"]
+        == "bounded_retention_expired"
+    )
+
+
+def test_scanner_fast_precheck_signed_tape_retention_skips_budget_eviction():
+    target = _scanner_watch_stock(
+        code="005930",
+        _scanner_fast_precheck_fields={
+            "fast_precheck_result": "budget_reallocated",
+            "fast_precheck_reason": "signed_tape_sell_dominated",
+            "rising_missed_signed_tape_watch_retention_recommended": True,
+            "rising_missed_signed_tape_watch_retention_reason": (
+                "bounded_repeat_cooldown_recheck_pending"
+            ),
+        },
+    )
+    targets = [target]
+    emitted = []
+
+    expired = kiwoom_sniper_v2._maybe_expire_scanner_watch_for_fast_precheck_budget(
+        target,
+        "005930",
+        targets,
+        now_ts=1035.0,
+        emit_event_fn=lambda *args, **kwargs: emitted.append((args, kwargs)),
+    )
+
+    assert expired is False
+    assert targets == [target]
+    assert emitted == []
+    assert target["_scanner_fast_precheck_budget_retained_reason"] == (
+        "bounded_repeat_cooldown_recheck_pending"
+    )
+
+
+def test_scanner_fast_precheck_ws_backoff_retains_then_evicts_after_recovery_window(
+    monkeypatch,
+):
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_WS_BACKOFF_WATCH_RETENTION_MIN_SEC", "10")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_WS_BACKOFF_WATCH_RETENTION_MAX_SEC", "20")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_WS_BACKOFF_WATCH_RETENTION_MIN_COUNT", "2")
+    target = _scanner_watch_stock(
+        code="005930",
+        effective_venue="KRX",
+        venue_resolution="consistent_explicit:target.effective_venue",
+        _scanner_fast_precheck_fields={
+            "fast_precheck_result": "budget_reallocated",
+            "fast_precheck_reason": "scanner_ws_stale_backoff_active",
+            "scanner_ws_stale_backoff_until": "1100.000",
+        },
+    )
+
+    first = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_fast_precheck_budget(
+        target,
+        now_ts=1035.0,
+    )
+    emitted = []
+    expired = kiwoom_sniper_v2._maybe_expire_scanner_watch_for_fast_precheck_budget(
+        target,
+        "005930",
+        [target],
+        now_ts=1035.0,
+        decision=first,
+        emit_event_fn=lambda *args: emitted.append(args),
+    )
+    second = (
+        kiwoom_sniper_v2._scanner_watch_eviction_decision_from_fast_precheck_budget(
+            target,
+            now_ts=1046.0,
+        )
+    )
+
+    assert first["should_evict"] is False
+    assert first["retention_active"] is True
+    assert first["ws_recovery_outcome"] == "bounded_ws_recovery_pending"
+    assert expired is False
+    assert emitted[0][2] == "scalping_scanner_ws_backoff_watch_retained"
+    assert emitted[0][3]["runtime_effect"] is True
+    assert emitted[0][3]["actual_order_submitted"] is False
+    assert emitted[0][3]["broker_order_forbidden"] is True
+    assert emitted[0][3]["effective_venue"] == "KRX"
+    assert emitted[0][3]["venue_resolution"].startswith("consistent_explicit:")
+    assert second["should_evict"] is True
+    assert second["eviction_reason"] == "scanner_ws_stale_backoff_recovery_exhausted"
+    assert second["eviction_attempt_count"] == 2
+    assert second["ws_backoff_retention_age_sec"] == 11.0
+    assert second["ws_recovery_outcome"] == "bounded_ws_recovery_exhausted"
+
+
+def test_scanner_ws_backoff_recovery_precedes_generic_queue_lag_eviction():
+    assert (
+        kiwoom_sniper_v2._scanner_queue_lag_eviction_allowed_before_recovery(
+            "scanner_ws_stale_backoff_active"
+        )
+        is False
+    )
+    assert (
+        kiwoom_sniper_v2._scanner_queue_lag_eviction_allowed_before_recovery(
+            "signed_tape_sell_dominated"
+        )
+        is True
+    )
+
+
+def test_scanner_fast_precheck_ws_backoff_missing_until_still_expires(
+    monkeypatch,
+):
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_WS_BACKOFF_WATCH_RETENTION_MIN_SEC", "10")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_WS_BACKOFF_WATCH_RETENTION_MAX_SEC", "20")
+    target = _scanner_watch_stock(
+        code="005930",
+        _scanner_fast_precheck_fields={
+            "fast_precheck_result": "budget_reallocated",
+            "fast_precheck_reason": "scanner_ws_stale_backoff_active",
+        },
+    )
+
+    first = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_fast_precheck_budget(
+        target,
+        now_ts=1035.0,
+    )
+    second = (
+        kiwoom_sniper_v2._scanner_watch_eviction_decision_from_fast_precheck_budget(
+            target,
+            now_ts=1056.0,
+        )
+    )
+
+    assert first["retention_active"] is True
+    assert first["ws_backoff_until"] == "not_available_ws_backoff_until"
+    assert second["should_evict"] is True
+    assert second["ws_backoff_retention_age_sec"] == 21.0
+
+
+def test_scanner_promotion_pending_attach_prevents_prune_until_attach_resolution(
+    monkeypatch,
+):
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PINNED_OBSERVATION_ITEMS", "")
+    published = []
+    manager = SimpleNamespace(subscribed_codes={"005930"})
+    monkeypatch.setattr(kiwoom_sniper_v2, "WS_MANAGER", manager)
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda event_name, payload: published.append((event_name, payload))
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "should_retain_ws_subscription",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.sniper_state_handlers,
+        "should_retain_rising_missed_nxt_post_block_subscription",
+        lambda *_args, **_kwargs: False,
+    )
+    kiwoom_sniper_v2._SCANNER_PROMOTION_PENDING_ATTACH_UNTIL.clear()
+
+    try:
+        assert (
+            kiwoom_sniper_v2.handle_scalping_scanner_promotion_batch_pending(
+                {"codes": ["005930"], "emitted_epoch": 1000.0}
+            )
+            is True
+        )
+        monkeypatch.setattr(kiwoom_sniper_v2.time, "time", lambda: 1001.0)
+        kiwoom_sniper_v2._prune_ws_subscriptions_for_inactive_targets([])
+        assert published == []
+
+        kiwoom_sniper_v2._clear_scanner_promotion_pending_attach("005930")
+        kiwoom_sniper_v2._prune_ws_subscriptions_for_inactive_targets([])
+        assert published == [
+            ("COMMAND_WS_UNREG", {"codes": ["005930"]}),
+        ]
+    finally:
+        kiwoom_sniper_v2._SCANNER_PROMOTION_PENDING_ATTACH_UNTIL.clear()
+
+
+def test_ws_prune_retains_widget_price_comparison_subscription(monkeypatch):
+    monkeypatch.setenv("KORSTOCKSCAN_WS_PINNED_OBSERVATION_ITEMS", "005930_AL")
+    published = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "WS_MANAGER",
+        SimpleNamespace(
+            subscribed_codes={"005930"},
+            is_pinned_observation_subscription=lambda code: code == "005930",
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    kiwoom_sniper_v2._prune_ws_subscriptions_for_inactive_targets([])
+
+    assert published == []
+
+
+def test_ws_prune_preserves_post_sell_exact_route_before_observation_demotion(
+    monkeypatch,
+):
+    demoted = []
+    published = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "WS_MANAGER",
+        SimpleNamespace(
+            subscribed_codes={"005930"},
+            is_pinned_observation_subscription=lambda code: code == "005930",
+            retain_micro_reversion_as_observation_only=lambda code: demoted.append(
+                code
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "should_retain_ws_subscription",
+        lambda code, now_ts=None: code == "005930",
+    )
+
+    kiwoom_sniper_v2._prune_ws_subscriptions_for_inactive_targets([])
+
+    assert demoted == []
+    assert published == []
+
+
+def test_execution_dependencies_bind_non_revive_smoothing_registration(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(kiwoom_sniper_v2, "_EXECUTION_DEPS", {})
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "bind_execution_dependencies",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    kiwoom_sniper_v2._ensure_execution_deps()
+
+    assert captured["smoothing_non_revive_post_sell_register_callback"] is (
+        kiwoom_sniper_v2.sniper_state_handlers.register_non_revive_smoothing_post_sell_paths
+    )
+
+
+def test_scanner_promotion_pending_attach_skips_already_attached_target(monkeypatch):
+    kiwoom_sniper_v2._SCANNER_PROMOTION_PENDING_ATTACH_UNTIL.clear()
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "ACTIVE_TARGETS",
+        [{"code": "005930", "status": "WATCHING"}],
+    )
+
+    try:
+        assert (
+            kiwoom_sniper_v2.handle_scalping_scanner_promotion_batch_pending(
+                {"codes": ["005930"], "emitted_epoch": 1000.0}
+            )
+            is True
+        )
+        assert kiwoom_sniper_v2._SCANNER_PROMOTION_PENDING_ATTACH_UNTIL == {}
+    finally:
+        kiwoom_sniper_v2._SCANNER_PROMOTION_PENDING_ATTACH_UNTIL.clear()
+
+
+def test_scanner_fast_precheck_retention_requires_bounded_signed_tape_reason(
+    monkeypatch,
+):
+    target = _scanner_watch_stock(
+        code="005930",
+        _scanner_fast_precheck_fields={
+            "fast_precheck_result": "budget_reallocated",
+            "fast_precheck_reason": "signed_tape_sell_dominated",
+            "rising_missed_signed_tape_watch_retention_recommended": True,
+            "rising_missed_signed_tape_watch_retention_reason": "unexpected_retention_reason",
+        },
+    )
+    targets = [target]
+    emitted = []
+    expire_calls = []
+
+    def fake_expire(target_arg, code_arg, targets_arg, *, decision, emit_event_fn=None):
+        expire_calls.append(
+            (target_arg, code_arg, targets_arg, decision, emit_event_fn)
+        )
+        return True
+
+    monkeypatch.setattr(kiwoom_sniper_v2, "_expire_scanner_watch_target", fake_expire)
+
+    expired = kiwoom_sniper_v2._maybe_expire_scanner_watch_for_fast_precheck_budget(
+        target,
+        "005930",
+        targets,
+        now_ts=1035.0,
+        emit_event_fn=lambda *args, **kwargs: emitted.append((args, kwargs)),
+    )
+
+    assert expired is True
+    assert len(expire_calls) == 1
+    assert emitted == []
+    assert "_scanner_fast_precheck_budget_retained_reason" not in target
+
+
+def test_scanner_queue_lag_retention_skips_eviction_for_bounded_signed_tape_reason(
+    monkeypatch,
+):
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_QUEUE_LAG_EVICTION_MIN_SEC", "30")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_QUEUE_LAG_EVICTION_MIN_COUNT", "2")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_QUEUE_LAG_EVICTION_IMMEDIATE_SEC", "60")
+    target = _scanner_watch_stock(
+        code="005930",
+        _scanner_watch_queue_lag_count=2,
+        _scanner_watch_queue_lag_first_observed_epoch=1035.0,
+        _scanner_watch_queue_lag_last_observed_epoch=1045.0,
+        _scanner_fast_precheck_result="budget_reallocated",
+        _scanner_fast_precheck_reason="signed_tape_sell_dominated",
+        _scanner_fast_precheck_fields={
+            "fast_precheck_result": "budget_reallocated",
+            "fast_precheck_reason": "signed_tape_sell_dominated",
+            "rising_missed_signed_tape_watch_retention_recommended": True,
+            "rising_missed_signed_tape_watch_retention_reason": (
+                "bounded_repeat_cooldown_recheck_pending"
+            ),
+        },
+    )
+
+    decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_queue_lag(
+        target,
+        now_ts=1065.0,
+        queue_lag_fields={"queue_lag_sec": 65.0},
+    )
+
+    assert decision["should_evict"] is False
+    assert (
+        decision["eviction_reason"] == "scanner_queue_lag_signed_tape_retention_pending"
+    )
+    assert decision["signed_tape_watch_retention_reason"] == (
+        "bounded_repeat_cooldown_recheck_pending"
+    )
+    assert target["_scanner_queue_lag_retained_reason"] == (
+        "bounded_repeat_cooldown_recheck_pending"
+    )
+    assert "_scanner_watch_queue_lag_count" not in target
+    assert "_scanner_watch_queue_lag_first_observed_epoch" not in target
+    assert "_scanner_watch_queue_lag_last_observed_epoch" not in target
+
+
+def test_scanner_queue_lag_retention_requires_bounded_signed_tape_reason(monkeypatch):
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_QUEUE_LAG_EVICTION_MIN_SEC", "30")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_QUEUE_LAG_EVICTION_MIN_COUNT", "2")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_QUEUE_LAG_EVICTION_IMMEDIATE_SEC", "60")
+    target = _scanner_watch_stock(
+        code="005930",
+        _scanner_fast_precheck_result="budget_reallocated",
+        _scanner_fast_precheck_reason="signed_tape_sell_dominated",
+        _scanner_fast_precheck_fields={
+            "fast_precheck_result": "budget_reallocated",
+            "fast_precheck_reason": "signed_tape_sell_dominated",
+            "rising_missed_signed_tape_watch_retention_recommended": True,
+            "rising_missed_signed_tape_watch_retention_reason": "unexpected_retention_reason",
+        },
+    )
+
+    decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_queue_lag(
+        target,
+        now_ts=1065.0,
+        queue_lag_fields={"queue_lag_sec": 65.0},
+    )
+
+    assert decision["should_evict"] is True
+    assert decision["eviction_reason"] == "scanner_queue_lag_budget_reallocated"
+    assert "_scanner_queue_lag_retained_reason" not in target
+
+
+def test_scanner_queue_lag_retention_requires_current_signed_tape_reason(monkeypatch):
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_QUEUE_LAG_EVICTION_MIN_SEC", "30")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_QUEUE_LAG_EVICTION_MIN_COUNT", "2")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_QUEUE_LAG_EVICTION_IMMEDIATE_SEC", "60")
+    target = _scanner_watch_stock(
+        code="005930",
+        _scanner_fast_precheck_result="budget_reallocated",
+        _scanner_fast_precheck_reason="candidate_gate_backoff_active",
+        _scanner_fast_precheck_fields={
+            "fast_precheck_result": "budget_reallocated",
+            "fast_precheck_reason": "candidate_gate_backoff_active",
+            "rising_missed_signed_tape_watch_retention_recommended": True,
+            "rising_missed_signed_tape_watch_retention_reason": (
+                "bounded_repeat_cooldown_recheck_pending"
+            ),
+        },
+    )
+
+    decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_queue_lag(
+        target,
+        now_ts=1065.0,
+        queue_lag_fields={"queue_lag_sec": 65.0},
+    )
+
+    assert decision["should_evict"] is True
+    assert decision["eviction_reason"] == "scanner_queue_lag_budget_reallocated"
+    assert "_scanner_queue_lag_retained_reason" not in target
+
+
+def test_scanner_queue_lag_eviction_immediate_for_extreme_lag(monkeypatch):
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_QUEUE_LAG_EVICTION_MIN_SEC", "30")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_QUEUE_LAG_EVICTION_MIN_COUNT", "3")
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_QUEUE_LAG_EVICTION_IMMEDIATE_SEC", "60")
+    target = _scanner_watch_stock(
+        code="005930",
+        _scanner_fast_precheck_result="source_quality_blocked",
+        _scanner_fast_precheck_reason="scanner_fast_precheck_source_quality_blocked",
+    )
+
+    decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_queue_lag(
+        target,
+        now_ts=1065.0,
+        queue_lag_fields={"queue_lag_sec": 65.0},
+    )
+
+    assert decision["should_evict"] is True
+    assert decision["eviction_attempt_count"] == 1
+    assert decision["queue_lag_immediate"] is True
+    assert decision["queue_lag_immediate_sec"] == 60.0
+
+
+def test_scanner_queue_lag_eviction_resets_when_heavy_eval_eligible(monkeypatch):
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_QUEUE_LAG_EVICTION_MIN_SEC", "30")
+    target = _scanner_watch_stock(
+        code="005930",
+        _scanner_watch_queue_lag_count=2,
+        _scanner_watch_queue_lag_first_observed_epoch=1035.0,
+        _scanner_watch_queue_lag_last_observed_epoch=1045.0,
+        _scanner_fast_precheck_result="eligible_for_heavy_entry_eval",
+        _scanner_fast_precheck_reason="fast_precheck_pass",
+    )
+
+    decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_queue_lag(
+        target,
+        now_ts=1065.0,
+        queue_lag_fields={"queue_lag_sec": 65.0},
+    )
+
+    assert decision["should_evict"] is False
+    assert decision["eviction_reason"] == "scanner_queue_lag_heavy_eval_eligible"
+    assert "_scanner_watch_queue_lag_count" not in target
+    assert "_scanner_watch_queue_lag_first_observed_epoch" not in target
+    assert "_scanner_watch_queue_lag_last_observed_epoch" not in target
+
+
+def test_scanner_queue_lag_eviction_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_QUEUE_LAG_EVICTION_ENABLED", "0")
+    target = _scanner_watch_stock(
+        code="005930",
+        _scanner_fast_precheck_result="stability_pending",
+        _scanner_fast_precheck_reason="scanner_fast_precheck_stability_pending",
+    )
+
+    decision = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_queue_lag(
+        target,
+        now_ts=1065.0,
+        queue_lag_fields={"queue_lag_sec": 65.0},
+    )
+
+    assert decision["should_evict"] is False
+    assert decision["eviction_attempt_count"] == 0
+    assert "_scanner_watch_queue_lag_count" not in target
+
+
+def test_scanner_full_eval_deferred_eviction_reallocates_repeated_budget_defer(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_FULL_EVAL_DEFERRED_EVICTION_MIN_COUNT", "3"
+    )
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_FULL_EVAL_DEFERRED_EVICTION_MIN_AGE_SEC", "120"
+    )
+    kiwoom_sniper_v2._SCANNER_WATCH_FULL_EVAL_DEFERRED_STATE.clear()
+    target = _scanner_watch_stock(
+        code="005930",
+        entry_armed_at_epoch=1000.0,
+        _scanner_fast_precheck_result="eligible_for_heavy_entry_eval",
+        _scanner_fast_precheck_reason="fast_precheck_pass",
+        _scanner_fast_precheck_fields={
+            "fast_precheck_result": "eligible_for_heavy_entry_eval"
+        },
+    )
+    fields = {
+        "skip_reason": "scanner_full_eval_loop_budget_deferred",
+        "queue_rank": 14,
+        "scanner_queue_rank": 9,
+        "watching_count": 20,
+        "scanner_watching_count": 16,
+        "scanner_full_eval_base_limit": 6,
+        "scanner_full_eval_limit": 4,
+        "scanner_full_eval_count": 4,
+        "scanner_rising_full_eval_extra_limit": 1,
+        "scanner_rising_full_eval_relief_count": 1,
+    }
+
+    first = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_full_eval_deferred(
+        target,
+        now_ts=1180.0,
+        skip_fields=fields,
+    )
+    second = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_full_eval_deferred(
+        target,
+        now_ts=1186.0,
+        skip_fields=fields,
+    )
+    third = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_full_eval_deferred(
+        target,
+        now_ts=1192.0,
+        skip_fields=fields,
+    )
+    event_fields = kiwoom_sniper_v2._scanner_watch_eviction_event_fields(
+        target, decision=third
+    )
+
+    assert first["should_evict"] is False
+    assert second["should_evict"] is False
+    assert third["should_evict"] is True
+    assert third["eviction_reason"] == "scanner_full_eval_budget_deferred_repeated"
+    assert third["terminal_stage"] == "scalping_scanner_watching_runtime_skip"
+    assert third["terminal_reason"] == "scanner_full_eval_loop_budget_deferred"
+    assert third["fresh_input_confirmed"] is True
+    assert (
+        event_fields["source_quality_detail_route"]
+        == "scanner_full_eval_budget_rotation"
+    )
+    assert event_fields["full_eval_deferred_min_count"] == 3
+    assert event_fields["full_eval_deferred_anchor_field"] == "entry_armed_at_epoch"
+    assert event_fields["scanner_full_eval_limit"] == 4
+    assert event_fields["scanner_full_eval_count"] == 4
+    assert event_fields["runtime_effect"] is True
+    assert event_fields["actual_order_submitted"] is False
+    assert event_fields["broker_order_forbidden"] is True
+
+
+def test_scanner_watch_eviction_candidate_accepts_restored_null_buy_time_strings():
+    target = _scanner_watch_stock(code="005930", buy_time="NaT", buy_qty="0.0")
+
+    assert kiwoom_sniper_v2._is_scanner_watch_eviction_candidate(target) is True
+
+    target["buy_time"] = "2026-07-09 09:30:00"
+
+    assert kiwoom_sniper_v2._is_scanner_watch_eviction_candidate(target) is False
+
+
+def test_scanner_full_eval_deferred_eviction_accumulates_across_target_refresh(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_FULL_EVAL_DEFERRED_EVICTION_MIN_COUNT", "3"
+    )
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_FULL_EVAL_DEFERRED_EVICTION_MIN_AGE_SEC", "120"
+    )
+    kiwoom_sniper_v2._SCANNER_WATCH_FULL_EVAL_DEFERRED_STATE.clear()
+    fields = {
+        "skip_reason": "scanner_full_eval_loop_budget_deferred",
+        "scanner_full_eval_limit": 4,
+        "scanner_full_eval_count": 5,
+    }
+
+    def _target():
+        return _scanner_watch_stock(
+            id=16197,
+            code="073240",
+            entry_armed_at_epoch=1000.0,
+            _scanner_fast_precheck_result="eligible_for_heavy_entry_eval",
+            _scanner_fast_precheck_reason="rising_stale_ws_snapshot_full_eval_relief",
+        )
+
+    first = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_full_eval_deferred(
+        _target(),
+        now_ts=1185.0,
+        skip_fields=fields,
+    )
+    second = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_full_eval_deferred(
+        _target(),
+        now_ts=1225.0,
+        skip_fields=fields,
+    )
+    third_target = _target()
+    third = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_full_eval_deferred(
+        third_target,
+        now_ts=1265.0,
+        skip_fields=fields,
+    )
+
+    assert first["eviction_attempt_count"] == 1
+    assert second["eviction_attempt_count"] == 2
+    assert third["should_evict"] is True
+    assert third["eviction_attempt_count"] == 3
+    assert third["full_eval_deferred_state_source"] == "module_cache_and_target_dict"
+    assert third_target["_scanner_watch_full_eval_deferred_count"] == 3
+
+
+def test_scanner_full_eval_deferred_uses_cached_anchor_when_refresh_moves_entry_epoch(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_FULL_EVAL_DEFERRED_EVICTION_MIN_COUNT", "3"
+    )
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_FULL_EVAL_DEFERRED_EVICTION_MIN_AGE_SEC", "180"
+    )
+    kiwoom_sniper_v2._SCANNER_WATCH_FULL_EVAL_DEFERRED_STATE.clear()
+    fields = {
+        "skip_reason": "scanner_full_eval_loop_budget_deferred",
+        "scanner_full_eval_limit": 4,
+        "scanner_full_eval_count": 4,
+    }
+    first_target = _scanner_watch_stock(
+        id=16197, code="073240", entry_armed_at_epoch=1000.0
+    )
+    refreshed_target = _scanner_watch_stock(
+        id=16197, code="073240", entry_armed_at_epoch=1130.0
+    )
+
+    first = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_full_eval_deferred(
+        first_target,
+        now_ts=1175.0,
+        skip_fields=fields,
+    )
+    second = kiwoom_sniper_v2._scanner_watch_eviction_decision_from_full_eval_deferred(
+        refreshed_target,
+        now_ts=1186.0,
+        skip_fields=fields,
+    )
+
+    assert first["eviction_reason"] == "scanner_full_eval_deferred_new_promotion_grace"
+    assert first_target["_scanner_watch_full_eval_deferred_anchor_epoch"] == 1000.0
+    assert second["eviction_attempt_count"] == 1
+    assert second["full_eval_deferred_watch_age_sec"] == 186.0
+    assert (
+        second["full_eval_deferred_anchor_field"]
+        == "full_eval_deferred_cached_anchor_epoch"
+    )
+    assert refreshed_target["_scanner_watch_full_eval_deferred_anchor_epoch"] == 1000.0
+
+
+def test_scanner_full_eval_deferred_state_prunes_inactive_targets():
+    kiwoom_sniper_v2._SCANNER_WATCH_FULL_EVAL_DEFERRED_STATE.clear()
+    kiwoom_sniper_v2._SCANNER_WATCH_FULL_EVAL_DEFERRED_STATE.update(
+        {
+            "11:005930": {"count": 2},
+            "22:000660": {"count": 1},
+            "33:073240": {"count": 3},
+        }
+    )
+    active = [
+        _scanner_watch_stock(id=11, code="005930"),
+        _scanner_watch_stock(id=22, code="000660", status="EXPIRED"),
+        _scanner_watch_stock(id=33, code="073240", status="HOLDING", buy_qty=1),
+    ]
+
+    kiwoom_sniper_v2._prune_scanner_watch_full_eval_deferred_state(active)
+
+    assert kiwoom_sniper_v2._SCANNER_WATCH_FULL_EVAL_DEFERRED_STATE == {
+        "11:005930": {"count": 2}
+    }
+
+
+def test_scanner_full_eval_deferred_eviction_respects_new_promotion_grace(monkeypatch):
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_FULL_EVAL_DEFERRED_EVICTION_MIN_AGE_SEC", "180"
+    )
+    kiwoom_sniper_v2._SCANNER_WATCH_FULL_EVAL_DEFERRED_STATE.clear()
+    target = _scanner_watch_stock(
+        code="005930",
+        entry_armed_at_epoch=1000.0,
+        _scanner_watch_full_eval_deferred_count=2,
+        _scanner_watch_full_eval_deferred_first_observed_epoch=1010.0,
+        _scanner_watch_full_eval_deferred_last_observed_epoch=1020.0,
+    )
+
+    decision = (
+        kiwoom_sniper_v2._scanner_watch_eviction_decision_from_full_eval_deferred(
+            target,
+            now_ts=1070.0,
+            skip_fields={"skip_reason": "scanner_full_eval_loop_budget_deferred"},
+        )
+    )
+
+    assert decision["should_evict"] is False
+    assert (
+        decision["eviction_reason"] == "scanner_full_eval_deferred_new_promotion_grace"
+    )
+    assert decision["full_eval_deferred_watch_age_sec"] == 70.0
+    assert "_scanner_watch_full_eval_deferred_count" not in target
+    assert "_scanner_watch_full_eval_deferred_first_observed_epoch" not in target
+    assert "_scanner_watch_full_eval_deferred_last_observed_epoch" not in target
+    assert target["_scanner_watch_full_eval_deferred_anchor_epoch"] == 1000.0
+
+
+def test_scanner_full_eval_deferred_eviction_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("KORSTOCKSCAN_SCANNER_FULL_EVAL_DEFERRED_EVICTION_ENABLED", "0")
+    kiwoom_sniper_v2._SCANNER_WATCH_FULL_EVAL_DEFERRED_STATE.clear()
+    target = _scanner_watch_stock(code="005930", entry_armed_at_epoch=1000.0)
+
+    decision = (
+        kiwoom_sniper_v2._scanner_watch_eviction_decision_from_full_eval_deferred(
+            target,
+            now_ts=1300.0,
+            skip_fields={"skip_reason": "scanner_full_eval_loop_budget_deferred"},
+        )
+    )
+
+    assert decision["should_evict"] is False
+    assert decision["eviction_attempt_count"] == 0
+    assert "_scanner_watch_full_eval_deferred_count" not in target
+
+
+def test_run_sniper_full_eval_deferred_eviction_is_checked_before_deferred_skip_log():
+    source = inspect.getsource(kiwoom_sniper_v2.run_sniper)
+    fields_idx = source.index('skip_reason": "scanner_full_eval_loop_budget_deferred"')
+    decision_idx = source.index(
+        "_scanner_watch_eviction_decision_from_full_eval_deferred(", fields_idx
+    )
+    diagnostic_idx = source.index('"full_eval_deferred_attempt_count"', decision_idx)
+    skip_idx = source.index("_defer_scanner_watching_runtime_skip(", diagnostic_idx)
+    expire_idx = source.index("_expire_scanner_watch_target(", decision_idx)
+
+    assert fields_idx < decision_idx < diagnostic_idx < skip_idx < expire_idx
+
+
+def test_ws_reg_budget_skipped_expires_scanner_hot_slot(monkeypatch):
+    emitted = []
+    active = [
+        {
+            "id": 77,
+            "code": "005930",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "buy_qty": 0,
+            "buy_time": None,
+        },
+        {
+            "id": 88,
+            "code": "000660",
+            "status": "HOLDING",
+            "strategy": "SCALPING",
+            "position_tag": "SCALP_BASE",
+            "buy_qty": 1,
+        },
+    ]
+    fake_db = _ExpireDB()
+    monkeypatch.setattr(kiwoom_sniper_v2, "ACTIVE_TARGETS", active)
+    monkeypatch.setattr(kiwoom_sniper_v2, "DB", fake_db)
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.sniper_state_handlers,
+        "_log_entry_pipeline",
+        lambda target, code, stage, **fields: emitted.append(
+            {"target": target, "code": code, "stage": stage, "fields": fields}
+        ),
+    )
+
+    expired = kiwoom_sniper_v2.handle_ws_reg_budget_skipped(
+        {
+            "codes": ["005930", "000660"],
+            "source": "scalping_scanner_promote",
+            "max_items": 24,
+        }
+    )
+
+    assert expired is True
+    assert active[0]["status"] == "EXPIRED"
+    assert active[1]["status"] == "HOLDING"
+    assert fake_db.calls == [({"status": "EXPIRED"}, False)]
+    assert emitted[-1]["stage"] == "scalping_scanner_watch_eviction"
+    assert (
+        emitted[-1]["fields"]["eviction_reason"]
+        == "scanner_ws_budget_skipped_hot_slot_rotation"
+    )
+    assert emitted[-1]["fields"]["terminal_reason"] == "ws_item_budget_exhausted"
+    assert emitted[-1]["fields"]["ws_recovery_outcome"] == "ws_reg_budget_skipped"
+
+
+def test_ws_reg_budget_skipped_retains_market_gainer_until_first_ai(monkeypatch):
+    active = [
+        {
+            "id": 77,
+            "code": "005930",
+            "status": "WATCHING",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "buy_qty": 0,
+            "buy_time": None,
+            "source_signature": "PREV_CLOSE_GAINER,PRICE_JUMP_START",
+            "scanner_promotion_emitted_epoch": 1000.0,
+        }
+    ]
+    fake_db = _ExpireDB()
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_SCANNER_MARKET_GAINER_FIRST_EVAL_RETENTION_SEC", "180"
+    )
+    monkeypatch.setattr(kiwoom_sniper_v2.time, "time", lambda: 1012.0)
+    monkeypatch.setattr(kiwoom_sniper_v2, "ACTIVE_TARGETS", active)
+    monkeypatch.setattr(kiwoom_sniper_v2, "DB", fake_db)
+
+    expired = kiwoom_sniper_v2.handle_ws_reg_budget_skipped(
+        {
+            "codes": ["005930"],
+            "source": "scanner_fast_precheck_stale_ws_recovery",
+            "max_items": 24,
+        }
+    )
+
+    assert expired is False
+    assert active[0]["status"] == "WATCHING"
+    assert active[0]["_scanner_ws_budget_skipped_retained_count"] == 1
+    assert active[0]["_scanner_ws_budget_skipped_retained_at"] == 1012.0
+    assert fake_db.calls == []
+
+
+def test_db_poll_scanner_target_attach_logs_recovery(monkeypatch):
+    emitted = []
+    published = []
+    targets = []
+    # A legacy database row may still carry the retired Opening owner.  Restore
+    # the target for scanner observation, but normalize ownership into the
+    # rising pool so archived metadata cannot recreate protected capacity.
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "evaluate_manual_control_exclusion",
+        lambda code: SimpleNamespace(excluded=False),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_SCANNER_PROMOTION_INBOX",
+        kiwoom_sniper_v2.ScannerPromotionInbox(max_active=4),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_scanner_scheduler_startup_mode", lambda: "legacy"
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_scalping_attach_capacity_decision",
+        lambda target, now_ts, *, watching_targets: (
+            True,
+            [],
+            {"scanner_watch_budget_owner": "opening_rotation"},
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda pipeline, name, code, stage, *, record_id=None, fields=None: emitted.append(
+            {"stage": stage, "code": code, "fields": fields or {}}
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    attached = kiwoom_sniper_v2.attach_db_poll_target_if_missing(
+        {
+            "id": 99,
+            "code": "005930",
+            "name": "SAMSUNG",
+            "strategy": "SCALPING",
+            "status": "WATCHING",
+            "position_tag": "SCANNER",
+            "buy_price": 70000,
+            "type": "SCALP",
+            "effective_venue": "KRX",
+            "venue_resolution": "session_window:krx_regular",
+            "scanner_promotion_id": "SCANPROM-005930-1000000",
+            "scanner_promotion_emitted_epoch": 1000.0,
+            "source_signature": "PRICE_JUMP_START",
+            "scanner_watch_budget_owner": "opening_rotation",
+        },
+        targets,
+        now_ts=1002.0,
+    )
+
+    assert attached is True, emitted
+    assert targets[0]["id"] == 99
+    assert targets[0]["added_time"] == 1002.0
+    assert published == [
+        ("COMMAND_WS_REG", {"codes": ["005930"], "source": "scanner_db_poll_attach"})
+    ]
+    assert emitted[-1]["stage"] == "scalping_scanner_runtime_target_attach"
+    assert emitted[-1]["fields"]["runtime_target_attach_outcome"] == "db_poll_attached"
+    assert emitted[-1]["fields"]["effective_venue"] == "KRX"
+    assert emitted[-1]["fields"]["venue_resolution"] == (
+        "consistent_explicit:payload.effective_venue,payload.venue,"
+        "target.effective_venue"
+    )
+    assert (
+        emitted[-1]["fields"]["runtime_target_attach_reason"]
+        == "eventbus_attach_missing_recovered_from_database_poll"
+    )
+    assert emitted[-1]["fields"]["runtime_record_id"] == 99
+    assert emitted[-1]["fields"]["scanner_promotion_id"] == "SCANPROM-005930-1000000"
+    assert emitted[-1]["fields"]["scanner_promotion_emitted_epoch"] == 1000.0
+    assert emitted[-1]["fields"]["source_signature"] == "PRICE_JUMP_START"
+    assert targets[0]["scanner_runtime_handoff_source"] == (
+        "database_poll_recovery_attach"
+    )
+    assert targets[0]["scanner_runtime_handoff_promotion_id"] == (
+        "SCANPROM-005930-1000000"
+    )
+    assert targets[0]["scanner_attach_provenance_version"] == (
+        "scanner_runtime_handoff_v1"
+    )
+    assert emitted[-1]["fields"]["scanner_runtime_handoff_epoch"] > 0
+    assert emitted[-1]["fields"]["scanner_runtime_instance_id"].startswith(
+        "scanner-runtime-"
+    )
+    assert targets[0]["scanner_watch_budget_owner"] == "rising_missed"
+    assert (
+        emitted[-1]["fields"]["scanner_watch_budget_owner_source"]
+        == "retired_opening_owner_normalized"
+    )
+
+
+def test_db_poll_scanner_target_rejects_generation_older_than_pending_inbox(
+    monkeypatch,
+):
+    emitted = []
+    published = []
+    targets = []
+    inbox = kiwoom_sniper_v2.ScannerPromotionInbox(max_active=4)
+    inbox.put(
+        kiwoom_sniper_v2.ScannerPromotionEnvelope.from_payload(
+            {
+                "code": "009320",
+                "scanner_promotion_id": "SCANPROM-009320-NEW",
+                "scanner_promotion_emitted_epoch": 1010.0,
+                "effective_venue": "KRX",
+            },
+            enqueued_epoch=1010.1,
+        )
+    )
+    monkeypatch.setattr(kiwoom_sniper_v2, "_SCANNER_PROMOTION_INBOX", inbox)
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda pipeline, name, code, stage, *, record_id=None, fields=None: emitted.append(
+            {"stage": stage, "code": code, "fields": fields or {}}
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    attached = kiwoom_sniper_v2.attach_db_poll_target_if_missing(
+        {
+            "id": 24315,
+            "code": "009320",
+            "name": "AJIN",
+            "strategy": "SCALPING",
+            "status": "WATCHING",
+            "position_tag": "SCANNER",
+            "buy_price": 997,
+            "type": "SCALP",
+            "effective_venue": "KRX",
+            "venue_resolution": "scanner_session_clock:krx_regular",
+            "scanner_promotion_id": "SCANPROM-009320-OLD",
+            "scanner_promotion_emitted_epoch": 1000.0,
+            "source_signature": "PRICE_JUMP_START",
+        },
+        targets,
+        now_ts=1011.0,
+    )
+
+    assert attached is False
+    assert targets == []
+    assert published == []
+    assert emitted[-1]["stage"] == "scalping_scanner_runtime_target_attach"
+    assert emitted[-1]["fields"]["runtime_target_attach_outcome"] == "skipped"
+    assert emitted[-1]["fields"]["runtime_target_attach_reason"] == (
+        "db_poll_blocked_by_pending_promotion_generation_mismatch"
+    )
+    assert emitted[-1]["fields"]["scanner_db_poll_generation_guard_applied"] is True
+    assert (
+        emitted[-1]["fields"]["scanner_pending_promotion_id"] == "SCANPROM-009320-NEW"
+    )
+
+
+def test_db_poll_replacement_releases_stale_scheduler_capacity(monkeypatch):
+    old_target = {
+        "id": 1,
+        "code": "000001",
+        "name": "OLD",
+        "strategy": "SCALPING",
+        "status": "WATCHING",
+        "position_tag": "SCANNER",
+        "effective_venue": "KRX",
+    }
+    targets = [old_target]
+    scheduler = kiwoom_sniper_v2.ScannerRuntimeScheduler(max_active=1)
+    old_registration = scheduler.register_generation(
+        code="000001",
+        promotion_id="PROMO-OLD",
+        record_id=1,
+        venue="KRX",
+        promotion_epoch=999.0,
+        attach_epoch=1000.0,
+        observed_price=10_000,
+        source_signature="VALUE_TOP",
+    )
+    assert old_registration.action == "generation_registered"
+    published = []
+    attach_logs = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_mode",
+        "deadline_v1",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_scheduler_venues",
+        frozenset({"KRX", "PREMARKET_KRX_LIKE", "NXT"}),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.run_sniper,
+        "scanner_runtime_scheduler",
+        scheduler,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_scalping_attach_capacity_decision",
+        lambda *args, **kwargs: (
+            True,
+            [old_target],
+            {"scanner_watch_budget_owner": "rising_missed"},
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_scalping_attach_replace_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_expire_scalping_watch_budget_targets",
+        lambda replacements, *args, **kwargs: [
+            replacement.update({"status": "EXPIRED"}) for replacement in replacements
+        ],
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_scanner_scheduler_boot_restore_payload",
+        lambda target, *, boot_epoch: {
+            **target,
+            "scanner_promotion_id": "PROMO-NEW",
+            "scanner_promotion_emitted_epoch": 1001.0,
+            "current_price_observed": 11_000,
+            "source_signature": "OPEN_TOP",
+            "effective_venue": "KRX",
+            "venue_resolution": "consistent_explicit:target.effective_venue",
+        },
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_emit_scanner_scheduler_event",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_scanner_identity_guard",
+        lambda payload, code, price: (
+            True,
+            {"scanner_identity_guard_reason": "identity_verified"},
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_log_scanner_runtime_target_attach",
+        lambda payload, **kwargs: attach_logs.append((payload, kwargs)),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    attached = kiwoom_sniper_v2.attach_db_poll_target_if_missing(
+        {
+            "id": 2,
+            "code": "000002",
+            "name": "NEW",
+            "strategy": "SCALPING",
+            "status": "WATCHING",
+            "position_tag": "SCANNER",
+            "buy_price": 11_000,
+            "type": "SCALP",
+            "effective_venue": "KRX",
+            "venue_resolution": "consistent_explicit:target.effective_venue",
+            "scanner_promotion_id": "PROMO-NEW",
+            "scanner_promotion_emitted_epoch": 1001.0,
+            "source_signature": "OPEN_TOP",
+        },
+        targets,
+        now_ts=1002.0,
+    )
+
+    assert attached is True, attach_logs
+    assert old_target["status"] == "EXPIRED"
+    assert scheduler.generation_codes() == frozenset({"000002"})
+    assert targets[-1]["scanner_generation_revision"] == 1
+    assert targets[-1]["_scanner_scheduler_registration_blocked"] is False
+    assert published[-1] == (
+        "COMMAND_WS_REG",
+        {"codes": ["000002"], "source": "scanner_db_poll_attach"},
+    )
+
+
+def test_db_poll_scanner_target_skips_manual_control_excluded_code(
+    monkeypatch, tmp_path
+):
+    emitted = []
+    published = []
+    targets = []
+    excluded_path = tmp_path / "manual_control_excluded_codes.txt"
+    excluded_path.write_text("005930\n", encoding="utf-8")
+    monkeypatch.delenv("KORSTOCKSCAN_MANUAL_CONTROL_EXCLUDED_CODES", raising=False)
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_MANUAL_CONTROL_EXCLUDED_CODES_FILE", str(excluded_path)
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda pipeline, name, code, stage, *, record_id=None, fields=None: emitted.append(
+            {"stage": stage, "code": code, "fields": fields or {}}
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    attached = kiwoom_sniper_v2.attach_db_poll_target_if_missing(
+        {
+            "id": 99,
+            "code": "005930",
+            "name": "SAMSUNG",
+            "strategy": "SCALPING",
+            "status": "WATCHING",
+            "position_tag": "SCANNER",
+            "buy_price": 70000,
+            "type": "SCALP",
+        },
+        targets,
+        now_ts=1002.0,
+    )
+
+    assert attached is False
+    assert targets == []
+    assert published == []
+    assert emitted[-1]["stage"] == "scalping_scanner_runtime_target_attach"
+    assert emitted[-1]["fields"]["runtime_target_attach_outcome"] == "skipped"
+    assert (
+        emitted[-1]["fields"]["runtime_target_attach_reason"]
+        == "operator_manual_control_excluded_symbol"
+    )
+    assert emitted[-1]["fields"]["manual_control_exclusion_applied"] is True
+
+
+def test_db_poll_manual_exclusion_terminalizes_only_exact_zero_fill_generation(
+    monkeypatch, tmp_path
+):
+    emitted = []
+    fake_db = _ExpireDB()
+    excluded_path = tmp_path / "manual_control_excluded_codes.txt"
+    excluded_path.write_text("005930\n", encoding="utf-8")
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_MANUAL_CONTROL_EXCLUDED_CODES_FILE", str(excluded_path)
+    )
+    monkeypatch.setattr(kiwoom_sniper_v2, "DB", fake_db)
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda pipeline, name, code, stage, *, record_id=None, fields=None: emitted.append(
+            {"stage": stage, "fields": fields or {}}
+        ),
+    )
+
+    attached = kiwoom_sniper_v2.attach_db_poll_target_if_missing(
+        {
+            "id": 99,
+            "code": "005930",
+            "name": "SAMSUNG",
+            "strategy": "SCALPING",
+            "status": "WATCHING",
+            "position_tag": "SCANNER",
+            "buy_qty": 0,
+            "buy_time": None,
+            "scanner_promotion_id": "SCANPROM-005930-1000000",
+        },
+        [],
+        now_ts=1002.0,
+    )
+
+    assert attached is False
+    assert fake_db.calls == [({"status": "EXPIRED"}, False)]
+    filter_contract = " ".join(fake_db.filters)
+    assert "recommendation_history.id" in filter_contract
+    assert "recommendation_history.stock_code" in filter_contract
+    assert "recommendation_history.status" in filter_contract
+    assert "recommendation_history.strategy" in filter_contract
+    assert "recommendation_history.position_tag" in filter_contract
+    assert "recommendation_history.scanner_promotion_id" in filter_contract
+    assert "recommendation_history.buy_time IS NULL" in filter_contract
+    assert "recommendation_history.buy_qty" in filter_contract
+    assert emitted[-1]["fields"]["manual_control_exclusion_terminalized"] is True
+    assert (
+        emitted[-1]["fields"]["manual_control_exclusion_terminalization_scope"]
+        == "exact_record_promotion_zero_fill"
+    )
+
+
+def test_db_poll_holding_target_skips_manual_control_excluded_code(
+    monkeypatch, tmp_path
+):
+    published = []
+    targets = []
+    excluded_path = tmp_path / "manual_control_excluded_codes.txt"
+    excluded_path.write_text("005930\n", encoding="utf-8")
+    monkeypatch.delenv("KORSTOCKSCAN_MANUAL_CONTROL_EXCLUDED_CODES", raising=False)
+    monkeypatch.setenv(
+        "KORSTOCKSCAN_MANUAL_CONTROL_EXCLUDED_CODES_FILE", str(excluded_path)
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    attached = kiwoom_sniper_v2.attach_db_poll_target_if_missing(
+        {
+            "id": 100,
+            "code": "005930",
+            "name": "SAMSUNG",
+            "strategy": "SCALPING",
+            "status": "HOLDING",
+            "position_tag": "SCANNER",
+            "buy_price": 70000,
+            "type": "SCALP",
+        },
+        targets,
+        now_ts=1002.0,
+    )
+
+    assert attached is False
+    assert targets == []
+    assert published == []
+
+
+def test_db_poll_scanner_target_preserves_entry_armed_recency(monkeypatch):
+    emitted = []
+    published = []
+    targets = []
+    monkeypatch.setattr(kiwoom_sniper_v2, "_latest_stock_name_from_db", lambda code: "")
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda pipeline, name, code, stage, *, record_id=None, fields=None: emitted.append(
+            {"stage": stage, "code": code, "fields": fields or {}}
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    attached = kiwoom_sniper_v2.attach_db_poll_target_if_missing(
+        {
+            "id": 101,
+            "code": "005930",
+            "name": "SAMSUNG",
+            "strategy": "SCALPING",
+            "status": "WATCHING",
+            "position_tag": "SCANNER",
+            "buy_price": 70000,
+            "type": "SCALP",
+            "entry_armed_at_epoch": 1001.0,
+        },
+        targets,
+        now_ts=2002.0,
+    )
+
+    assert attached is True
+    assert targets[0]["id"] == 101
+    assert targets[0]["added_time"] == 1001.0
+    assert emitted[-1]["fields"]["runtime_target_attach_outcome"] == "db_poll_attached"
+    assert emitted[-1]["fields"]["runtime_record_id"] == 101
+
+
+def test_db_poll_scanner_target_blocks_identity_mismatch(monkeypatch):
+    emitted = []
+    published = []
+    targets = []
+    fake_db = _ExpireDB()
+    monkeypatch.setattr(
+        kiwoom_sniper_v2, "_latest_stock_name_from_db", lambda code: "두산"
+    )
+    monkeypatch.setattr(kiwoom_sniper_v2, "DB", fake_db)
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda pipeline, name, code, stage, *, record_id=None, fields=None: emitted.append(
+            {"stage": stage, "code": code, "fields": fields or {}}
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    attached = kiwoom_sniper_v2.attach_db_poll_target_if_missing(
+        {
+            "id": 101,
+            "code": "000150",
+            "name": "아로마티카",
+            "strategy": "SCALPING",
+            "status": "WATCHING",
+            "position_tag": "SCANNER",
+            "buy_price": 5450,
+            "type": "SCALP",
+            "entry_armed_at_epoch": 1001.0,
+        },
+        targets,
+        now_ts=2002.0,
+    )
+
+    assert attached is False
+    assert targets == []
+    assert published == []
+    assert emitted[-1]["stage"] == "scalping_scanner_runtime_target_attach"
+    assert emitted[-1]["fields"]["runtime_target_attach_outcome"] == "skipped"
+    assert (
+        emitted[-1]["fields"]["runtime_target_attach_reason"]
+        == "scanner_identity_name_mismatch"
+    )
+    assert emitted[-1]["fields"]["scanner_identity_payload_name"] == "아로마티카"
+    assert emitted[-1]["fields"]["scanner_identity_db_name"] == "두산"
+    assert emitted[-1]["fields"]["scanner_identity_mismatch_expired"] is True
+    assert fake_db.calls == [({"status": "EXPIRED"}, False)]
+
+
+def test_boot_filter_drops_invalid_scanner_identity_without_replacing_list(monkeypatch):
+    emitted = []
+    fake_db = _ExpireDB()
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "_latest_stock_name_from_db",
+        lambda code: "두산" if code == "000150" else "",
+    )
+    monkeypatch.setattr(kiwoom_sniper_v2, "DB", fake_db)
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda pipeline, name, code, stage, *, record_id=None, fields=None: emitted.append(
+            {"stage": stage, "code": code, "fields": fields or {}}
+        ),
+    )
+    targets = [
+        {
+            "id": 101,
+            "code": "000150",
+            "name": "아로마티카",
+            "strategy": "SCALPING",
+            "status": "WATCHING",
+            "position_tag": "SCANNER",
+            "buy_price": 5450,
+        },
+        {
+            "id": 102,
+            "code": "005930",
+            "name": "SAMSUNG",
+            "strategy": "SCALPING",
+            "status": "WATCHING",
+        },
+    ]
+    original_id = id(targets)
+
+    targets[:] = kiwoom_sniper_v2._filter_invalid_scanner_identity_targets(targets)
+
+    assert id(targets) == original_id
+    assert [target["code"] for target in targets] == ["005930"]
+    assert emitted[-1]["stage"] == "scalping_scanner_runtime_target_attach"
+    assert (
+        emitted[-1]["fields"]["runtime_target_attach_reason"]
+        == "scanner_identity_name_mismatch"
+    )
+    assert emitted[-1]["fields"]["scanner_identity_mismatch_expired"] is True
+    assert fake_db.calls == [({"status": "EXPIRED"}, False)]
+
+
+def test_db_poll_target_attach_skips_existing_real_target(monkeypatch):
+    emitted = []
+    published = []
+    targets = [{"code": "005930", "strategy": "SCALPING", "status": "WATCHING"}]
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "emit_pipeline_event",
+        lambda *args, **kwargs: emitted.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+
+    attached = kiwoom_sniper_v2.attach_db_poll_target_if_missing(
+        {
+            "id": 100,
+            "code": "005930",
+            "name": "SAMSUNG",
+            "strategy": "SCALPING",
+            "status": "WATCHING",
+            "position_tag": "SCANNER",
+        },
+        targets,
+        now_ts=1003.0,
+    )
+
+    assert attached is False
+    assert targets == [{"code": "005930", "strategy": "SCALPING", "status": "WATCHING"}]
+    assert published == []
+    assert emitted == []
+
+
+def test_risk_off_without_confirmed_context_is_prior_not_block(monkeypatch):
+    class FakeMarketRegime:
+        def refresh_if_needed(self):
+            return SimpleNamespace(
+                risk_state="RISK_OFF",
+                allow_swing_entry=False,
+                swing_score=25,
+                debug={"component_scores": {}, "score_threshold": 70},
+                reasons=["unit"],
+                vix_extreme=False,
+                vix_two_day_down=False,
+                vix_peak_passed=False,
+                oil_reversal=False,
+                wti_dead_cross=False,
+                wti_from_recent_high_pct=0.0,
+                fng_value=0.0,
+                fng_prev=0.0,
+                fng_recovery=False,
+                fng_extreme_fear=False,
+                vix_close=0.0,
+                wti_rsi=0.0,
+            )
+
+    monkeypatch.setattr(sniper_market_regime, "MARKET_REGIME", FakeMarketRegime())
+    monkeypatch.setattr(
+        sniper_market_regime,
+        "_load_confirmed_risk_context",
+        lambda: {
+            "panic_state": "NORMAL",
+            "confirmed_risk_off_advisory": False,
+            "risk_off_advisory": False,
+            "single_market_risk_off_advisory": False,
+            "confirmed_risk_block": False,
+        },
+    )
+
+    blocked, reason, meta = (
+        sniper_market_regime.should_block_swing_entry_by_market_regime("KOSPI_ML")
+    )
+
+    assert blocked is False
+    assert "risk=RISK_OFF" in reason
+    assert "risk_context=not_confirmed" in reason
+    assert meta["market_regime_prior_observed"] is True
+    assert meta["market_regime_prior_reason"] == "recovery_gate_signal_insufficient"
+
+
+def test_non_swing_strategy_does_not_refresh_market_regime(monkeypatch):
+    class BrokenMarketRegime:
+        def refresh_if_needed(self):
+            raise AssertionError("non-swing strategy should not refresh market regime")
+
+    monkeypatch.setattr(sniper_market_regime, "MARKET_REGIME", BrokenMarketRegime())
+
+    blocked, reason, meta = (
+        sniper_market_regime.should_block_swing_entry_by_market_regime("SCALPING")
+    )
+
+    assert blocked is False
+    assert reason == ""
+    assert meta["strategy_scope"] == "non_swing"
+    assert meta["confirmed_risk_block"] is False
+
+
+def test_single_market_risk_off_is_prior_not_block(monkeypatch):
+    class FakeMarketRegime:
+        def refresh_if_needed(self):
+            return SimpleNamespace(
+                risk_state="RISK_OFF",
+                allow_swing_entry=False,
+                swing_score=25,
+                debug={"component_scores": {}, "score_threshold": 70},
+                reasons=[],
+                vix_extreme=False,
+                vix_two_day_down=False,
+                vix_peak_passed=False,
+                oil_reversal=False,
+                wti_dead_cross=False,
+                wti_from_recent_high_pct=0.0,
+                fng_value=0.0,
+                fng_prev=0.0,
+                fng_recovery=False,
+                fng_extreme_fear=False,
+                vix_close=0.0,
+                wti_rsi=0.0,
+            )
+
+    monkeypatch.setattr(sniper_market_regime, "MARKET_REGIME", FakeMarketRegime())
+    monkeypatch.setattr(
+        sniper_market_regime,
+        "_load_confirmed_risk_context",
+        lambda: {
+            "panic_state": "NORMAL",
+            "confirmed_risk_off_advisory": False,
+            "risk_off_advisory": False,
+            "single_market_risk_off_advisory": True,
+            "confirmed_risk_block": False,
+        },
+    )
+
+    blocked, _, meta = sniper_market_regime.should_block_swing_entry_by_market_regime(
+        "KOSPI_ML"
+    )
+
+    assert blocked is False
+    assert meta["market_regime_prior_reason"] == "single_market_risk_off_advisory"
+
+
+def test_oil_only_recovery_gate_deficit_is_prior_not_block(monkeypatch):
+    class FakeMarketRegime:
+        def refresh_if_needed(self):
+            return SimpleNamespace(
+                risk_state="RISK_OFF",
+                allow_swing_entry=False,
+                swing_score=35,
+                swing_entry_recovery_gate_score=35,
+                recovery_gate_state="INSUFFICIENT",
+                swing_recovery_gate_label="INSUFFICIENT",
+                recovery_gate_reason="oil_only_recovery_signal_insufficient",
+                oil_only_recovery_prior=True,
+                market_regime_continuous_score=73.1543,
+                market_regime_continuous_label="RISK_ON",
+                market_regime_source_quality="valid",
+                debug={
+                    "component_scores": {
+                        "vix": 0,
+                        "oil": 35,
+                        "fng": 0,
+                        "local_breadth": 0,
+                    },
+                    "score_threshold": 70,
+                },
+                reasons=["원유 반전 시그널"],
+                vix_extreme=False,
+                vix_two_day_down=False,
+                vix_peak_passed=False,
+                oil_reversal=True,
+                wti_dead_cross=False,
+                wti_from_recent_high_pct=-5.0,
+                fng_value=15.0,
+                fng_prev=15.0,
+                fng_recovery=False,
+                fng_extreme_fear=False,
+                vix_close=22.99,
+                wti_rsi=45.0,
+            )
+
+    monkeypatch.setattr(sniper_market_regime, "MARKET_REGIME", FakeMarketRegime())
+    monkeypatch.setattr(
+        sniper_market_regime,
+        "_load_confirmed_risk_context",
+        lambda: {
+            "panic_state": "NORMAL",
+            "confirmed_risk_off_advisory": False,
+            "risk_off_advisory": False,
+            "single_market_risk_off_advisory": False,
+            "confirmed_risk_block": False,
+        },
+    )
+
+    blocked, reason, meta = (
+        sniper_market_regime.should_block_swing_entry_by_market_regime("KOSPI_ML")
+    )
+
+    assert blocked is False
+    assert "legacy_recovery_gate_score=35/70" in reason
+    assert "continuous_label=RISK_ON" in reason
+    assert meta["market_regime_prior_reason"] == "oil_only_recovery_signal_insufficient"
+    assert meta["oil_only_recovery_prior"] is True
+    assert meta["market_regime_continuous_label"] == "RISK_ON"
+
+
+def test_confirmed_panic_context_blocks_swing_market_regime(monkeypatch):
+    class FakeMarketRegime:
+        def refresh_if_needed(self):
+            return SimpleNamespace(
+                risk_state="RISK_OFF",
+                allow_swing_entry=False,
+                swing_score=25,
+                debug={"component_scores": {}, "score_threshold": 70},
+                reasons=[],
+                vix_extreme=False,
+                vix_two_day_down=False,
+                vix_peak_passed=False,
+                oil_reversal=False,
+                wti_dead_cross=False,
+                wti_from_recent_high_pct=0.0,
+                fng_value=0.0,
+                fng_prev=0.0,
+                fng_recovery=False,
+                fng_extreme_fear=False,
+                vix_close=0.0,
+                wti_rsi=0.0,
+            )
+
+    monkeypatch.setattr(sniper_market_regime, "MARKET_REGIME", FakeMarketRegime())
+    monkeypatch.setattr(
+        sniper_market_regime,
+        "_load_confirmed_risk_context",
+        lambda: {
+            "panic_state": "PANIC_SELL",
+            "confirmed_risk_off_advisory": False,
+            "risk_off_advisory": False,
+            "single_market_risk_off_advisory": False,
+            "confirmed_risk_block": True,
+        },
+    )
+
+    blocked, _, meta = sniper_market_regime.should_block_swing_entry_by_market_regime(
+        "KOSPI_ML"
+    )
+
+    assert blocked is True
+    assert meta["confirmed_risk_block"] is True
+    assert meta["market_regime_block_reason"] == "confirmed_risk_context"
+
+
+def test_string_false_risk_flags_do_not_confirm_block(monkeypatch):
+    class FakeMarketRegime:
+        def refresh_if_needed(self):
+            return SimpleNamespace(
+                risk_state="RISK_OFF",
+                allow_swing_entry=False,
+                swing_score=25,
+                debug={"component_scores": {}, "score_threshold": 70},
+                reasons=[],
+                vix_extreme=False,
+                vix_two_day_down=False,
+                vix_peak_passed=False,
+                oil_reversal=False,
+                wti_dead_cross=False,
+                wti_from_recent_high_pct=0.0,
+                fng_value=0.0,
+                fng_prev=0.0,
+                fng_recovery=False,
+                fng_extreme_fear=False,
+                vix_close=0.0,
+                wti_rsi=0.0,
+            )
+
+    monkeypatch.setattr(sniper_market_regime, "MARKET_REGIME", FakeMarketRegime())
+    monkeypatch.setattr(
+        sniper_market_regime,
+        "_load_confirmed_risk_context",
+        lambda: {
+            "panic_state": "NORMAL",
+            "confirmed_risk_off_advisory": "False",
+            "risk_off_advisory": "False",
+            "single_market_risk_off_advisory": "False",
+            "confirmed_risk_block": False,
+        },
+    )
+
+    blocked, _, meta = sniper_market_regime.should_block_swing_entry_by_market_regime(
+        "KOSPI_ML"
+    )
+
+    assert blocked is False
+    assert meta["market_regime_prior_observed"] is True
+
+
+def test_truthy_flag_treats_false_strings_as_false():
+    assert sniper_market_regime._truthy_flag("False") is False
+    assert sniper_market_regime._truthy_flag("0") is False
+    assert sniper_market_regime._truthy_flag("true") is True
+
+
+def test_ws_prune_retains_nxt_post_block_sampler_subscription(monkeypatch):
+    published = []
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "WS_MANAGER",
+        SimpleNamespace(subscribed_codes={"123456"}),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "event_bus",
+        SimpleNamespace(
+            publish=lambda name, payload: published.append((name, payload))
+        ),
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2,
+        "should_retain_ws_subscription",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        kiwoom_sniper_v2.sniper_state_handlers,
+        "should_retain_rising_missed_nxt_post_block_subscription",
+        lambda code, now_ts=None: code == "123456",
+    )
+
+    kiwoom_sniper_v2._prune_ws_subscriptions_for_inactive_targets([])
+
+    assert published == []

@@ -1,0 +1,370 @@
+import gzip
+import json
+
+from src.engine import pipeline_event_verbosity_report as report_mod
+from src.engine.pipeline_event_summary import ProducerSummaryCompactor
+
+
+def _event(
+    target_date: str,
+    hhmmss: str,
+    stage: str,
+    *,
+    record_id: int,
+    fields: dict | None = None,
+) -> dict:
+    return {
+        "schema_version": 1,
+        "event_type": "pipeline_event",
+        "pipeline": "ENTRY_PIPELINE",
+        "stage": stage,
+        "stock_name": "테스트종목",
+        "stock_code": "000001",
+        "record_id": record_id,
+        "fields": fields or {},
+        "emitted_at": f"{target_date}T{hhmmss}",
+        "emitted_date": target_date,
+        "text_payload": "-",
+    }
+
+
+def _write_raw(tmp_path, target_date: str, rows: list[dict]) -> None:
+    raw_dir = tmp_path / "pipeline_events"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    with (raw_dir / f"pipeline_events_{target_date}.jsonl").open(
+        "w", encoding="utf-8"
+    ) as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _write_producer_summary(tmp_path, target_date: str, rows: list[dict]) -> None:
+    compactor = ProducerSummaryCompactor(
+        summary_dir=tmp_path / "pipeline_event_summaries",
+        mode="shadow",
+        flush_sec=0,
+    )
+    for row in rows:
+        compactor.submit(row)
+    compactor.flush(target_date=target_date)
+
+
+def _gzip_replace(path) -> None:
+    gz_path = path.with_name(path.name + ".gz")
+    with path.open("rb") as source, gzip.open(gz_path, "wb") as target:
+        target.write(source.read())
+    path.unlink()
+
+
+def test_pipeline_event_verbosity_report_detects_missing_shadow(monkeypatch, tmp_path):
+    monkeypatch.setattr(report_mod, "DATA_DIR", tmp_path)
+    _write_raw(
+        tmp_path,
+        "2026-05-06",
+        [
+            _event(
+                "2026-05-06",
+                "10:00:00",
+                "blocked_strength_momentum",
+                record_id=1,
+                fields={"reason": "below_strength_base"},
+            )
+        ],
+    )
+
+    report = report_mod.build_pipeline_event_verbosity_report("2026-05-06")
+
+    assert report["state"] == "v2_shadow_missing"
+    assert report["recommended_workorder_state"] == "open_shadow_order"
+    assert report["raw_stream"]["high_volume_line_count"] == 1
+    assert report["policy"]["runtime_effect"] is False
+
+
+def test_pipeline_event_verbosity_report_does_not_require_shadow_without_eligible_events(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(report_mod, "DATA_DIR", tmp_path)
+    _write_raw(
+        tmp_path,
+        "2026-05-06",
+        [
+            _event(
+                "2026-05-06",
+                "10:00:00",
+                "unrelated_low_volume_stage",
+                record_id=1,
+            )
+        ],
+    )
+
+    report = report_mod.build_pipeline_event_verbosity_report("2026-05-06")
+
+    assert report["state"] == "v2_shadow_no_eligible_events"
+    assert report["recommended_workorder_state"] == "observe_no_eligible_events"
+    assert report["parity"]["ok"] is True
+    assert report["parity"]["no_eligible_events"] is True
+    assert report["producer_summary"]["exists"] is False
+
+
+def test_pipeline_event_verbosity_report_parity_pass(monkeypatch, tmp_path):
+    monkeypatch.setattr(report_mod, "DATA_DIR", tmp_path)
+    rows = [
+        _event(
+            "2026-05-06",
+            "10:00:00",
+            "blocked_strength_momentum",
+            record_id=1,
+            fields={"reason": "below_strength_base"},
+        ),
+        _event(
+            "2026-05-06",
+            "10:00:01",
+            "blocked_overbought",
+            record_id=2,
+            fields={"reason": "near_day_high"},
+        ),
+        _event(
+            "2026-05-06",
+            "10:00:02",
+            "scalping_scanner_fast_precheck",
+            record_id=3,
+            fields={
+                "fast_precheck_result": "defer",
+                "fast_precheck_reason": "waiting_heavy_eval",
+                "source_quality_gate": "pass",
+            },
+        ),
+    ]
+    _write_raw(tmp_path, "2026-05-06", rows)
+    _write_producer_summary(tmp_path, "2026-05-06", rows)
+
+    report = report_mod.build_pipeline_event_verbosity_report("2026-05-06")
+
+    assert report["state"] == "v2_shadow_parity_pass"
+    assert report["parity"]["ok"] is True
+    assert report["parity"]["stage_diff"] == {}
+    assert report["parity"]["blocker_diff"] == {}
+    assert report["producer_summary"]["manifest_mode"] == "shadow"
+    assert (
+        report["producer_summary"]["stage_counts"]["scalping_scanner_fast_precheck"]
+        == 1
+    )
+
+
+def test_pipeline_event_verbosity_report_parity_pass_with_gzip_sources(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(report_mod, "DATA_DIR", tmp_path)
+    rows = [
+        _event(
+            "2026-05-06",
+            "10:00:00",
+            "blocked_strength_momentum",
+            record_id=1,
+            fields={"reason": "below_strength_base"},
+        )
+    ]
+    _write_raw(tmp_path, "2026-05-06", rows)
+    _write_producer_summary(tmp_path, "2026-05-06", rows)
+    _gzip_replace(tmp_path / "pipeline_events" / "pipeline_events_2026-05-06.jsonl")
+    _gzip_replace(
+        tmp_path
+        / "pipeline_event_summaries"
+        / "pipeline_event_producer_summary_2026-05-06.jsonl"
+    )
+
+    report = report_mod.build_pipeline_event_verbosity_report("2026-05-06")
+
+    assert report["state"] == "v2_shadow_parity_pass"
+    assert report["producer_summary"]["exists"] is True
+    assert report["producer_summary"]["path"].endswith(".jsonl.gz")
+    assert (
+        report["raw_stream"]["raw_storage_size_bytes"]
+        == (tmp_path / "pipeline_events" / "pipeline_events_2026-05-06.jsonl.gz")
+        .stat()
+        .st_size
+    )
+    assert report["raw_stream"]["raw_size_bytes"] > 0
+    assert report["raw_stream"]["high_volume_byte_share_pct"] <= 100.0
+
+
+def test_pipeline_event_verbosity_raw_size_includes_non_json_lines(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(report_mod, "DATA_DIR", tmp_path)
+    raw_dir = tmp_path / "pipeline_events"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = raw_dir / "pipeline_events_2026-05-06.jsonl"
+    event = _event(
+        "2026-05-06",
+        "10:00:00",
+        "blocked_strength_momentum",
+        record_id=1,
+        fields={"reason": "below_strength_base"},
+    )
+    raw_path.write_text(
+        "\n".join(
+            [
+                json.dumps(event, ensure_ascii=False),
+                "",
+                "not-json",
+                "",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    report = report_mod.build_pipeline_event_verbosity_report("2026-05-06")
+
+    assert report["raw_stream"]["raw_size_bytes"] == raw_path.stat().st_size
+    assert report["raw_stream"]["raw_line_count"] == 2
+    assert report["raw_stream"]["high_volume_line_count"] == 1
+
+
+def test_pipeline_event_verbosity_report_parity_fail(monkeypatch, tmp_path):
+    monkeypatch.setattr(report_mod, "DATA_DIR", tmp_path)
+    raw_rows = [
+        _event(
+            "2026-05-06",
+            "10:00:00",
+            "blocked_strength_momentum",
+            record_id=1,
+            fields={"reason": "below_strength_base"},
+        ),
+        _event(
+            "2026-05-06",
+            "10:00:01",
+            "blocked_strength_momentum",
+            record_id=2,
+            fields={"reason": "below_window_buy_value"},
+        ),
+    ]
+    _write_raw(tmp_path, "2026-05-06", raw_rows)
+    _write_producer_summary(tmp_path, "2026-05-06", raw_rows[:1])
+
+    report = report_mod.build_pipeline_event_verbosity_report("2026-05-06")
+
+    assert report["state"] == "v2_shadow_parity_fail"
+    assert report["recommended_workorder_state"] == "block_suppress_and_fix_shadow"
+    assert report["parity"]["ok"] is False
+    assert "blocked_strength_momentum" in report["parity"]["stage_diff"]
+
+
+def test_pipeline_event_verbosity_report_marks_pending_flush_when_raw_tail_is_newer(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(report_mod, "DATA_DIR", tmp_path)
+    raw_rows = [
+        _event(
+            "2026-05-06",
+            "10:00:00",
+            "blocked_strength_momentum",
+            record_id=1,
+            fields={"reason": "below_strength_base"},
+        ),
+        _event(
+            "2026-05-06",
+            "10:05:00",
+            "blocked_strength_momentum",
+            record_id=2,
+            fields={"reason": "below_window_buy_value"},
+        ),
+    ]
+    _write_raw(tmp_path, "2026-05-06", raw_rows)
+    _write_producer_summary(tmp_path, "2026-05-06", raw_rows[:1])
+    manifest_path = (
+        tmp_path
+        / "pipeline_event_summaries"
+        / "pipeline_event_producer_summary_manifest_2026-05-06.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["updated_at"] = "2026-05-06T10:00:30"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = report_mod.build_pipeline_event_verbosity_report("2026-05-06")
+
+    assert report["state"] == "v2_shadow_pending_flush"
+    assert report["recommended_workorder_state"] == "observe_pending_next_flush"
+    assert report["parity"]["producer_pending_flush"] is True
+
+
+def test_pipeline_event_verbosity_compares_only_completed_common_minutes(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(report_mod, "DATA_DIR", tmp_path)
+    shared_row = _event(
+        "2026-05-06",
+        "09:59:30",
+        "blocked_strength_momentum",
+        record_id=1,
+        fields={"reason": "below_strength_base"},
+    )
+    producer_current_minute = _event(
+        "2026-05-06",
+        "10:00:10",
+        "blocked_strength_momentum",
+        record_id=2,
+        fields={"reason": "below_strength_base"},
+    )
+    raw_tail = _event(
+        "2026-05-06",
+        "10:05:00",
+        "blocked_strength_momentum",
+        record_id=3,
+        fields={"reason": "below_window_buy_value"},
+    )
+    _write_raw(tmp_path, "2026-05-06", [shared_row, producer_current_minute, raw_tail])
+    _write_producer_summary(
+        tmp_path, "2026-05-06", [shared_row, producer_current_minute]
+    )
+    manifest_path = (
+        tmp_path
+        / "pipeline_event_summaries"
+        / "pipeline_event_producer_summary_manifest_2026-05-06.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["updated_at"] = "2026-05-06T10:00:20"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = report_mod.build_pipeline_event_verbosity_report("2026-05-06")
+
+    assert report["state"] == "v2_shadow_pending_flush"
+    assert report["parity"]["ok"] is False
+    assert report["parity"]["common_watermark_ok"] is True
+    assert report["parity"]["comparison_watermark"] == "2026-05-06T10:00:00"
+    assert report["parity"]["comparison_raw_derived_event_count"] == 1
+    assert report["parity"]["comparison_producer_event_count"] == 1
+    assert report["parity"]["raw_tail_excluded_event_count"] == 2
+
+
+def test_pipeline_event_verbosity_report_separates_partial_day_coverage(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(report_mod, "DATA_DIR", tmp_path)
+    raw_rows = [
+        _event(
+            "2026-05-06",
+            "09:00:00",
+            "blocked_strength_momentum",
+            record_id=1,
+            fields={"reason": "below_strength_base"},
+        ),
+        _event(
+            "2026-05-06",
+            "10:00:00",
+            "blocked_strength_momentum",
+            record_id=2,
+            fields={"reason": "below_window_buy_value"},
+        ),
+    ]
+    _write_raw(tmp_path, "2026-05-06", raw_rows)
+    _write_producer_summary(tmp_path, "2026-05-06", raw_rows[1:])
+
+    report = report_mod.build_pipeline_event_verbosity_report("2026-05-06")
+
+    assert report["state"] == "v2_shadow_partial_coverage"
+    assert report["recommended_workorder_state"] == "observe_next_full_coverage_day"
+    assert report["parity"]["producer_start_complete"] is False
+    assert report["parity"]["producer_pending_flush"] is False
+    assert report["parity"]["suppress_eligibility"] is False

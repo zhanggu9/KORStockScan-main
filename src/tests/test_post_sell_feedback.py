@@ -1,0 +1,1069 @@
+import json
+import sys
+import types
+from datetime import datetime
+from types import SimpleNamespace
+
+from src.engine import sniper_post_sell_feedback as feedback_mod
+import src.utils as utils_pkg
+
+
+def _make_candle(ts: str, high: int, low: int, close: int) -> dict:
+    return {
+        "체결시간": ts,
+        "고가": high,
+        "저가": low,
+        "현재가": close,
+    }
+
+
+def test_post_sell_minute_forward_source_quality_marks_truncated_ka10080_window_partial():
+    quality = feedback_mod._minute_forward_source_quality(
+        {10: {"bars": 10}},
+        {"truncated_window": True},
+    )
+
+    assert quality["minute_candle_source_quality"] == "partial_window"
+    assert quality["minute_candle_source_quality_gate"] == "source_quality_warning"
+    assert quality["minute_candle_source_quality_reason"] == "ka10080_truncated_window"
+
+
+def test_record_and_evaluate_post_sell_feedback(monkeypatch, tmp_path):
+    monkeypatch.setattr(feedback_mod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(
+        feedback_mod,
+        "TRADING_RULES",
+        SimpleNamespace(
+            POST_SELL_FEEDBACK_ENABLED=True,
+            POST_SELL_FEEDBACK_EVAL_ENABLED=True,
+            POST_SELL_FEEDBACK_MISSED_UPSIDE_MFE_PCT=0.8,
+            POST_SELL_FEEDBACK_MISSED_UPSIDE_CLOSE_PCT=0.3,
+            POST_SELL_FEEDBACK_GOOD_EXIT_MAE_PCT=-0.6,
+            POST_SELL_FEEDBACK_GOOD_EXIT_CLOSE_PCT=-0.2,
+        ),
+    )
+    feedback_mod._RECORDED_KEYS.clear()
+
+    candidate_upside = feedback_mod.record_post_sell_candidate(
+        recommendation_id=1,
+        stock={
+            "name": "상승후보",
+            "strategy": "SCALPING",
+            "position_tag": "SCALP_BASE",
+        },
+        code="111111",
+        sell_time="2026-04-08 10:00:30",
+        buy_price=9900,
+        sell_price=10000,
+        profit_rate=1.0,
+        buy_qty=10,
+        exit_rule="scalp_soft_stop_pct",
+        revive=False,
+    )
+    candidate_good_exit = feedback_mod.record_post_sell_candidate(
+        recommendation_id=2,
+        stock={
+            "name": "하락후보",
+            "strategy": "SCALPING",
+            "position_tag": "SCALP_BASE",
+        },
+        code="222222",
+        sell_time="2026-04-08 10:00:30",
+        buy_price=10200,
+        sell_price=10000,
+        profit_rate=-2.0,
+        buy_qty=10,
+        exit_rule="scalp_ai_early_exit",
+        revive=False,
+    )
+    assert candidate_upside is not None
+    assert candidate_good_exit is not None
+    assert candidate_upside["exit_decision_source"] == "-"
+    assert candidate_upside["realized_result_label"] == "익절"
+
+    candle_map = {
+        "111111": [
+            _make_candle("10:01:00", 10120, 10010, 10080),
+            _make_candle("10:02:00", 10220, 10050, 10160),
+            _make_candle("10:03:00", 10250, 10120, 10180),
+            _make_candle("10:04:00", 10230, 10130, 10150),
+            _make_candle("10:05:00", 10190, 10100, 10120),
+            _make_candle("10:06:00", 10180, 10090, 10110),
+            _make_candle("10:07:00", 10190, 10100, 10140),
+            _make_candle("10:08:00", 10200, 10120, 10160),
+            _make_candle("10:09:00", 10210, 10140, 10170),
+            _make_candle("10:10:00", 10220, 10150, 10180),
+        ],
+        "222222": [
+            _make_candle("10:01:00", 10020, 9920, 9940),
+            _make_candle("10:02:00", 10010, 9880, 9900),
+            _make_candle("10:03:00", 9990, 9850, 9880),
+            _make_candle("10:04:00", 9970, 9840, 9860),
+            _make_candle("10:05:00", 9960, 9830, 9850),
+            _make_candle("10:06:00", 9950, 9820, 9840),
+            _make_candle("10:07:00", 9940, 9810, 9830),
+            _make_candle("10:08:00", 9930, 9800, 9820),
+            _make_candle("10:09:00", 9920, 9800, 9810),
+            _make_candle("10:10:00", 9920, 9790, 9800),
+        ],
+    }
+
+    fake_kiwoom = types.SimpleNamespace(
+        get_kiwoom_token=lambda: "dummy",
+        get_minute_candles_ka10080=lambda _token, code, limit=700: candle_map.get(
+            code, []
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "src.utils.kiwoom_utils", fake_kiwoom)
+    monkeypatch.setattr(utils_pkg, "kiwoom_utils", fake_kiwoom, raising=False)
+
+    summary = feedback_mod.evaluate_post_sell_candidates("2026-04-08", token="dummy")
+    assert summary.total_candidates == 2
+    assert summary.evaluated_candidates == 2
+    assert summary.outcome_counts.get("MISSED_UPSIDE", 0) == 1
+    assert summary.outcome_counts.get("GOOD_EXIT", 0) == 1
+    assert summary.minute_candle_source_quality_counts == {"pass": 2}
+    evaluations = feedback_mod._load_jsonl(feedback_mod._evaluation_path("2026-04-08"))
+    assert "metrics_30m" in evaluations[0]
+    assert "metrics_60m" in evaluations[0]
+    assert evaluations[0]["minute_candle_source_quality"] == "pass"
+    assert evaluations[0]["minute_candle_source_quality_gate"] == "pass"
+    assert evaluations[0]["minute_candle_forward_10m_bars"] == 10
+    assert evaluations[0]["minute_candle_source_meta"]["api_id"] == "ka10080"
+
+    text = feedback_mod.format_post_sell_feedback_summary(summary)
+    assert "MISSED_UPSIDE 1" in text
+    assert "GOOD_EXIT 1" in text
+
+
+def test_profitable_hard_stop_keeps_exit_rule_but_labels_realized_profit(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(feedback_mod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(
+        feedback_mod,
+        "TRADING_RULES",
+        SimpleNamespace(
+            POST_SELL_FEEDBACK_ENABLED=True,
+            POST_SELL_FEEDBACK_EVAL_ENABLED=True,
+            POST_SELL_FEEDBACK_MISSED_UPSIDE_MFE_PCT=0.8,
+            POST_SELL_FEEDBACK_MISSED_UPSIDE_CLOSE_PCT=0.3,
+            POST_SELL_FEEDBACK_GOOD_EXIT_MAE_PCT=-0.6,
+            POST_SELL_FEEDBACK_GOOD_EXIT_CLOSE_PCT=-0.2,
+        ),
+    )
+    feedback_mod._RECORDED_KEYS.clear()
+
+    candidate = feedback_mod.record_post_sell_candidate(
+        recommendation_id=30,
+        stock={
+            "name": "데브시스터즈",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "last_exit_ai_score_raw": 82,
+            "last_exit_ai_score_effective": 78,
+            "last_exit_ai_action": "HOLD",
+            "last_exit_ai_result_source": "live",
+            "last_exit_ai_model": "tier1-model",
+            "last_exit_ai_model_tier": "tier1",
+            "last_exit_ai_transport_mode": "responses_ws",
+            "last_exit_ai_data_quality": "partial",
+        },
+        code="194480",
+        sell_time="2026-06-30 08:07:29",
+        buy_price=18340,
+        sell_price=18630,
+        profit_rate=1.35,
+        buy_qty=1,
+        exit_rule="scalp_hard_stop_pct",
+        revive=True,
+    )
+
+    assert candidate is not None
+    assert candidate["exit_rule"] == "scalp_hard_stop_pct"
+    assert candidate["profit_rate"] == 1.35
+    assert candidate["realized_result_label"] == "익절"
+    assert candidate["exit_rule_profit_mismatch"] is True
+    assert candidate["ai_score_raw"] == 82.0
+    assert candidate["ai_score_effective"] == 78.0
+    assert candidate["ai_result_source"] == "live"
+    assert candidate["ai_data_quality"] == "partial"
+
+
+def test_real_post_sell_candidate_handles_none_ai_provenance(monkeypatch, tmp_path):
+    monkeypatch.setattr(feedback_mod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(
+        feedback_mod,
+        "TRADING_RULES",
+        SimpleNamespace(
+            POST_SELL_FEEDBACK_ENABLED=True,
+            POST_SELL_FEEDBACK_EVAL_ENABLED=True,
+            POST_SELL_FEEDBACK_MISSED_UPSIDE_MFE_PCT=0.8,
+            POST_SELL_FEEDBACK_MISSED_UPSIDE_CLOSE_PCT=0.3,
+            POST_SELL_FEEDBACK_GOOD_EXIT_MAE_PCT=-0.6,
+            POST_SELL_FEEDBACK_GOOD_EXIT_CLOSE_PCT=-0.2,
+        ),
+    )
+    feedback_mod._RECORDED_KEYS.clear()
+
+    candidate = feedback_mod.record_post_sell_candidate(
+        recommendation_id=31,
+        stock={
+            "name": "파인엠텍",
+            "strategy": "SCALPING",
+            "position_tag": "SCANNER",
+            "last_exit_current_ai_score": None,
+            "last_exit_ai_score_raw": None,
+            "last_exit_ai_score_effective": None,
+            "last_exit_ai_result_source": None,
+            "last_exit_ai_data_quality": None,
+        },
+        code="441270",
+        sell_time="2026-07-03 18:58:20",
+        buy_price=7310,
+        sell_price=7330,
+        profit_rate=0.27,
+        buy_qty=1,
+        exit_rule="LOW_PROFIT_STAGNATION",
+        revive=False,
+    )
+
+    assert candidate is not None
+    assert candidate["current_ai_score"] == 0.0
+    assert candidate["ai_score_raw"] == 0.0
+    assert candidate["ai_score_effective"] == 0.0
+    assert candidate["ai_result_source"] == "-"
+    assert candidate["ai_data_quality"] == "-"
+    assert candidate["ai_score_raw_at_exit"] == 0.0
+
+
+def test_record_and_evaluate_sim_post_sell_feedback_isolated(monkeypatch, tmp_path):
+    monkeypatch.setattr(feedback_mod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(
+        feedback_mod,
+        "TRADING_RULES",
+        SimpleNamespace(
+            POST_SELL_FEEDBACK_ENABLED=True,
+            POST_SELL_FEEDBACK_EVAL_ENABLED=True,
+            POST_SELL_FEEDBACK_MISSED_UPSIDE_MFE_PCT=0.8,
+            POST_SELL_FEEDBACK_MISSED_UPSIDE_CLOSE_PCT=0.3,
+            POST_SELL_FEEDBACK_GOOD_EXIT_MAE_PCT=-0.6,
+            POST_SELL_FEEDBACK_GOOD_EXIT_CLOSE_PCT=-0.2,
+        ),
+    )
+    feedback_mod._SIM_RECORDED_KEYS.clear()
+
+    candidate = feedback_mod.record_sim_post_sell_candidate(
+        sim_record_id="SIM-005950-1",
+        sim_parent_record_id="PARENT-1",
+        stock={"name": "이수화학", "strategy": "SCALPING", "position_tag": "SCALP_SIM"},
+        code="005950",
+        sell_time="2026-05-18 10:00:30",
+        buy_price=10000,
+        sell_price=9746,
+        profit_rate=-2.54,
+        buy_qty=1,
+        exit_rule="scalp_hard_stop_pct",
+        sell_reason_type="STOP_LOSS",
+        current_ai_score=76,
+        ai_score_raw=78,
+        ai_action="HOLD",
+        ai_result_source="bedrock",
+        ai_model="bedrock-nova-lite-v2",
+        ai_model_tier="tier2",
+        ai_transport_mode="bedrock",
+        ai_data_quality="fresh",
+    )
+
+    assert candidate is not None
+    assert candidate["runtime_effect"] is False
+    assert candidate["actual_order_submitted"] is False
+    assert candidate["broker_order_forbidden"] is True
+    assert candidate["decision_authority"] == "sim_equal_weight_observation_only"
+    assert "broker order submit" in candidate["forbidden_uses"]
+    assert candidate["entry_time_source"] == "not_recorded_at_source"
+    assert candidate["entry_join_status"] == "raw_append_only_unjoined"
+    assert candidate["entry_record_id"] == "PARENT-1"
+    assert candidate["high_ai_hard_stop_conflict"] is True
+    assert candidate["hard_stop_conflict_dimension"] == "high_ai_hard_stop_conflict"
+    assert candidate["hard_stop_conflict_allowed_runtime_apply"] is False
+    assert candidate["hard_stop_conflict_hard_gate"] is False
+    assert candidate["ai_model_at_exit"] == "bedrock-nova-lite-v2"
+    assert candidate["ai_data_quality"] == "fresh"
+    assert (
+        candidate["hard_stop_conflict_contract"]["metric_role"]
+        == "exit_post_sell_dimension"
+    )
+    assert (
+        "hard stop relaxation"
+        in candidate["hard_stop_conflict_contract"]["forbidden_uses"]
+    )
+    assert feedback_mod._candidate_path("2026-05-18").exists() is False
+    assert feedback_mod._sim_candidate_path("2026-05-18").exists() is True
+
+    candle_map = {
+        "005950": [
+            _make_candle("10:01:00", 9800, 9700, 9780),
+            _make_candle("10:02:00", 9900, 9720, 9850),
+            _make_candle("10:03:00", 10050, 9810, 10000),
+            _make_candle("10:04:00", 10120, 9900, 10080),
+            _make_candle("10:05:00", 10150, 9950, 10100),
+            _make_candle("10:06:00", 10180, 10000, 10140),
+            _make_candle("10:07:00", 10160, 10020, 10130),
+            _make_candle("10:08:00", 10140, 10010, 10120),
+            _make_candle("10:09:00", 10130, 10000, 10110),
+            _make_candle("10:10:00", 10120, 9990, 10100),
+        ],
+    }
+    fake_kiwoom = types.SimpleNamespace(
+        get_kiwoom_token=lambda: "dummy",
+        get_minute_candles_ka10080=lambda _token, code, limit=700: candle_map.get(
+            code, []
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "src.utils.kiwoom_utils", fake_kiwoom)
+    monkeypatch.setattr(utils_pkg, "kiwoom_utils", fake_kiwoom, raising=False)
+
+    summary = feedback_mod.evaluate_sim_post_sell_candidates(
+        "2026-05-18", token="dummy"
+    )
+    assert summary.total_candidates == 1
+    assert summary.evaluated_candidates == 1
+    assert summary.outcome_counts.get("MISSED_UPSIDE") == 1
+    evaluations = feedback_mod._load_jsonl(
+        feedback_mod._sim_evaluation_path("2026-05-18")
+    )
+    assert evaluations[0]["sim_record_id"] == "SIM-005950-1"
+    assert evaluations[0]["runtime_effect"] is False
+    assert evaluations[0]["high_ai_hard_stop_conflict"] is True
+    assert (
+        evaluations[0]["hard_stop_conflict_dimension"] == "high_ai_hard_stop_conflict"
+    )
+    assert evaluations[0]["ai_score_at_exit"] == 76
+    assert evaluations[0]["metrics_10m"]["mfe_pct"] > 4.0
+
+
+def test_backfill_sim_post_sell_candidates_is_idempotent(monkeypatch, tmp_path):
+    monkeypatch.setattr(feedback_mod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(
+        feedback_mod,
+        "TRADING_RULES",
+        SimpleNamespace(
+            POST_SELL_FEEDBACK_ENABLED=True,
+            POST_SELL_FEEDBACK_EVAL_ENABLED=True,
+        ),
+    )
+    feedback_mod._SIM_RECORDED_KEYS.clear()
+    threshold_dir = tmp_path / "threshold_cycle"
+    threshold_dir.mkdir(parents=True)
+    (threshold_dir / "threshold_events_2026-05-18.jsonl").write_text(
+        json.dumps(
+            {
+                "stage": "scalp_sim_sell_order_assumed_filled",
+                "stock_name": "이수화학",
+                "stock_code": "005950",
+                "emitted_at": "2026-05-18T09:16:46",
+                "fields": {
+                    "sim_record_id": "SCALPSIM-1",
+                    "sim_parent_record_id": "6924",
+                    "profit_rate": "-2.54",
+                    "buy_price": "10780",
+                    "assumed_fill_price": "10530",
+                    "qty": "264",
+                    "exit_rule": "scalp_hard_stop_pct",
+                    "sell_reason_type": "LOSS",
+                    "current_ai_score": "74",
+                    "ai_score_raw": "77",
+                    "ai_action": "HOLD",
+                    "ai_result_source": "bedrock",
+                    "ai_model": "bedrock-nova-lite-v2",
+                    "ai_model_tier": "tier2",
+                    "ai_transport_mode": "bedrock",
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    pipeline_dir = tmp_path / "pipeline_events"
+    pipeline_dir.mkdir(parents=True)
+    duplicate_event = json.loads(
+        (threshold_dir / "threshold_events_2026-05-18.jsonl").read_text(
+            encoding="utf-8"
+        )
+    )
+    overnight_event = {
+        "stage": "scalp_sim_sell_order_assumed_filled",
+        "stock_name": "솔브레인홀딩스",
+        "stock_code": "036830",
+        "emitted_at": "2026-05-18T15:10:09",
+        "fields": {
+            "sim_record_id": "SCALPSIM-OVERNIGHT-1",
+            "sim_parent_record_id": "7001",
+            "profit_rate": "-1.68",
+            "buy_price": "44750",
+            "assumed_fill_price": "44100",
+            "qty": "2",
+            "exit_rule": "scalp_sim_overnight_sell_today",
+            "sell_reason_type": "OVERNIGHT",
+        },
+    }
+    (pipeline_dir / "pipeline_events_2026-05-18.jsonl").write_text(
+        "\n".join(
+            json.dumps(row, ensure_ascii=False)
+            for row in (duplicate_event, overnight_event)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    first = feedback_mod.backfill_sim_post_sell_candidates_from_threshold_events(
+        "2026-05-18"
+    )
+    second = feedback_mod.backfill_sim_post_sell_candidates_from_threshold_events(
+        "2026-05-18"
+    )
+
+    assert first["events_seen"] == 2
+    assert first["duplicate_source_events"] == 1
+    assert first["candidates_created"] == 2
+    assert second["events_seen"] == 2
+    assert second["candidates_created"] == 0
+    candidates = feedback_mod._load_jsonl(
+        feedback_mod._sim_candidate_path("2026-05-18")
+    )
+    assert len(candidates) == 2
+    assert candidates[0]["high_ai_hard_stop_conflict"] is True
+    assert candidates[0]["ai_score_at_exit"] == 74
+    assert candidates[0]["ai_model_at_exit"] == "bedrock-nova-lite-v2"
+
+
+def test_sim_post_sell_high_ai_conflict_falls_back_to_runtime_ai_prob(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(feedback_mod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(
+        feedback_mod,
+        "TRADING_RULES",
+        SimpleNamespace(
+            POST_SELL_FEEDBACK_ENABLED=True,
+            POST_SELL_FEEDBACK_EVAL_ENABLED=True,
+        ),
+    )
+    feedback_mod._SIM_RECORDED_KEYS.clear()
+
+    candidate = feedback_mod.record_sim_post_sell_candidate(
+        sim_record_id="SIM-RT-PROB",
+        stock={"name": "런타임확률", "rt_ai_prob": 0.76},
+        code="005930",
+        sell_time="2026-05-18 10:03:00",
+        buy_price=10000,
+        sell_price=9740,
+        profit_rate=-2.6,
+        buy_qty=1,
+        exit_rule="scalp_hard_stop_pct",
+        sell_reason_type="STOP_LOSS",
+    )
+
+    assert candidate is not None
+    assert candidate["current_ai_score"] == 76.0
+    assert candidate["high_ai_hard_stop_conflict"] is True
+    assert candidate["hard_stop_conflict_dimension"] == "high_ai_hard_stop_conflict"
+    assert candidate["ai_result_source_at_exit"] == "-"
+
+
+def test_soft_stop_forensics_report(monkeypatch, tmp_path):
+    monkeypatch.setattr(feedback_mod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(
+        feedback_mod,
+        "TRADING_RULES",
+        SimpleNamespace(
+            POST_SELL_FEEDBACK_ENABLED=True,
+            POST_SELL_FEEDBACK_EVAL_ENABLED=True,
+            POST_SELL_FEEDBACK_MISSED_UPSIDE_MFE_PCT=0.8,
+            POST_SELL_FEEDBACK_MISSED_UPSIDE_CLOSE_PCT=0.3,
+            POST_SELL_FEEDBACK_GOOD_EXIT_MAE_PCT=-0.6,
+            POST_SELL_FEEDBACK_GOOD_EXIT_CLOSE_PCT=-0.2,
+            POST_SELL_WS_RETAIN_MINUTES=0,
+        ),
+    )
+    feedback_mod._RECORDED_KEYS.clear()
+    feedback_mod._WS_RETAIN_UNTIL.clear()
+
+    feedback_mod.record_post_sell_candidate(
+        recommendation_id=201,
+        stock={"name": "반등A", "strategy": "SCALPING", "position_tag": "SCANNER"},
+        code="661111",
+        sell_time="2026-04-08 12:00:10",
+        buy_price=10100,
+        sell_price=9900,
+        profit_rate=-1.6,
+        buy_qty=10,
+        exit_rule="scalp_soft_stop_pct",
+        peak_profit=0.1,
+        held_sec=220,
+        current_ai_score=43,
+        soft_stop_threshold_pct=-1.5,
+        same_symbol_soft_stop_cooldown_would_block=True,
+    )
+    feedback_mod.record_post_sell_candidate(
+        recommendation_id=202,
+        stock={
+            "name": "지속약세B",
+            "strategy": "SCALPING",
+            "position_tag": "OPEN_RECLAIM",
+        },
+        code="662222",
+        sell_time="2026-04-08 12:00:10",
+        buy_price=10000,
+        sell_price=9850,
+        profit_rate=-2.2,
+        buy_qty=10,
+        exit_rule="scalp_soft_stop_pct",
+        peak_profit=-0.2,
+        held_sec=80,
+        current_ai_score=38,
+        soft_stop_threshold_pct=-1.5,
+        same_symbol_soft_stop_cooldown_would_block=True,
+    )
+
+    candle_map = {
+        "661111": [
+            _make_candle("12:01:00", 10020, 9880, 9990),
+            _make_candle("12:02:00", 10130, 9950, 10080),
+            _make_candle("12:03:00", 10180, 10040, 10120),
+            _make_candle("12:04:00", 10160, 10010, 10110),
+            _make_candle("12:05:00", 10150, 10020, 10100),
+            _make_candle("12:06:00", 10140, 10030, 10090),
+            _make_candle("12:07:00", 10150, 10040, 10110),
+            _make_candle("12:08:00", 10160, 10050, 10120),
+            _make_candle("12:09:00", 10170, 10060, 10130),
+            _make_candle("12:10:00", 10180, 10070, 10140),
+        ],
+        "662222": [
+            _make_candle("12:01:00", 9840, 9780, 9810),
+            _make_candle("12:02:00", 9850, 9750, 9790),
+            _make_candle("12:03:00", 9840, 9720, 9780),
+            _make_candle("12:04:00", 9830, 9700, 9770),
+            _make_candle("12:05:00", 9820, 9690, 9760),
+            _make_candle("12:06:00", 9810, 9680, 9750),
+            _make_candle("12:07:00", 9800, 9670, 9740),
+            _make_candle("12:08:00", 9790, 9660, 9730),
+            _make_candle("12:09:00", 9780, 9650, 9720),
+            _make_candle("12:10:00", 9770, 9640, 9710),
+        ],
+    }
+    fake_kiwoom = types.SimpleNamespace(
+        get_kiwoom_token=lambda: "dummy",
+        get_minute_candles_ka10080=lambda _token, code, limit=700: candle_map.get(
+            code, []
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "src.utils.kiwoom_utils", fake_kiwoom)
+    monkeypatch.setattr(utils_pkg, "kiwoom_utils", fake_kiwoom, raising=False)
+
+    feedback_mod.evaluate_post_sell_candidates("2026-04-08", token="dummy")
+    report = feedback_mod.build_post_sell_feedback_report(
+        "2026-04-08", top_n=5, evaluate_now=False
+    )
+
+    forensic = report["soft_stop_forensics"]
+    assert forensic["total_soft_stop"] == 2
+    assert forensic["rebound_above_sell_rate"]["1m"] == 50.0
+    assert forensic["rebound_above_buy_rate"]["3m"] == 50.0
+    assert forensic["rebound_above_sell_rate"]["30m"] == 50.0
+    assert forensic["rebound_above_buy_rate"]["60m"] == 50.0
+    assert forensic["median_overshoot_pct"] == 0.4
+    assert forensic["p95_overshoot_pct"] >= 0.66
+    assert forensic["cooldown_would_block_rate"] == 100.0
+    assert forensic["tag_buckets"]
+    assert forensic["held_sec_buckets"]
+    assert forensic["peak_profit_buckets"]
+    assert forensic["top_rebound_cases"][0]["stock_code"] == "661111"
+
+
+def test_post_sell_candidate_dedup(monkeypatch, tmp_path):
+    monkeypatch.setattr(feedback_mod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(
+        feedback_mod,
+        "TRADING_RULES",
+        SimpleNamespace(
+            POST_SELL_FEEDBACK_ENABLED=True,
+            POST_SELL_FEEDBACK_EVAL_ENABLED=True,
+            POST_SELL_FEEDBACK_MISSED_UPSIDE_MFE_PCT=0.8,
+            POST_SELL_FEEDBACK_MISSED_UPSIDE_CLOSE_PCT=0.3,
+            POST_SELL_FEEDBACK_GOOD_EXIT_MAE_PCT=-0.6,
+            POST_SELL_FEEDBACK_GOOD_EXIT_CLOSE_PCT=-0.2,
+        ),
+    )
+    feedback_mod._RECORDED_KEYS.clear()
+
+    first = feedback_mod.record_post_sell_candidate(
+        recommendation_id=55,
+        stock={"name": "중복테스트"},
+        code="333333",
+        sell_time="2026-04-08 11:20:10",
+        sell_price=10000,
+        buy_price=10100,
+        profit_rate=-1.0,
+        buy_qty=1,
+    )
+    second = feedback_mod.record_post_sell_candidate(
+        recommendation_id=55,
+        stock={"name": "중복테스트"},
+        code="333333",
+        sell_time="2026-04-08 11:20:40",
+        sell_price=10000,
+        buy_price=10100,
+        profit_rate=-1.0,
+        buy_qty=1,
+    )
+    assert first is not None
+    assert second is None
+
+
+def test_evaluate_backfills_legacy_horizon_metrics(monkeypatch, tmp_path):
+    monkeypatch.setattr(feedback_mod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(
+        feedback_mod,
+        "TRADING_RULES",
+        SimpleNamespace(
+            POST_SELL_FEEDBACK_ENABLED=True,
+            POST_SELL_FEEDBACK_EVAL_ENABLED=True,
+            POST_SELL_FEEDBACK_MISSED_UPSIDE_MFE_PCT=0.8,
+            POST_SELL_FEEDBACK_MISSED_UPSIDE_CLOSE_PCT=0.3,
+            POST_SELL_FEEDBACK_GOOD_EXIT_MAE_PCT=-0.6,
+            POST_SELL_FEEDBACK_GOOD_EXIT_CLOSE_PCT=-0.2,
+        ),
+    )
+    feedback_mod._RECORDED_KEYS.clear()
+
+    candidate = feedback_mod.record_post_sell_candidate(
+        recommendation_id=71,
+        stock={"name": "레거시평가"},
+        code="771111",
+        sell_time="2026-04-08 10:00:30",
+        buy_price=10000,
+        sell_price=9900,
+        profit_rate=-1.0,
+        buy_qty=1,
+        exit_rule="scalp_soft_stop_pct",
+    )
+    assert candidate is not None
+    feedback_mod._append_jsonl(
+        feedback_mod._evaluation_path("2026-04-08"),
+        {
+            "post_sell_id": candidate["post_sell_id"],
+            "signal_date": "2026-04-08",
+            "stock_code": "771111",
+            "stock_name": "레거시평가",
+            "sell_time": "10:00:30",
+            "sell_price": 9900,
+            "buy_price": 10000,
+            "profit_rate": -1.0,
+            "outcome": "NEUTRAL",
+            "metrics_10m": {"mfe_pct": 0.0, "mae_pct": 0.0, "close_ret_pct": 0.0},
+        },
+    )
+
+    fake_kiwoom = types.SimpleNamespace(
+        get_kiwoom_token=lambda: "dummy",
+        get_minute_candles_ka10080=lambda _token, _code, limit=700: [
+            _make_candle("10:01:00", 10000, 9880, 9950),
+            _make_candle("10:30:00", 10100, 9900, 10050),
+            _make_candle("11:00:00", 10200, 9890, 10100),
+        ],
+    )
+    monkeypatch.setitem(sys.modules, "src.utils.kiwoom_utils", fake_kiwoom)
+    monkeypatch.setattr(utils_pkg, "kiwoom_utils", fake_kiwoom, raising=False)
+
+    summary = feedback_mod.evaluate_post_sell_candidates("2026-04-08", token="dummy")
+    assert summary.evaluated_candidates == 1
+    latest = feedback_mod._dedupe_latest_evaluations(
+        feedback_mod._load_jsonl(feedback_mod._evaluation_path("2026-04-08"))
+    )[0]
+    assert "metrics_30m" in latest
+    assert "metrics_60m" in latest
+
+
+def test_post_sell_ws_retain_window(monkeypatch, tmp_path):
+    monkeypatch.setattr(feedback_mod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(
+        feedback_mod,
+        "TRADING_RULES",
+        SimpleNamespace(
+            POST_SELL_FEEDBACK_ENABLED=True,
+            POST_SELL_FEEDBACK_EVAL_ENABLED=True,
+            POST_SELL_FEEDBACK_MISSED_UPSIDE_MFE_PCT=0.8,
+            POST_SELL_FEEDBACK_MISSED_UPSIDE_CLOSE_PCT=0.3,
+            POST_SELL_FEEDBACK_GOOD_EXIT_MAE_PCT=-0.6,
+            POST_SELL_FEEDBACK_GOOD_EXIT_CLOSE_PCT=-0.2,
+            POST_SELL_WS_RETAIN_MINUTES=3,
+        ),
+    )
+    feedback_mod._RECORDED_KEYS.clear()
+    feedback_mod._WS_RETAIN_UNTIL.clear()
+
+    feedback_mod.record_post_sell_candidate(
+        recommendation_id=91,
+        stock={"name": "유지테스트"},
+        code="444444",
+        sell_time="2026-04-08 11:00:00",
+        sell_price=10000,
+        buy_price=10000,
+    )
+
+    base_ts = 1_775_636_400.0  # 2026-04-08 11:00:00 KST 근사
+    retain_until = base_ts + 180.0
+    feedback_mod._WS_RETAIN_UNTIL["444444"] = retain_until
+
+    assert (
+        feedback_mod.should_retain_ws_subscription("444444", now_ts=base_ts + 60.0)
+        is True
+    )
+    assert (
+        feedback_mod.should_retain_ws_subscription("444444", now_ts=base_ts + 181.0)
+        is False
+    )
+
+
+def test_real_post_sell_registers_bounded_exact_route_bbo_observer(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(feedback_mod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(
+        feedback_mod,
+        "TRADING_RULES",
+        SimpleNamespace(
+            POST_SELL_FEEDBACK_ENABLED=True,
+            POST_SELL_WS_RETAIN_MINUTES=10,
+        ),
+    )
+    feedback_mod._RECORDED_KEYS.clear()
+    feedback_mod._WS_RETAIN_UNTIL.clear()
+    feedback_mod._POST_SELL_EXECUTABLE_BBO_OBSERVERS.clear()
+    sell_dt = datetime.now().replace(microsecond=0)
+
+    candidate = feedback_mod.record_post_sell_candidate(
+        recommendation_id=92,
+        stock={
+            "name": "경로유지테스트",
+            "last_sell_execution_broker_route": "SOR",
+            "last_sell_execution_cohort": "KRX",
+            "last_sell_execution_session_bucket": "krx_regular",
+        },
+        code="444445",
+        sell_time=sell_dt,
+        sell_price=10_000,
+        buy_price=9_900,
+    )
+
+    assert candidate is not None
+    assert candidate["post_sell_executable_bbo_observer_registered"] is True
+    assert candidate["post_sell_executable_bbo_observer_status"] == "registered"
+    assert (
+        candidate["post_sell_executable_bbo_expected_market_route"]
+        == "krx_nxt_integrated"
+    )
+    assert candidate["post_sell_executable_bbo_venue"] == "KRX"
+    assert candidate["post_sell_executable_bbo_session"] == "krx_regular"
+    assert candidate["post_sell_executable_bbo_horizons_sec"] == [60, 180, 300, 600]
+    assert feedback_mod.should_retain_ws_subscription(
+        "444445", now_ts=sell_dt.timestamp() + 610.0
+    )
+    assert not feedback_mod.should_retain_ws_subscription(
+        "444445", now_ts=sell_dt.timestamp() + 616.0
+    )
+
+
+def test_real_post_sell_observer_fails_closed_without_execution_route(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(feedback_mod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(
+        feedback_mod,
+        "TRADING_RULES",
+        SimpleNamespace(
+            POST_SELL_FEEDBACK_ENABLED=True,
+            POST_SELL_WS_RETAIN_MINUTES=10,
+        ),
+    )
+    feedback_mod._RECORDED_KEYS.clear()
+    feedback_mod._WS_RETAIN_UNTIL.clear()
+    feedback_mod._POST_SELL_EXECUTABLE_BBO_OBSERVERS.clear()
+
+    candidate = feedback_mod.record_post_sell_candidate(
+        recommendation_id=93,
+        stock={"name": "경로결손테스트"},
+        code="444446",
+        sell_time=datetime.now().replace(microsecond=0),
+        sell_price=10_000,
+        buy_price=9_900,
+    )
+
+    assert candidate is not None
+    assert candidate["post_sell_executable_bbo_observer_registered"] is False
+    assert (
+        candidate["post_sell_executable_bbo_observer_status"]
+        == "route_source_quality_blocked"
+    )
+    assert candidate["post_sell_executable_bbo_route_reason"] == (
+        "broker_and_ws_route_missing"
+    )
+    assert "444446" not in feedback_mod._WS_RETAIN_UNTIL
+    assert feedback_mod._POST_SELL_EXECUTABLE_BBO_OBSERVERS == {}
+
+
+def test_post_sell_route_contract_preserves_nxt_close_only_session(monkeypatch):
+    monkeypatch.setattr(
+        feedback_mod,
+        "TRADING_RULES",
+        SimpleNamespace(SCALPING_NEW_BUY_CUTOFF="19:45:00"),
+    )
+    sell_dt = datetime.fromisoformat("2026-08-21T19:50:00+09:00")
+
+    route = feedback_mod._post_sell_execution_route_contract(
+        {
+            "last_sell_execution_broker_route": "NXT",
+            "last_sell_execution_cohort": "NXT",
+            "last_sell_execution_session_bucket": "nxt_close_only",
+        },
+        sell_dt=sell_dt,
+    )
+    fallback_route = feedback_mod._post_sell_execution_route_contract(
+        {
+            "last_sell_execution_broker_route": "NXT",
+            "last_sell_execution_cohort": "NXT",
+        },
+        sell_dt=sell_dt,
+    )
+
+    assert route["status"] == "route_contract_ready"
+    assert route["expected_market_route"] == "nxt_only"
+    assert route["session"] == "nxt_close_only"
+    assert fallback_route["status"] == "route_contract_ready"
+    assert fallback_route["session"] == "nxt_close_only"
+
+
+def test_post_sell_route_contract_blocks_venue_session_mismatch():
+    sell_dt = datetime.fromisoformat("2026-08-21T10:00:00+09:00")
+
+    route = feedback_mod._post_sell_execution_route_contract(
+        {
+            "last_sell_execution_broker_route": "SOR",
+            "last_sell_execution_cohort": "KRX",
+            "last_sell_execution_session_bucket": "nxt_entry_window",
+        },
+        sell_dt=sell_dt,
+    )
+
+    assert route["status"] == "route_source_quality_blocked"
+    assert route["reason"] == "venue_session_route_contract_mismatch"
+    assert route["venue"] == "KRX"
+    assert route["session"] == "nxt_entry_window"
+
+
+def test_source_only_observer_can_request_bounded_ws_retention(monkeypatch):
+    base_ts = 1_775_636_400.0
+    feedback_mod._WS_RETAIN_UNTIL.clear()
+    monkeypatch.setattr(feedback_mod.time, "time", lambda: base_ts)
+
+    assert feedback_mod.retain_ws_subscription_until("444444", base_ts + 92.0) is True
+    assert feedback_mod.should_retain_ws_subscription("444444", now_ts=base_ts + 91.0)
+    assert not feedback_mod.should_retain_ws_subscription(
+        "444444", now_ts=base_ts + 93.0
+    )
+
+
+def test_build_post_sell_feedback_report(monkeypatch, tmp_path):
+    monkeypatch.setattr(feedback_mod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(
+        feedback_mod,
+        "TRADING_RULES",
+        SimpleNamespace(
+            POST_SELL_FEEDBACK_ENABLED=True,
+            POST_SELL_FEEDBACK_EVAL_ENABLED=True,
+            POST_SELL_FEEDBACK_MISSED_UPSIDE_MFE_PCT=0.8,
+            POST_SELL_FEEDBACK_MISSED_UPSIDE_CLOSE_PCT=0.3,
+            POST_SELL_FEEDBACK_GOOD_EXIT_MAE_PCT=-0.6,
+            POST_SELL_FEEDBACK_GOOD_EXIT_CLOSE_PCT=-0.2,
+            POST_SELL_WS_RETAIN_MINUTES=0,
+        ),
+    )
+    feedback_mod._RECORDED_KEYS.clear()
+    feedback_mod._WS_RETAIN_UNTIL.clear()
+
+    feedback_mod.record_post_sell_candidate(
+        recommendation_id=101,
+        stock={"name": "상승A", "strategy": "SCALPING", "position_tag": "OPEN_RECLAIM"},
+        code="551111",
+        sell_time="2026-04-08 10:00:10",
+        buy_price=9800,
+        sell_price=10000,
+        profit_rate=2.0,
+        buy_qty=10,
+        exit_rule="scalp_soft_stop_pct",
+    )
+    feedback_mod.record_post_sell_candidate(
+        recommendation_id=102,
+        stock={"name": "하락B", "strategy": "SCALPING", "position_tag": "SCALP_BASE"},
+        code="552222",
+        sell_time="2026-04-08 10:00:10",
+        buy_price=10200,
+        sell_price=10000,
+        profit_rate=-2.0,
+        buy_qty=10,
+        exit_rule="scalp_ai_early_exit",
+    )
+    feedback_mod.record_post_sell_candidate(
+        recommendation_id=103,
+        stock={"name": "중립C", "strategy": "KOSPI_ML", "position_tag": "KOSPI_BASE"},
+        code="553333",
+        sell_time="2026-04-08 10:00:10",
+        buy_price=10000,
+        sell_price=10000,
+        profit_rate=0.0,
+        buy_qty=10,
+        exit_rule="trailing_take_profit",
+    )
+
+    candle_map = {
+        "551111": [
+            _make_candle("10:01:00", 10120, 10020, 10090),
+            _make_candle("10:02:00", 10220, 10080, 10160),
+            _make_candle("10:03:00", 10240, 10120, 10190),
+            _make_candle("10:04:00", 10200, 10100, 10160),
+            _make_candle("10:05:00", 10180, 10090, 10140),
+            _make_candle("10:06:00", 10200, 10100, 10160),
+            _make_candle("10:07:00", 10220, 10130, 10180),
+            _make_candle("10:08:00", 10230, 10120, 10190),
+            _make_candle("10:09:00", 10240, 10130, 10200),
+            _make_candle("10:10:00", 10250, 10140, 10210),
+        ],
+        "552222": [
+            _make_candle("10:01:00", 10010, 9920, 9950),
+            _make_candle("10:02:00", 10000, 9880, 9920),
+            _make_candle("10:03:00", 9990, 9860, 9890),
+            _make_candle("10:04:00", 9980, 9850, 9880),
+            _make_candle("10:05:00", 9970, 9840, 9870),
+            _make_candle("10:06:00", 9970, 9830, 9860),
+            _make_candle("10:07:00", 9960, 9820, 9850),
+            _make_candle("10:08:00", 9960, 9810, 9840),
+            _make_candle("10:09:00", 9950, 9800, 9830),
+            _make_candle("10:10:00", 9950, 9790, 9820),
+        ],
+        "553333": [
+            _make_candle("10:01:00", 10020, 9980, 10000),
+            _make_candle("10:02:00", 10030, 9970, 10010),
+            _make_candle("10:03:00", 10020, 9980, 10000),
+            _make_candle("10:04:00", 10010, 9990, 10000),
+            _make_candle("10:05:00", 10020, 9980, 10000),
+            _make_candle("10:06:00", 10020, 9980, 10000),
+            _make_candle("10:07:00", 10020, 9980, 10000),
+            _make_candle("10:08:00", 10010, 9990, 10000),
+            _make_candle("10:09:00", 10020, 9980, 10000),
+            _make_candle("10:10:00", 10020, 9980, 10000),
+        ],
+    }
+    fake_kiwoom = types.SimpleNamespace(
+        get_kiwoom_token=lambda: "dummy",
+        get_minute_candles_ka10080=lambda _token, code, limit=700: candle_map.get(
+            code, []
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "src.utils.kiwoom_utils", fake_kiwoom)
+    monkeypatch.setattr(utils_pkg, "kiwoom_utils", fake_kiwoom, raising=False)
+
+    summary = feedback_mod.evaluate_post_sell_candidates("2026-04-08", token="dummy")
+    assert summary.evaluated_candidates == 3
+
+    report = feedback_mod.build_post_sell_feedback_report(
+        "2026-04-08",
+        top_n=5,
+        evaluate_now=False,
+    )
+
+    assert report["metrics"]["evaluated_candidates"] == 3
+    assert report["metrics"]["missed_upside_rate"] > 0.0
+    assert report["metrics"]["good_exit_rate"] > 0.0
+    assert report["metrics"]["estimated_extra_upside_10m_krw_sum"] > 0
+    assert report["metrics"]["estimated_extra_upside_30m_krw_sum"] > 0
+    assert report["meta"]["evaluation_horizons_min"] == [1, 3, 5, 10, 20, 30, 60]
+    assert len(report["exit_rule_tuning"]) == 3
+    assert len(report["tag_tuning"]) == 3
+    assert report["priority_actions"]
+    assert report["top_missed_upside"]
+    assert "soft_stop_forensics" in report
+
+
+def test_materialize_post_sell_snapshot_preserves_insufficient_sample_provenance(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+    monkeypatch.setattr(
+        feedback_mod,
+        "build_post_sell_feedback_report",
+        lambda target_date, evaluate_now: {
+            "date": target_date,
+            "metrics": {"total_candidates": 3, "evaluated_candidates": 0},
+            "meta": {},
+        },
+    )
+
+    def _save(kind, target_date, payload):
+        captured.update({"kind": kind, "target_date": target_date, "payload": payload})
+        return tmp_path / f"{kind}_{target_date}.json"
+
+    monkeypatch.setattr(feedback_mod, "save_monitor_snapshot", _save)
+
+    result = feedback_mod.materialize_post_sell_feedback_snapshot("2026-08-03")
+
+    assert captured["kind"] == "post_sell_feedback"
+    assert captured["payload"]["source_quality"] == {
+        "status": "insufficient_sample",
+        "reason": "no_mature_real_post_sell_evaluation_rows",
+        "candidate_count": 3,
+        "evaluated_candidate_count": 0,
+        "runtime_effect": False,
+        "allowed_runtime_apply": False,
+        "actual_order_submitted": False,
+        "broker_order_forbidden": True,
+        "underlying_execution_scope": "real_post_sell_candidates",
+    }
+    assert captured["payload"]["metric_contract"]["runtime_effect"] is False
+    assert captured["payload"]["meta"]["snapshot_materialization_mode"] == (
+        "existing_rows_only_no_rest_evaluation"
+    )
+    assert result["runtime_effect"] is False
+    assert result["allowed_runtime_apply"] is False
+
+
+def test_materialize_post_sell_feedback_snapshot_marks_partial_sample(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+    monkeypatch.setattr(
+        feedback_mod,
+        "build_post_sell_feedback_report",
+        lambda target_date, evaluate_now: {
+            "date": target_date,
+            "metrics": {"total_candidates": 3, "evaluated_candidates": 1},
+            "meta": {},
+        },
+    )
+
+    def _save(kind, target_date, payload):
+        captured["payload"] = payload
+        return tmp_path / f"{kind}_{target_date}.json"
+
+    monkeypatch.setattr(feedback_mod, "save_monitor_snapshot", _save)
+
+    feedback_mod.materialize_post_sell_feedback_snapshot("2026-08-03")
+
+    assert captured["payload"]["source_quality"]["status"] == "partial_sample"
+    assert captured["payload"]["source_quality"]["reason"] == (
+        "partial_mature_real_post_sell_evaluation_rows"
+    )

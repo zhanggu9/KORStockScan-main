@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>KORStockScan 퀀트 터미널</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f4f6f9; font-family: 'Malgun Gothic', sans-serif; padding-top: 20px;}
+        .card-custom { background: white; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); padding: 20px; margin-bottom: 20px;}
+        .stat-val { font-size: 28px; font-weight: 900; }
+        .insight-box { border-left: 5px solid #3498db; padding-left: 15px; margin-bottom: 15px;}
+        .insight-title { font-weight: bold; color: #2c3e50; font-size: 1.1rem;}
+        .bull-model { color: #e67e22; font-weight: bold; }
+        .badge-pass { background-color: #27ae60; color: white; padding: 4px 8px; border-radius: 8px; font-weight: bold; }
+        .badge-fail { background-color: #e74c3c; color: white; padding: 4px 8px; border-radius: 8px; }
+    </style>
+</head>
+<body class="container">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2 style="font-weight: 900; color: #2c3e50;">📊 KORStockScan 터미널</h2>
+        
+        <form method="GET" action="/" class="d-flex">
+            <select name="date" class="form-select me-2" onchange="this.form.submit()">
+                {% for d in dates %}
+                    <option value="{{ d }}" {% if d == selected_date %}selected{% endif %}>{{ d }} 리포트</option>
+                {% endfor %}
+            </select>
+        </form>
+    </div>
+
+    <div class="row mb-4">
+        <div class="col-md-3">
+            <div class="card-custom text-center">
+                <div class="text-muted fw-bold mb-2">시장 상태</div>
+                <div class="stat-val {{ data.stats.color }}">{{ data.stats.status_text }}</div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card-custom text-center">
+                <div class="text-muted fw-bold mb-2">20일선 돌파 비율</div>
+                <div class="stat-val">{{ data.stats.ma20_ratio }}%</div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card-custom text-center">
+                <div class="text-muted fw-bold mb-2">시장 평균 RSI</div>
+                <div class="stat-val">{{ data.stats.avg_rsi }}</div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card-custom text-center">
+                <div class="text-muted fw-bold mb-2">AI 메타 확신도</div>
+                <div class="stat-val">{{ data.stats.avg_prob }}%</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="card-custom mb-4">
+        <h4 class="fw-bold mb-3">🤖 AI 거시 경제 및 심리 분석</h4>
+        <div class="insight-box">
+            <div class="insight-title">1. 데이터 대시보드 분석</div>
+            <p class="text-muted">{{ data.insights.dashboard }}</p>
+        </div>
+        <div class="insight-box">
+            <div class="insight-title">2. 앙상블 모델 심리 분석 (Psychology)</div>
+            <p class="text-muted">{{ data.insights.psychology }}</p>
+        </div>
+        <div class="insight-box" style="border-left-color: #e74c3c; background-color: #fdf3f2; padding: 15px; border-radius: 0 8px 8px 0;">
+            <div class="insight-title text-danger">🎯 결론 및 향후 전략</div>
+            <p class="text-dark fw-bold mb-0">{{ data.insights.strategy }}</p>
+        </div>
+    </div>
+
+    <div class="card-custom">
+        <table class="table table-hover text-center align-middle">
+            <thead style="background-color: #34495e; color: white;">
+                <tr>
+                    <th>코드</th>
+                    <th>종목명</th>
+                    <th>현재가</th>
+                    <th>20일선돌파</th>
+                    <th>최종AI확신도</th>
+                    <th>개별AI모델(일반/상승장)</th>
+                    <th>수급(외인/기관)</th>
+                    <th>결과</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for stock in data.stocks %}
+                <tr>
+                    <td>{{ stock.code }}</td>
+                    <td class="fw-bold">{{ stock.name }}</td>
+                    <td>{{ stock.price }}</td>
+                    <td>{{ stock.ma20 }}</td>
+                    <td class="fw-bold">{{ stock.ai_prob }}</td>
+                    <td class="text-muted" style="font-size: 0.9rem;">
+                        {{ stock.ai_details | replace("상승장[", "<span class='bull-model'>상승장[") | replace("]", "]</span>") | safe }}
+                    </td>
+                    <td>{{ stock.supply }}</td>
+                    <td>
+                        {% if '✅' in stock.result %}
+                            <span class="badge-pass">{{ stock.result }}</span>
+                        {% else %}
+                            <span class="badge-fail">{{ stock.result }}</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</body>
+</html>

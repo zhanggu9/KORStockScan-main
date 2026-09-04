@@ -1,0 +1,7 @@
+trade_date: "2026-05-11"
+targets:
+  - code: "123456"
+    name: "IPO_NAME"
+    listing_date: "2026-05-11"
+    offer_price: 10000
+    budget_cap_krw: 5000000

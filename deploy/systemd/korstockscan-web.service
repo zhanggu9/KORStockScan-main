@@ -1,0 +1,17 @@
+[Unit]
+Description=KORStockScan Flask Web Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/KORStockScan
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/home/ubuntu/KORStockScan/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/ubuntu/KORStockScan/.venv/bin/python /home/ubuntu/KORStockScan/src/web/app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
