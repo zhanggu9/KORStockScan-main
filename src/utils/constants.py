@@ -1202,8 +1202,8 @@ class TradingConfig:
     # ==========================================
     # 🎯 AI 엔진 제어값 (OpenAI)
     # ==========================================
-    GPT_FAST_MODEL = "gpt-5.6-terra"
-    GPT_DEEP_MODEL = "gpt-5.6-terra"
+    GPT_FAST_MODEL = "gpt-5-nano"
+    GPT_DEEP_MODEL = "gpt-5.4"
     GPT_REPORT_MODEL = "gpt-5.4-mini"
     GPT_THRESHOLD_CORRECTION_MODEL: str = "gpt-5.5"
     GPT_THRESHOLD_CORRECTION_FALLBACK_MODELS: tuple = ("gpt-5.4", "gpt-5.4-mini")

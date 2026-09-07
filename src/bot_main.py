@@ -1,6 +1,27 @@
 # ==============================================================================
 # 🚀 KORStockScan V13.0 통합 관제 시스템 (Main Orchestrator)
 # ==============================================================================
+
+# bot_main.py 맨 위에 추가
+import os
+from dotenv import load_dotenv
+import sys
+
+# 프로젝트 루트 경로 찾기 (src/bot_main.py가 실행되므로 상위 폴더가 루트)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ENV_PATH = os.path.join(PROJECT_ROOT, '.env')
+
+print(f"🔍 [DEBUG] .env 파일 경로: {ENV_PATH}")
+print(f"🔍 [DEBUG] .env 파일 존재: {os.path.exists(ENV_PATH)}")
+
+# .env 파일 강제 로드
+load_dotenv(ENV_PATH)
+
+# OpenAI 키 확인 (디버깅)
+print(f"🔍 [DEBUG] OPENAI_API_KEY: {os.getenv('OPENAI_API_KEY', 'Not Set')[:20] if os.getenv('OPENAI_API_KEY') else 'Not Set'}...")
+
+
+
 """
 [KOSDAQ 하이브리드 AI 스캐너 (Kosdaq Scanner)]
 """

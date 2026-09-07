@@ -1049,32 +1049,32 @@ class GPTSniperEngine:
             return max(
                 1,
                 int(
-                    getattr(TRADING_RULES, "OPENAI_ANALYZE_TARGET_TIMEOUT_MS", 3000)
-                    or 3000
+                    getattr(TRADING_RULES, "OPENAI_ANALYZE_TARGET_TIMEOUT_MS", 15000)
+                    or 15000
                 ),
             )
         if endpoint == "entry_price":
             return max(
                 1,
                 int(
-                    getattr(TRADING_RULES, "OPENAI_ENTRY_PRICE_TIMEOUT_MS", 7000)
-                    or 7000
+                    getattr(TRADING_RULES, "OPENAI_ENTRY_PRICE_TIMEOUT_MS", 15000)
+                    or 15000
                 ),
             )
         if endpoint == "holding_score":
             return max(
                 1,
                 int(
-                    getattr(TRADING_RULES, "OPENAI_HOLDING_SCORE_TIMEOUT_MS", 7000)
-                    or 7000
+                    getattr(TRADING_RULES, "OPENAI_HOLDING_SCORE_TIMEOUT_MS", 15000)
+                    or 15000
                 ),
             )
         if endpoint == "holding_flow":
             return max(
                 1,
                 int(
-                    getattr(TRADING_RULES, "OPENAI_HOLDING_FLOW_TIMEOUT_MS", 7000)
-                    or 7000
+                    getattr(TRADING_RULES, "OPENAI_HOLDING_FLOW_TIMEOUT_MS", 15000)
+                    or 15000
                 ),
             )
         if endpoint == "scanner_report":
@@ -1089,26 +1089,26 @@ class GPTSniperEngine:
             return max(
                 1,
                 int(
-                    getattr(TRADING_RULES, "OPENAI_OVERNIGHT_TIMEOUT_MS", 12000)
-                    or 12000
+                    getattr(TRADING_RULES, "OPENAI_OVERNIGHT_TIMEOUT_MS", 15000)
+                    or 15000
                 ),
             )
         if not require_json:
             return max(
                 1,
                 int(
-                    getattr(TRADING_RULES, "OPENAI_RESPONSES_WS_TIMEOUT_MS", 700) or 700
+                    getattr(TRADING_RULES, "OPENAI_RESPONSES_WS_TIMEOUT_MS", 15000) or 15000
                 ),
             )
         if endpoint in OPENAI_RESPONSES_WS_ENDPOINTS:
             return max(
                 1,
                 int(
-                    getattr(TRADING_RULES, "OPENAI_RESPONSES_WS_TIMEOUT_MS", 700) or 700
+                    getattr(TRADING_RULES, "OPENAI_RESPONSES_WS_TIMEOUT_MS", 15000) or 15000
                 ),
             )
         return max(
-            1, int(getattr(TRADING_RULES, "OPENAI_RESPONSES_WS_TIMEOUT_MS", 700) or 700)
+            1, int(getattr(TRADING_RULES, "OPENAI_RESPONSES_WS_TIMEOUT_MS", 15000) or 15000)
         )
 
     def _is_sim_observation_overnight_context(self, realtime_ctx):

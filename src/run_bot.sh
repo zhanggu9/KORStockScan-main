@@ -1,5 +1,16 @@
 #!/bin/bash
 
+# run_bot.sh 시작 부분에 추가
+# .env 파일 로드
+if [ -f .env ]; then
+    echo "📌 .env 파일 로드 중..."
+    set -a
+    source .env
+    set +a
+else
+    echo "⚠️ .env 파일을 찾을 수 없습니다."
+fi
+
 THRESHOLD_RUNTIME_ENV_WAIT_SEC="${KORSTOCKSCAN_THRESHOLD_RUNTIME_ENV_WAIT_SEC:-1800}"
 THRESHOLD_RUNTIME_ENV_REQUIRED="${KORSTOCKSCAN_THRESHOLD_RUNTIME_ENV_REQUIRED:-true}"
 THRESHOLD_RUNTIME_ENV_BOOTSTRAP="${KORSTOCKSCAN_THRESHOLD_RUNTIME_ENV_BOOTSTRAP:-true}"
