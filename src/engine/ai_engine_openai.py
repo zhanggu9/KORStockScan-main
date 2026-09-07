@@ -107,6 +107,7 @@ from src.engine.scalping.holding_decision_context import (  # noqa: E402
     holding_decision_context_model_payload,
 )
 from src.utils.logger import log_error, log_info
+from src.utils.telegram_notifier import send_telegram_message # 텔레그램 알림용
 from src.utils.constants import TRADING_RULES
 from src.engine.macro_briefing_complete import build_scanner_data_input
 from src.engine.ai_prompt_contracts import (
@@ -1882,6 +1883,14 @@ class GPTSniperEngine:
                 result_source=str(result_source or "-"),
                 input_contract_fields=input_contract_fields,
             )
+        )
+
+        # 텔레그램 알림용
+        send_telegram_message(
+            f"🤖 <b>{prompt_type}</b>\n"
+            f"action: {payload.get('action', payload.get('action_key', '-'))}\n"
+            f"score: {payload.get('score', payload.get('confidence', '-'))}\n"
+            f"source: {result_source}"
         )
         return payload
 
@@ -9174,6 +9183,13 @@ class GPTSniperEngine:
                     provider_called=False,
                 )
             )
+            # 텔레그램 알림용
+            send_telegram_message(
+                f"🤖 <b>{prompt_type}</b>\n"
+                f"action: {payload.get('action', payload.get('action_key', '-'))}\n"
+                f"score: {payload.get('score', payload.get('confidence', '-'))}\n"
+                f"source: {result_source}"
+            )
             return result
         cache_key = self._build_gatekeeper_cache_key(
             stock_name=stock_name,
@@ -9218,6 +9234,13 @@ class GPTSniperEngine:
                     stock_code=stock_code,
                     provider_called=False,
                 )
+            )
+            # 텔레그램 알림용
+            send_telegram_message(
+                f"🤖 <b>{prompt_type}</b>\n"
+                f"action: {payload.get('action', payload.get('action_key', '-'))}\n"
+                f"score: {payload.get('score', payload.get('confidence', '-'))}\n"
+                f"source: {result_source}"
             )
             return cached_result
 
@@ -9285,6 +9308,13 @@ class GPTSniperEngine:
         )
         self._cache_set(
             "_gatekeeper_cache", cache_key, result, self.gatekeeper_cache_ttl
+        )
+        # 텔레그램 알림용
+        send_telegram_message(
+            f"🤖 <b>{prompt_type}</b>\n"
+            f"action: {payload.get('action', payload.get('action_key', '-'))}\n"
+            f"score: {payload.get('score', payload.get('confidence', '-'))}\n"
+            f"source: {result_source}"
         )
         return result
 

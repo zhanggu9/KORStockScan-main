@@ -53,6 +53,7 @@ from src.engine.sniper_time import (
 )
 from src.utils.constants import TRADING_RULES
 from src.utils.pipeline_event_logger import emit_pipeline_event
+from src.utils.telegram_notifier import send_telegram_message # 텔레그램 알림용
 from sqlalchemy import func, or_
 
 SCANNER_RISING_START_SOURCE_FAMILY = "scalping_scanner_rising_start_source_v1"
@@ -5284,6 +5285,16 @@ def promote_candidates(
             },
         )
         event_bus.publish("SCALPING_SCANNER_PROMOTED_TARGET", runtime_target_payload)
+        
+        # 텔레그램 알림용
+        send_telegram_message(
+            f"🎯 <b>신규 스캘핑 후보 포착</b>\n"
+            f"{runtime_target_payload.get('name', '-')} ({runtime_target_payload.get('code', '-')})\n"
+            f"가격: {runtime_target_payload.get('buy_price', '-')}원\n"
+            f"사유: {runtime_target_payload.get('scanner_promotion_reason', '-')}\n"
+            f"source: {runtime_target_payload.get('source_signature', '-')}"
+        )
+
         if limit_down_manager is not None:
             # Keep the observation-only signal block until the synchronous
             # normal-target attach handoff has completed.  The release keeps
