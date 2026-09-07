@@ -69,11 +69,11 @@ def calculate_severity(title):
 def is_telegram_send_allowed(now=None):
     """
     텔레그램 브로드캐스트가 허용된 시간인지 확인
-    9PM(21:00) ~ 8AM(08:00) 사이는 텔레그램 전송 차단
+    1AM(01:00) ~ 6AM(06:00) 사이는 텔레그램 전송 차단
     """
     current_hour = _coerce_kst(now).hour
-    # 21시 이상 또는 8시 미만이면 전송 불가 (9PM ~ 8AM)
-    if current_hour >= 21 or current_hour < 8:
+    # 1시 이상 또는 6시 미만이면 전송 불가 (1AM ~ 6AM)
+    if current_hour >= 1 or current_hour < 6:
         return False
     return True
 
