@@ -2,10 +2,10 @@
 
 # run_bot.sh 시작 부분에 추가
 # .env 파일 로드
-if [ -f .env ]; then
+if [ -f "$PROJECT_DIR/.env" ]; then
     echo "📌 .env 파일 로드 중..."
     set -a
-    source .env
+    source "$PROJECT_DIR/.env"
     set +a
 else
     echo "⚠️ .env 파일을 찾을 수 없습니다."
@@ -48,7 +48,7 @@ wait_for_threshold_runtime_env() {
     if [ ! -f "$env_path" ] && { [ "$THRESHOLD_RUNTIME_ENV_BOOTSTRAP" = "true" ] || [ "$THRESHOLD_RUNTIME_ENV_BOOTSTRAP" = "1" ]; }; then
         echo "🧭 threshold runtime env 생성 시도: $env_path"
         (
-            cd ..
+            cd "$PROJECT_DIR"
             THRESHOLD_CYCLE_APPLY_MODE="${THRESHOLD_CYCLE_APPLY_MODE:-auto_bounded_live}" \
             THRESHOLD_CYCLE_AUTO_APPLY="${THRESHOLD_CYCLE_AUTO_APPLY:-true}" \
             THRESHOLD_CYCLE_AUTO_APPLY_REQUIRE_AI="${THRESHOLD_CYCLE_AUTO_APPLY_REQUIRE_AI:-true}" \

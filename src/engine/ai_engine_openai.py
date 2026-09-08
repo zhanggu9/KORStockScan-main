@@ -9185,10 +9185,9 @@ class GPTSniperEngine:
             )
             # 텔레그램 알림용
             send_telegram_message(
-                f"🤖 <b>{prompt_type}</b>\n"
-                f"action: {payload.get('action', payload.get('action_key', '-'))}\n"
-                f"score: {payload.get('score', payload.get('confidence', '-'))}\n"
-                f"source: {result_source}"
+                f"🤖 <b>realtime_gatekeeper</b>\n"
+                f"action: {result.get('action_label', result.get('action_key', '-'))}\n"
+                f"source: input_preflight_blocked"
             )
             return result
         cache_key = self._build_gatekeeper_cache_key(
@@ -9237,10 +9236,9 @@ class GPTSniperEngine:
             )
             # 텔레그램 알림용
             send_telegram_message(
-                f"🤖 <b>{prompt_type}</b>\n"
-                f"action: {payload.get('action', payload.get('action_key', '-'))}\n"
-                f"score: {payload.get('score', payload.get('confidence', '-'))}\n"
-                f"source: {result_source}"
+                f"🤖 <b>realtime_gatekeeper</b>\n"
+                f"action: {cached_result.get('action_label', cached_result.get('action_key', '-'))}\n"
+                f"source: cache"
             )
             return cached_result
 
@@ -9311,10 +9309,9 @@ class GPTSniperEngine:
         )
         # 텔레그램 알림용
         send_telegram_message(
-            f"🤖 <b>{prompt_type}</b>\n"
-            f"action: {payload.get('action', payload.get('action_key', '-'))}\n"
-            f"score: {payload.get('score', payload.get('confidence', '-'))}\n"
-            f"source: {result_source}"
+            f"🤖 <b>realtime_gatekeeper</b>\n"
+            f"action: {result.get('action_label', result.get('action_key', '-'))}\n"
+            f"source: {'live' if not report_payload.get('error') else 'exception'}"
         )
         return result
 

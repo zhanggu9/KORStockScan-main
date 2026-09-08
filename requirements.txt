@@ -31,3 +31,5 @@ yfinance
 fear-and-greed
 flask
 pytest
+pyarrow
+duckdb

@@ -17,8 +17,12 @@ print(f"🔍 [DEBUG] .env 파일 존재: {os.path.exists(ENV_PATH)}")
 # .env 파일 강제 로드
 load_dotenv(ENV_PATH)
 
-# OpenAI 키 확인 (디버깅)
-print(f"🔍 [DEBUG] OPENAI_API_KEY: {os.getenv('OPENAI_API_KEY', 'Not Set')[:20] if os.getenv('OPENAI_API_KEY') else 'Not Set'}...")
+# Log only whether the credential is configured.  Printing even a prefix leaks
+# sensitive material into terminal history, service logs, and monitoring output.
+print(
+    "🔍 [DEBUG] OPENAI_API_KEY configured: "
+    f"{bool(os.getenv('OPENAI_API_KEY'))}"
+)
 
 
 
