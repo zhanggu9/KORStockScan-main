@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import os
 import sys
 import time
 from datetime import datetime, timedelta
@@ -15,7 +14,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.utils.kiwoom_utils import get_minute_candles_ka10080, get_kiwoom_token  # noqa: E402
 
-KST = __import__("zoneinfo").zoneinfo.ZoneInfo("Asia/Seoul")
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "minute"
 
 
