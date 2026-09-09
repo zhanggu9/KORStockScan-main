@@ -27,7 +27,6 @@ def parse_date(value: str):
 def trading_dates(start, end):
     current = start
     while current <= end:
-        # 주말 제외. 공휴일/휴장일은 API 응답이 없으면 건너뜁니다.
         if current.weekday() < 5:
             yield current
         current += timedelta(days=1)
@@ -53,11 +52,36 @@ def normalize_row(code: str, row: dict, base_date: str) -> dict:
     }
 
 
-def collect_one_day(token: str, code: str, day, output_dir: Path, limit: int) -> Path:
+def collect_one_day(token: str, code: str, day, output_dir: Path, limit: int) -> Path | None:
     base_dt = day.strftime("%Y%m%d")
-    rows = get_minute_candles_ka10080(token, code, limit=limit)
+
+    # IMPORTANT: pass the requested base date to ka10080. Without this,
+    # Kiwoom can return the latest available bars rather than the requested day.
+    rows = get_minute_candles_ka10080(
+        token,
+        code,
+        limit=limit,
+        base_dt=base_dt,
+    )
+
     normalized = [normalize_row(code, row, base_dt) for row in rows]
     normalized = [r for r in normalized if r["datetime"]]
+
+    # Defense-in-depth: never write bars belonging to another date into the
+    # requested day's file, even if the API returns extra rows.
+    prefix = f"{base_dt[:4]}-{base_dt[4:6]}-{base_dt[6:8]}"
+    normalized = [r for r in normalized if r["datetime"].startswith(prefix)]
+    normalized.sort(key=lambda r: r["datetime"])
+
+    if not normalized:
+        print(f"[{base_dt}] {code}: 해당 날짜의 1분봉 데이터가 없습니다.")
+        return None
+
+    # Remove duplicate timestamps defensively.
+    deduped = {}
+    for row in normalized:
+        deduped[row["datetime"]] = row
+    normalized = list(deduped.values())
     normalized.sort(key=lambda r: r["datetime"])
 
     day_dir = output_dir / code
@@ -72,7 +96,10 @@ def collect_one_day(token: str, code: str, day, output_dir: Path, limit: int) ->
         writer.writeheader()
         writer.writerows(normalized)
 
-    print(f"[{base_dt}] {code}: {len(normalized)} bars -> {path}")
+    print(
+        f"[{base_dt}] {code}: {len(normalized)} bars "
+        f"({normalized[0]['datetime']} ~ {normalized[-1]['datetime']}) -> {path}"
+    )
     return path
 
 
@@ -93,7 +120,7 @@ def main() -> int:
         default=DEFAULT_OUTPUT_DIR,
         help="저장 루트 디렉터리",
     )
-    parser.add_argument("--sleep", type=float, default=0.25, help="날짜 간 요청 간격(초)")
+    parser.add_argument("--sleep", type=float, default=0.5, help="날짜 간 요청 간격(초)")
     args = parser.parse_args()
 
     if args.limit < 1:
@@ -111,8 +138,8 @@ def main() -> int:
     collected = 0
     for day in trading_dates(args.start, end):
         try:
-            collect_one_day(token, args.code, day, args.output_dir, args.limit)
-            collected += 1
+            if collect_one_day(token, args.code, day, args.output_dir, args.limit):
+                collected += 1
         except Exception as exc:
             print(f"[{day:%Y%m%d}] 수집 실패: {type(exc).__name__}: {exc}", file=sys.stderr)
         time.sleep(max(0.0, args.sleep))
