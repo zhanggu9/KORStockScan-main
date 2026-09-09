@@ -12,7 +12,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.utils.kiwoom_utils import get_minute_candles_ka10080, get_kiwoom_token  # noqa: E402
+from src.utils.kiwoom_utils import (  # noqa: E402
+    get_kiwoom_token,
+    get_minute_candles_ka10080_with_meta,
+)
 
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "minute"
 
@@ -55,9 +58,9 @@ def normalize_row(code: str, row: dict, base_date: str) -> dict:
 def collect_one_day(token: str, code: str, day, output_dir: Path, limit: int) -> Path | None:
     base_dt = day.strftime("%Y%m%d")
 
-    # IMPORTANT: pass the requested base date to ka10080. Without this,
-    # Kiwoom can return the latest available bars rather than the requested day.
-    rows = get_minute_candles_ka10080(
+    # The existing with_meta wrapper already supports base_dt. Use it instead
+    # of the simpler wrapper, which intentionally exposes only (token, code, limit).
+    rows, meta = get_minute_candles_ka10080_with_meta(
         token,
         code,
         limit=limit,
@@ -74,7 +77,10 @@ def collect_one_day(token: str, code: str, day, output_dir: Path, limit: int) ->
     normalized.sort(key=lambda r: r["datetime"])
 
     if not normalized:
-        print(f"[{base_dt}] {code}: 해당 날짜의 1분봉 데이터가 없습니다.")
+        print(
+            f"[{base_dt}] {code}: 해당 날짜의 1분봉 데이터가 없습니다. "
+            f"request_base_dt={meta.get('request_base_dt')}"
+        )
         return None
 
     # Remove duplicate timestamps defensively.
