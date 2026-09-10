@@ -33,3 +33,4 @@ flask
 pytest
 pyarrow
 duckdb
+pykrx
