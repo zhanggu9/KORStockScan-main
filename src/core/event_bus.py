@@ -3,6 +3,7 @@ from __future__ import annotations  # 💡 이 줄을 파일 맨 위에 추가�
 import threading
 from typing import Callable, Dict, List
 from src.utils.logger import log_error
+from src.engine.microstructure_recorder import MicrostructureRecorder
 
 
 class EventBus:
@@ -14,9 +15,8 @@ class EventBus:
             if cls._instance is None:
                 cls._instance = super(EventBus, cls).__new__(cls)
                 cls._instance._subscribers: Dict[str, List[Callable]] = {}
-                cls._instance._sub_lock = (
-                    threading.Lock()
-                )  # 구독/발행 시의 스레드 안전성 보장
+                cls._instance._sub_lock = threading.Lock()
+                cls._instance._microstructure_recorder = MicrostructureRecorder()
                 print("전역 EventBus(싱글톤) 인스턴스가 생성되었습니다.")
         return cls._instance
 
@@ -43,10 +43,37 @@ class EventBus:
             if not callbacks:
                 self._subscribers.pop(event_type, None)
 
+    @staticmethod
+    def _augment_scalping_realtime_types(payload: dict) -> None:
+        """Ensure the scalping websocket prewarm includes trade + order-book feeds.
+
+        The existing scanner requested 0B only.  SniperRadar consumes execution
+        strength/trade data and order-book totals, so retain 0B and add 0A/0C.
+        """
+        if payload.get("source") != "scanner_scalping_buy_window_prewarm":
+            return
+
+        current = payload.get("required_realtime_types") or ()
+        if isinstance(current, str):
+            current = (current,)
+        merged = list(dict.fromkeys([*current, "0A", "0B", "0C"]))
+        payload["required_realtime_types"] = tuple(merged)
+
     def publish(self, event_type: str, payload: dict = None):
         """이벤트를 발생시키고, 구독 중인 모든 콜백 함수에 데이터를 전달합니다."""
         if payload is None:
             payload = {}
+
+        # The recorder is intentionally outside the subscriber loop so a full
+        # order-book/trade stream cannot block individual scanner callbacks.
+        if event_type == "REALTIME_TICK_ARRIVED":
+            try:
+                self._microstructure_recorder.record_async(payload)
+            except Exception as exc:
+                log_error(f"[MicrostructureRecorder] queue failure: {exc}")
+
+        if event_type == "COMMAND_WS_REG":
+            self._augment_scalping_realtime_types(payload)
 
         with self._sub_lock:
             callbacks = self._subscribers.get(event_type, []).copy()
