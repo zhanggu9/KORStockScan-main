@@ -22,9 +22,9 @@ DEFAULT_UNIVERSE = PROJECT_ROOT / "data" / "universe" / "all.csv"
 INDEX_ORDER = ("KOSPI 200", "KOSDAQ 150")
 DEFAULT_RETRIES = 3
 DEFAULT_SLEEP_DAY_SINGLE = 0.5
-DEFAULT_SLEEP_DAY_UNIVERSE = 1.0
-DEFAULT_SLEEP_STOCK = 1.0
-DEFAULT_RETRY_SLEEP = 5.0
+DEFAULT_SLEEP_DAY_UNIVERSE = 0.5
+DEFAULT_SLEEP_STOCK = 0.5
+DEFAULT_RETRY_SLEEP = 3.0
 
 
 def parse_date(value: str):
@@ -351,7 +351,7 @@ def main() -> int:
         dest="sleep_day",
         type=float,
         default=None,
-        help="날짜 간 요청 간격(초). 단일 종목 기본 0.5, 유니버스 기본 1.0",
+        help="날짜 간 요청 간격(초). 단일 종목 기본 0.5, 유니버스 기본 0.5",
     )
     parser.add_argument(
         "--sleep-day",
@@ -364,7 +364,7 @@ def main() -> int:
         "--sleep-stock",
         type=float,
         default=DEFAULT_SLEEP_STOCK,
-        help="--universe에서 종목 간 요청 간격(초). 기본 1.0",
+        help="--universe에서 종목 간 요청 간격(초). 기본 0.5",
     )
     parser.add_argument(
         "--retries",
@@ -376,7 +376,7 @@ def main() -> int:
         "--retry-sleep",
         type=float,
         default=DEFAULT_RETRY_SLEEP,
-        help="재시도 대기시간 배수의 기준 초. 기본 5.0",
+        help="재시도 대기시간 배수의 기준 초. 기본 3.0",
     )
     parser.add_argument(
         "--max-stocks",
