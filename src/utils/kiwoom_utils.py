@@ -4502,9 +4502,14 @@ def fetch_kiwoom_api_continuous(
         if max_pages is not None and len(all_results) >= max(1, int(max_pages or 1)):
             meta["continuous_page_limit_reached"] = True
             break
-
-        time.sleep(0.5)  # 연속조회 시 서버 배려를 위한 딜레이(실전서버)
+        
+        # time.sleep(0.5)  # 연속조회 시 서버 배려를 위한 딜레이(실전서버)
         # time.sleep(1.2)  # 연속조회 시 서버 배려를 위한 딜레이(모의투자서버)
+
+        # 실전 서버: ka10080 분봉 연속조회는 더 빠르게,
+        # 그 외 API는 기존 0.5초 유지
+        continuous_sleep = 0.25 if api_id == "ka10080" else 0.5
+        time.sleep(continuous_sleep)
 
     return (all_results, meta) if return_meta else all_results
 
