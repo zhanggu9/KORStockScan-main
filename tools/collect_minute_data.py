@@ -24,7 +24,7 @@ DEFAULT_RETRIES = 3
 DEFAULT_SLEEP_DAY_SINGLE = 0.3
 DEFAULT_SLEEP_DAY_UNIVERSE = 0.3
 DEFAULT_SLEEP_STOCK = 0.3
-DEFAULT_RETRY_SLEEP = 2.0
+DEFAULT_RETRY_SLEEP = 3.0
 
 
 def parse_date(value: str):
@@ -281,6 +281,7 @@ def collect_universe(args, token: str, end) -> int:
             flush=True,
         )
 
+        stock_requested = False
         for day_no, day in enumerate(days, start=1):
             ok, was_skipped = collect_with_retry(
                 token,
@@ -297,13 +298,15 @@ def collect_universe(args, token: str, end) -> int:
                     skipped += 1
                 else:
                     success += 1
+                    stock_requested = True
             else:
                 failed += 1
 
-            if day_no < len(days):
+            if not was_skipped and day_no < len(days):
                 time.sleep(max(0.0, args.sleep_day))
 
-        time.sleep(max(0.0, args.sleep_stock))
+        if stock_requested:
+            time.sleep(max(0.0, args.sleep_stock))
 
     finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
     print(
@@ -351,7 +354,7 @@ def main() -> int:
         dest="sleep_day",
         type=float,
         default=None,
-        help="날짜 간 요청 간격(초). 단일 종목 기본 0.5, 유니버스 기본 0.5",
+        help="날짜 간 요청 간격(초). 단일 종목 기본 0.3, 유니버스 기본 0.3",
     )
     parser.add_argument(
         "--sleep-day",
@@ -364,7 +367,7 @@ def main() -> int:
         "--sleep-stock",
         type=float,
         default=DEFAULT_SLEEP_STOCK,
-        help="--universe에서 종목 간 요청 간격(초). 기본 0.5",
+        help="--universe에서 실제 API 호출이 있었던 종목 간 요청 간격(초). 기본 0.3",
     )
     parser.add_argument(
         "--retries",
