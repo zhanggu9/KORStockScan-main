@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -13,7 +12,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.backtest.engine import BacktestConfig, run_backtest  # noqa: E402
-from src.backtest.strategies import ema_cross_strategy  # noqa: E402
+from src.backtest.strategies import (  # noqa: E402
+    ema_cross_strategy,
+    one_minute_scalping_proxy_strategy,
+)
 
 
 def parse_date(value: str):
@@ -58,6 +60,19 @@ def result_row(result):
     }
 
 
+def build_strategy(args):
+    if args.strategy == "ema":
+        return ema_cross_strategy(args.fast, args.slow)
+    return one_minute_scalping_proxy_strategy(
+        rsi_period=args.rsi_period,
+        rsi_buy=args.rsi_buy,
+        rsi_sell=args.rsi_sell,
+        volume_multiplier=args.volume_multiplier,
+        average_window=args.average_window,
+        price_distance_pct=args.price_distance_pct,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="KORStockScan 1분봉 CSV 백테스트 실행기")
     parser.add_argument("--code", required=True, help="종목코드 예: 005930")
@@ -70,8 +85,20 @@ def main() -> int:
     parser.add_argument("--initial-cash", type=float, default=10_000_000.0)
     parser.add_argument("--fee-bps", type=float, default=15.0)
     parser.add_argument("--slippage-bps", type=float, default=5.0)
+    parser.add_argument(
+        "--strategy",
+        choices=["scalping_proxy", "ema"],
+        default="scalping_proxy",
+        help="기본은 OHLCV 기반 1분 스캘핑 프록시",
+    )
     parser.add_argument("--fast", type=int, default=5)
     parser.add_argument("--slow", type=int, default=20)
+    parser.add_argument("--rsi-period", type=int, default=14)
+    parser.add_argument("--rsi-buy", type=float, default=70.0)
+    parser.add_argument("--rsi-sell", type=float, default=50.0)
+    parser.add_argument("--volume-multiplier", type=float, default=2.5)
+    parser.add_argument("--average-window", type=int, default=3)
+    parser.add_argument("--price-distance-pct", type=float, default=2.0)
     parser.add_argument(
         "--execution",
         choices=["next_open", "close"],
@@ -89,7 +116,7 @@ def main() -> int:
 
     try:
         frame, file_count = load_code(args.data_dir, args.code, args.start, args.end)
-        strategy = ema_cross_strategy(args.fast, args.slow)
+        strategy = build_strategy(args)
         config = BacktestConfig(
             initial_cash=args.initial_cash,
             fee_bps=args.fee_bps,
@@ -102,9 +129,10 @@ def main() -> int:
         return 2
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    summary_path = args.output_dir / f"{args.code}_{args.start:%Y%m%d}_{args.end:%Y%m%d}_summary.csv"
-    trades_path = args.output_dir / f"{args.code}_{args.start:%Y%m%d}_{args.end:%Y%m%d}_trades.csv"
-    equity_path = args.output_dir / f"{args.code}_{args.start:%Y%m%d}_{args.end:%Y%m%d}_equity.csv"
+    prefix = f"{args.code}_{args.start:%Y%m%d}_{args.end:%Y%m%d}_{args.strategy}"
+    summary_path = args.output_dir / f"{prefix}_summary.csv"
+    trades_path = args.output_dir / f"{prefix}_trades.csv"
+    equity_path = args.output_dir / f"{prefix}_equity.csv"
 
     pd.DataFrame([result_row(result)]).to_csv(
         summary_path, index=False, encoding="utf-8-sig"
@@ -112,9 +140,10 @@ def main() -> int:
     pd.DataFrame([t.__dict__ for t in result.trades]).to_csv(
         trades_path, index=False, encoding="utf-8-sig"
     )
-    result.equity_curve.to_csv(equity_path, index=False, encoding="utf-8-sig")
+    result.equity_curve.to_csv(equity_path, index=False)
 
     print(f"백테스트 완료: {result.code}")
+    print(f"전략: {args.strategy}")
     print(f"기간: {args.start:%Y%m%d} ~ {args.end:%Y%m%d} | files={file_count}")
     print(f"최종자산: {result.final_cash:,.0f}")
     print(f"수익률: {result.equity_return_pct:.2f}%")
