@@ -25,17 +25,63 @@ def parse_date(value: str) -> str:
     return value
 
 
+def _extract_tickers(value) -> list[str]:
+    """Handle both the documented list return and DataFrame return seen in some pykrx builds."""
+    if value is None:
+        return []
+
+    if isinstance(value, pd.DataFrame):
+        if value.empty:
+            return []
+
+        # Current pykrx normally returns a list, but some builds/wrappers can
+        # expose the underlying KRX result as a DataFrame. Prefer the standard
+        # ISU_SRT_CD column and fall back to the DataFrame index.
+        for column in ("ISU_SRT_CD", "티커", "ticker", "code"):
+            if column in value.columns:
+                values = value[column].tolist()
+                break
+        else:
+            values = value.index.tolist()
+    else:
+        try:
+            values = list(value)
+        except TypeError:
+            return []
+
+    result = []
+    for ticker in values:
+        if pd.isna(ticker):
+            continue
+        ticker = str(ticker).strip()
+        if ticker:
+            result.append(ticker.zfill(6))
+    return result
+
+
 def fetch_index(index_name: str, as_of: str) -> pd.DataFrame:
     market, index_code = INDEXES[index_name]
-    tickers = stock.get_index_portfolio_deposit_file(index_code, as_of)
-    if not tickers:
+
+    try:
+        raw = stock.get_index_portfolio_deposit_file(index_code, as_of)
+    except Exception as exc:
         raise RuntimeError(
-            f"{index_name} 구성종목을 가져오지 못했습니다. 조회일={as_of}, index={index_code}"
+            f"{index_name} 구성종목 API 조회 실패: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    tickers = _extract_tickers(raw)
+    if not tickers:
+        raw_type = type(raw).__name__
+        raw_shape = getattr(raw, "shape", None)
+        raise RuntimeError(
+            f"{index_name} 구성종목을 가져오지 못했습니다. "
+            f"조회일={as_of}, index={index_code}, "
+            f"응답형식={raw_type}, shape={raw_shape}. "
+            "pykrx/한국거래소 응답이 비어 있거나 차단되었을 가능성이 있습니다."
         )
 
     rows = []
     for ticker in tickers:
-        ticker = str(ticker).zfill(6)
         try:
             name = stock.get_market_ticker_name(ticker)
         except Exception:
@@ -84,8 +130,6 @@ def main() -> int:
         ["index", "code"]
     )
 
-    # 동일 종목이 두 지수에 동시에 포함될 경우, 두 index 행은 보존한다.
-    # 전체 유니버스용 중복 제거 파일도 함께 만든다.
     args.output.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(args.output, index=False, encoding="utf-8-sig")
 
