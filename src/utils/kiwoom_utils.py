@@ -4389,7 +4389,7 @@ def fetch_kiwoom_api_continuous(
                 if response.status_code == 200:
                     break  # 성공 시 재시도 루프 탈출
                 elif response.status_code == 429:
-                    wait_sec = (retry_count + 1) * 3
+                    wait_sec = (retry_count + 1) * 1.3
                     print(
                         f"⚠️ [{api_id}] 429 요청 제한! {wait_sec}초 대기 후 재시도... ({retry_count+1}/{max_retries})"
                     )
