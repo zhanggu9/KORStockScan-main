@@ -12,10 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.backtest.engine import BacktestConfig, run_backtest  # noqa: E402
-from src.backtest.strategies import (  # noqa: E402
-    ema_cross_strategy,
-    one_minute_scalping_proxy_strategy,
-)
+from src.backtest.strategies import ema_cross_strategy, one_minute_scalping_proxy_strategy  # noqa: E402
 
 
 def parse_date(value: str):
@@ -41,7 +38,8 @@ def load_code(data_dir: Path, code: str, start, end) -> tuple[pd.DataFrame, int]
         raise FileNotFoundError(
             f"No minute CSV files found for {code}: {start:%Y%m%d}~{end:%Y%m%d}"
         )
-    frames = [pd.read_csv(path, encoding="utf-8-sig") for path in paths]
+    # Keep stock codes as strings so leading zeros are never lost.
+    frames = [pd.read_csv(path, encoding="utf-8-sig", dtype={"code": str}) for path in paths]
     return pd.concat(frames, ignore_index=True), len(paths)
 
 
@@ -81,7 +79,9 @@ def main() -> int:
     parser.add_argument(
         "--data-dir", type=Path, default=PROJECT_ROOT / "data" / "minute"
     )
-    parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "data" / "backtest")
+    parser.add_argument(
+        "--output-dir", type=Path, default=PROJECT_ROOT / "data" / "backtest"
+    )
     parser.add_argument("--initial-cash", type=float, default=10_000_000.0)
     parser.add_argument("--fee-bps", type=float, default=15.0)
     parser.add_argument("--slippage-bps", type=float, default=5.0)
@@ -99,6 +99,11 @@ def main() -> int:
     parser.add_argument("--volume-multiplier", type=float, default=2.5)
     parser.add_argument("--average-window", type=int, default=3)
     parser.add_argument("--price-distance-pct", type=float, default=2.0)
+    parser.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="스캘핑 조건의 실제 통과 건수와 극값을 출력",
+    )
     parser.add_argument(
         "--execution",
         choices=["next_open", "close"],
@@ -151,6 +156,30 @@ def main() -> int:
     print(f"거래수: {result.total_trades}")
     print(f"승률: {result.win_rate_pct:.2f}%")
     print(f"Profit Factor: {result.profit_factor:.3f}")
+
+    if args.diagnostics and args.strategy == "scalping_proxy":
+        from src.backtest.strategies import diagnose_one_minute_scalping_proxy
+
+        diagnostics = diagnose_one_minute_scalping_proxy(
+            frame,
+            rsi_period=args.rsi_period,
+            rsi_buy=args.rsi_buy,
+            rsi_sell=args.rsi_sell,
+            volume_multiplier=args.volume_multiplier,
+            average_window=args.average_window,
+            price_distance_pct=args.price_distance_pct,
+        )
+        print("\n[조건 진단]")
+        print(f"유효 봉 수: {diagnostics['valid_bars']:,}")
+        print(f"RSI >= {args.rsi_buy:g}: {diagnostics['rsi_buy_pass']:,}")
+        print(f"거래량 >= 평균×{args.volume_multiplier:g}: {diagnostics['volume_pass']:,}")
+        print(f"종가 >= 평균 대비 {args.price_distance_pct:g}%: {diagnostics['price_pass']:,}")
+        print(f"세 조건 동시 충족: {diagnostics['all_buy_pass']:,}")
+        print(f"RSI <= {args.rsi_sell:g}: {diagnostics['rsi_sell_pass']:,}")
+        print(f"최대 RSI: {diagnostics['max_rsi']:.2f}")
+        print(f"최대 거래량 배수: {diagnostics['max_volume_ratio']:.2f}x")
+        print(f"최대 평균종가 대비 상승률: {diagnostics['max_price_distance_pct']:.2f}%")
+
     print(f"결과: {summary_path}")
     return 0
 
