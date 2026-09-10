@@ -353,7 +353,8 @@ def main() -> int:
         "--sleep-day",
         dest="sleep_day",
         type=float,
-        help="--universe에서 날짜 간 요청 간격(초). --sleep과 동일 의미",
+        default=argparse.SUPPRESS,
+        help="--universe에서 날짜 간 요청 간격(초). --sleep보다 우선",
     )
     parser.add_argument(
         "--sleep-stock",
