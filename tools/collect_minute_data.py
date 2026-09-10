@@ -69,6 +69,12 @@ def collect_one_day(token: str, code: str, day, output_dir: Path, limit: int) ->
 
     normalized = [normalize_row(code, row, base_dt) for row in rows]
     normalized = [r for r in normalized if r["datetime"]]
+    
+    # 15:30 이후 데이터 제외
+    normalized = [
+        r for r in normalized
+        if r["datetime"][11:19] <= "15:30:00"
+    ]
 
     # Defense-in-depth: never write bars belonging to another date into the
     # requested day's file, even if the API returns extra rows.
