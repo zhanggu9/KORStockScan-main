@@ -18,6 +18,9 @@ from src.utils.kiwoom_utils import (  # noqa: E402
 )
 
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "minute"
+DEFAULT_UNIVERSE = PROJECT_ROOT / "data" / "universe" / "all.csv"
+INDEX_ORDER = ("KOSPI 200", "KOSDAQ 150")
+DEFAULT_RETRIES = 3
 
 
 def parse_date(value: str):
@@ -69,7 +72,7 @@ def collect_one_day(token: str, code: str, day, output_dir: Path, limit: int) ->
 
     normalized = [normalize_row(code, row, base_dt) for row in rows]
     normalized = [r for r in normalized if r["datetime"]]
-    
+
     # 15:30 이후 데이터 제외
     normalized = [
         r for r in normalized
@@ -115,11 +118,218 @@ def collect_one_day(token: str, code: str, day, output_dir: Path, limit: int) ->
     return path
 
 
+def read_universe(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"유니버스 파일을 찾을 수 없습니다: {path}\n"
+            "먼저 `python tools/fetch_index_universe.py --index all`을 실행하세요."
+        )
+
+    rows: list[dict[str, str]] = []
+    with path.open("r", newline="", encoding="utf-8-sig") as fh:
+        reader = csv.DictReader(fh)
+        required = {"code", "name", "index"}
+        if not required.issubset(set(reader.fieldnames or [])):
+            raise ValueError(
+                f"유니버스 CSV 컬럼이 올바르지 않습니다. 필요한 컬럼: {sorted(required)}"
+            )
+
+        seen: set[str] = set()
+        for row in reader:
+            code = str(row.get("code") or "").strip()
+            name = str(row.get("name") or "").strip()
+            index_name = str(row.get("index") or "").strip()
+            if len(code) != 6 or not code.isdigit() or not index_name:
+                continue
+
+            key = f"{index_name}:{code}"
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({"code": code, "name": name, "index": index_name})
+
+    ordered: list[dict[str, str]] = []
+    for index_name in INDEX_ORDER:
+        ordered.extend(row for row in rows if row["index"] == index_name)
+    ordered.extend(row for row in rows if row["index"] not in INDEX_ORDER)
+    return ordered
+
+
+def output_path(output_dir: Path, code: str, day) -> Path:
+    return output_dir / code / f"{day:%Y%m%d}.csv"
+
+
+def collect_with_retry(
+    token: str,
+    row: dict[str, str],
+    day,
+    output_dir: Path,
+    limit: int,
+    retries: int,
+    retry_sleep: float,
+    overwrite: bool,
+) -> tuple[bool, bool]:
+    code = row["code"]
+    name = row["name"]
+    path = output_path(output_dir, code, day)
+
+    if path.exists() and not overwrite:
+        print(f"    ↳ SKIP {code} {name}: 이미 존재 ({path})")
+        return True, True
+
+    for attempt in range(1, retries + 2):
+        try:
+            result = collect_one_day(token, code, day, output_dir, limit)
+            return result is not None, False
+        except Exception as exc:
+            if attempt > retries:
+                print(
+                    f"    ↳ FAIL {code} {name} {day:%Y%m%d}: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+                return False, False
+
+            wait = retry_sleep * attempt
+            print(
+                f"    ↳ RETRY {code} {name} {day:%Y%m%d}: "
+                f"attempt={attempt}/{retries}, wait={wait:.1f}s, "
+                f"error={type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            time.sleep(max(0.0, wait))
+
+    return False, False
+
+
+def collect_single_code(args, token: str, end) -> int:
+    print(f"수집 시작: code={args.code}, start={args.start}, end={end}, limit={args.limit}")
+    collected = 0
+    failed = 0
+
+    for day in trading_dates(args.start, end):
+        try:
+            if collect_one_day(token, args.code, day, args.output_dir, args.limit):
+                collected += 1
+        except Exception as exc:
+            failed += 1
+            print(f"[{day:%Y%m%d}] 수집 실패: {type(exc).__name__}: {exc}", file=sys.stderr)
+        time.sleep(max(0.0, args.sleep_day))
+
+    print(f"수집 완료: {collected} 거래일, failed={failed}")
+    return 0 if failed == 0 else 2
+
+
+def collect_universe(args, token: str, end) -> int:
+    try:
+        rows = read_universe(args.universe)
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    if args.index != "all":
+        target_index = "KOSPI 200" if args.index == "kospi200" else "KOSDAQ 150"
+        rows = [row for row in rows if row["index"] == target_index]
+
+    if args.max_stocks is not None:
+        rows = rows[: args.max_stocks]
+
+    days = list(trading_dates(args.start, end))
+    if not rows:
+        print("수집할 종목이 없습니다.", file=sys.stderr)
+        return 1
+    if not days:
+        print("수집할 거래일이 없습니다.", file=sys.stderr)
+        return 1
+
+    total_jobs = len(rows) * len(days)
+    success = 0
+    skipped = 0
+    failed = 0
+    started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+
+    print(
+        f"대량 수집 시작: {started_at} | "
+        f"stocks={len(rows)}, days={len(days)}, jobs={total_jobs}"
+    )
+    print(f"유니버스: {args.universe}")
+    print(f"저장 루트: {args.output_dir}")
+
+    current_index = None
+    seen_codes: set[str] = set()
+
+    for stock_no, row in enumerate(rows, start=1):
+        if row["index"] != current_index:
+            current_index = row["index"]
+            print(f"\n===== {current_index} =====", flush=True)
+
+        if row["code"] in seen_codes:
+            print(
+                f"[{stock_no}/{len(rows)}] {row['code']} {row['name']} | "
+                "DUPLICATE CODE - skip",
+                flush=True,
+            )
+            continue
+        seen_codes.add(row["code"])
+
+        print(
+            f"[{stock_no}/{len(rows)}] {row['code']} {row['name']} | {row['index']}",
+            flush=True,
+        )
+
+        for day_no, day in enumerate(days, start=1):
+            ok, was_skipped = collect_with_retry(
+                token,
+                row,
+                day,
+                args.output_dir,
+                args.limit,
+                args.retries,
+                args.retry_sleep,
+                args.overwrite,
+            )
+            if ok:
+                if was_skipped:
+                    skipped += 1
+                else:
+                    success += 1
+            else:
+                failed += 1
+
+            if day_no < len(days):
+                time.sleep(max(0.0, args.sleep_day))
+
+        time.sleep(max(0.0, args.sleep_stock))
+
+    finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    print(
+        f"\n대량 수집 완료: {finished_at} | "
+        f"success={success}, skipped={skipped}, failed={failed}, jobs={total_jobs}"
+    )
+    return 0 if failed == 0 else 2
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Kiwoom ka10080 1분봉 수집기")
-    parser.add_argument("--code", required=True, help="종목코드 예: 005930")
+    parser = argparse.ArgumentParser(
+        description="Kiwoom ka10080 1분봉 수집기 (단일 종목 / all.csv 유니버스 일괄 수집)"
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--code", help="단일 종목코드 예: 005930")
+    group.add_argument(
+        "--universe",
+        nargs="?",
+        const=DEFAULT_UNIVERSE,
+        type=Path,
+        help="all.csv 기반 유니버스 일괄 수집. 값 생략 시 data/universe/all.csv",
+    )
     parser.add_argument("--start", required=True, type=parse_date, help="시작일 YYYYMMDD")
     parser.add_argument("--end", type=parse_date, help="종료일 YYYYMMDD")
+    parser.add_argument(
+        "--index",
+        choices=["all", "kospi200", "kosdaq150"],
+        default="all",
+        help="--universe에서 수집할 지수. 기본: all",
+    )
     parser.add_argument(
         "--limit",
         type=int,
@@ -132,11 +342,58 @@ def main() -> int:
         default=DEFAULT_OUTPUT_DIR,
         help="저장 루트 디렉터리",
     )
-    parser.add_argument("--sleep", type=float, default=0.5, help="날짜 간 요청 간격(초)")
+    parser.add_argument(
+        "--sleep",
+        dest="sleep_day",
+        type=float,
+        default=0.5,
+        help="날짜 간 요청 간격(초). 기존 단일 종목 옵션",
+    )
+    parser.add_argument(
+        "--sleep-day",
+        dest="sleep_day",
+        type=float,
+        help="--universe에서 날짜 간 요청 간격(초). --sleep과 동일 의미",
+    )
+    parser.add_argument(
+        "--sleep-stock",
+        type=float,
+        default=0.5,
+        help="--universe에서 종목 간 요청 간격(초). 기본 0.5",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=DEFAULT_RETRIES,
+        help="--universe에서 실패 재시도 횟수. 기본 3",
+    )
+    parser.add_argument(
+        "--retry-sleep",
+        type=float,
+        default=2.0,
+        help="재시도 대기시간 배수의 기준 초. 기본 2.0",
+    )
+    parser.add_argument(
+        "--max-stocks",
+        type=int,
+        help="--universe 테스트용 최대 종목 수",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="--universe에서 이미 존재하는 일별 CSV도 다시 수집",
+    )
     args = parser.parse_args()
 
     if args.limit < 1:
         parser.error("--limit은 1 이상이어야 합니다.")
+    if args.retries < 0:
+        parser.error("--retries는 0 이상이어야 합니다.")
+    if args.sleep_day < 0 or args.sleep_stock < 0 or args.retry_sleep < 0:
+        parser.error("sleep 관련 옵션은 0 이상이어야 합니다.")
+    if args.max_stocks is not None and args.max_stocks < 1:
+        parser.error("--max-stocks는 1 이상이어야 합니다.")
+
     end = args.end or args.start
     if end < args.start:
         parser.error("--end는 --start보다 빠를 수 없습니다.")
@@ -146,18 +403,9 @@ def main() -> int:
         print("Kiwoom token 발급/조회에 실패했습니다.", file=sys.stderr)
         return 1
 
-    print(f"수집 시작: code={args.code}, start={args.start}, end={end}, limit={args.limit}")
-    collected = 0
-    for day in trading_dates(args.start, end):
-        try:
-            if collect_one_day(token, args.code, day, args.output_dir, args.limit):
-                collected += 1
-        except Exception as exc:
-            print(f"[{day:%Y%m%d}] 수집 실패: {type(exc).__name__}: {exc}", file=sys.stderr)
-        time.sleep(max(0.0, args.sleep))
-
-    print(f"수집 완료: {collected} 거래일")
-    return 0
+    if args.code:
+        return collect_single_code(args, token, end)
+    return collect_universe(args, token, end)
 
 
 if __name__ == "__main__":
