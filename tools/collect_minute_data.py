@@ -21,6 +21,10 @@ DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "minute"
 DEFAULT_UNIVERSE = PROJECT_ROOT / "data" / "universe" / "all.csv"
 INDEX_ORDER = ("KOSPI 200", "KOSDAQ 150")
 DEFAULT_RETRIES = 3
+DEFAULT_SLEEP_DAY_SINGLE = 0.5
+DEFAULT_SLEEP_DAY_UNIVERSE = 1.0
+DEFAULT_SLEEP_STOCK = 1.0
+DEFAULT_RETRY_SLEEP = 5.0
 
 
 def parse_date(value: str):
@@ -346,21 +350,21 @@ def main() -> int:
         "--sleep",
         dest="sleep_day",
         type=float,
-        default=0.5,
-        help="날짜 간 요청 간격(초). 기존 단일 종목 옵션",
+        default=None,
+        help="날짜 간 요청 간격(초). 단일 종목 기본 0.5, 유니버스 기본 1.0",
     )
     parser.add_argument(
         "--sleep-day",
         dest="sleep_day",
         type=float,
         default=argparse.SUPPRESS,
-        help="--universe에서 날짜 간 요청 간격(초). --sleep보다 우선",
+        help="날짜 간 요청 간격(초). --sleep보다 우선",
     )
     parser.add_argument(
         "--sleep-stock",
         type=float,
-        default=0.5,
-        help="--universe에서 종목 간 요청 간격(초). 기본 0.5",
+        default=DEFAULT_SLEEP_STOCK,
+        help="--universe에서 종목 간 요청 간격(초). 기본 1.0",
     )
     parser.add_argument(
         "--retries",
@@ -371,8 +375,8 @@ def main() -> int:
     parser.add_argument(
         "--retry-sleep",
         type=float,
-        default=2.0,
-        help="재시도 대기시간 배수의 기준 초. 기본 2.0",
+        default=DEFAULT_RETRY_SLEEP,
+        help="재시도 대기시간 배수의 기준 초. 기본 5.0",
     )
     parser.add_argument(
         "--max-stocks",
@@ -385,6 +389,9 @@ def main() -> int:
         help="--universe에서 이미 존재하는 일별 CSV도 다시 수집",
     )
     args = parser.parse_args()
+
+    if args.sleep_day is None:
+        args.sleep_day = DEFAULT_SLEEP_DAY_SINGLE if args.code else DEFAULT_SLEEP_DAY_UNIVERSE
 
     if args.limit < 1:
         parser.error("--limit은 1 이상이어야 합니다.")
