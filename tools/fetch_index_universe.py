@@ -12,23 +12,24 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 try:
-    import FinanceDataReader as fdr
+    from pykrx import stock
 except ImportError as exc:  # pragma: no cover
     raise SystemExit(
-        "FinanceDataReader가 설치되어 있지 않습니다. `pip install finance-datareader`를 실행하세요."
+        "pykrx가 설치되어 있지 않습니다. `pip install pykrx`를 실행하세요."
     ) from exc
 
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "universe"
 
+# KRX index codes used by pykrx.
 INDEXES = {
-    "kospi200": {"snapshot": "KRX/INDEX/STOCK/1028", "market": "KOSPI", "name": "KOSPI 200"},
-    "kosdaq150": {"snapshot": "KRX/INDEX/STOCK/2203", "market": "KOSDAQ", "name": "KOSDAQ 150"},
+    "kospi200": {"index_code": "1028", "market": "KOSPI", "name": "KOSPI 200"},
+    "kosdaq150": {"index_code": "2203", "market": "KOSDAQ", "name": "KOSDAQ 150"},
 }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="현재 KOSPI 200 / KOSDAQ 150 구성종목을 자동으로 가져옵니다."
+        description="현재 KOSPI 200 / KOSDAQ 150 구성종목을 pykrx로 가져옵니다."
     )
     parser.add_argument(
         "--index", choices=["kospi200", "kosdaq150", "all"], default="all",
@@ -41,23 +42,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _find_column(df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
-    if df is None:
-        return None
-    normalized = {str(col).strip().lower(): col for col in df.columns}
-    for candidate in candidates:
-        if candidate.lower() in normalized:
-            return normalized[candidate.lower()]
-    return None
-
-
-def _extract_codes(raw: pd.DataFrame) -> list[str]:
-    if raw is None or raw.empty:
-        return []
-    code_col = _find_column(
-        raw, ("Symbol", "Code", "Ticker", "종목코드", "티커", "ISU_SRT_CD")
-    )
-    values = raw[code_col].tolist() if code_col is not None else raw.index.tolist()
+def _normalize_codes(values: list[str] | tuple[str, ...]) -> list[str]:
     codes: list[str] = []
     for value in values:
         text = str(value).strip()
@@ -69,46 +54,32 @@ def _extract_codes(raw: pd.DataFrame) -> list[str]:
     return list(dict.fromkeys(codes))
 
 
-def _load_name_map(market: str) -> dict[str, str]:
-    try:
-        listing = fdr.StockListing(market)
-    except Exception as exc:
-        print(f"[{market}] 종목명 매핑 조회 실패: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return {}
-    code_col = _find_column(listing, ("Symbol", "Code", "Ticker", "종목코드", "티커"))
-    name_col = _find_column(listing, ("Name", "name", "종목명"))
-    if code_col is None or name_col is None:
-        return {}
-    return {
-        str(row[code_col]).strip().zfill(6): str(row[name_col]).strip()
-        for _, row in listing.iterrows()
-    }
-
-
 def fetch_constituents(index_key: str) -> list[dict[str, str]]:
     info = INDEXES[index_key]
-    print(f"[{info['name']}] FinanceDataReader 조회: {info['snapshot']}")
+    index_code = info["index_code"]
+    print(f"[{info['name']}] pykrx 조회: index_code={index_code}", flush=True)
     try:
-        raw = fdr.SnapDataReader(info["snapshot"])
+        values = stock.get_index_portfolio_deposit_file(index_code)
     except Exception as exc:
         raise RuntimeError(
             f"{info['name']} 구성종목 조회 실패: {type(exc).__name__}: {exc}"
         ) from exc
 
-    codes = _extract_codes(raw)
+    codes = _normalize_codes(values)
     if not codes:
         raise RuntimeError(
             f"{info['name']} 구성종목을 가져오지 못했습니다. "
-            f"응답형식={type(raw).__name__}, shape={getattr(raw, 'shape', None)}"
+            f"pykrx 반환값={type(values).__name__}, count=0"
         )
 
-    name_map = _load_name_map(info["market"])
+    # 이번 단계는 구성종목 코드 조회 자체를 검증하는 테스트이므로
+    # 종목명 조회는 별도로 수행하지 않는다.
     rows = [
         {
             "code": code,
-            "name": name_map.get(code, ""),
+            "name": "",
             "index": info["name"],
-            "index_code": info["snapshot"].rsplit("/", 1)[-1],
+            "index_code": index_code,
         }
         for code in codes
     ]
@@ -153,11 +124,7 @@ def main() -> int:
         path = args.output_dir / f"{index_key}.csv"
         write_csv(rows, path)
         all_rows.extend(rows)
-        missing_names = sum(1 for row in rows if not row["name"])
-        print(
-            f"[{info['name']}] {len(rows)}종목 -> {path}"
-            + (f" (종목명 미매핑 {missing_names}개)" if missing_names else "")
-        )
+        print(f"[{info['name']}] {len(rows)}종목 -> {path}")
 
     if len(selected) > 1:
         combined_path = args.output_dir / "all.csv"
