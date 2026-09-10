@@ -77,6 +77,30 @@ def _normalize_codes(values: list[str] | tuple[str, ...]) -> list[str]:
     return list(dict.fromkeys(codes))
 
 
+def _fetch_stock_names(market: str, date: str | None = None) -> dict[str, str]:
+    """Fetch a single market-wide ticker->name map instead of one API call per stock."""
+    try:
+        tickers = stock.get_market_ticker_list(date=date, market=market)
+    except Exception as exc:
+        raise RuntimeError(
+            f"{market} 종목명 목록 조회 실패: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    names: dict[str, str] = {}
+    for ticker in _normalize_codes(tickers):
+        try:
+            name = stock.get_market_ticker_name(ticker)
+        except Exception as exc:
+            print(
+                f"[{market}] 종목명 조회 실패: {ticker}: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            continue
+        if name:
+            names[ticker] = str(name).strip()
+    return names
+
+
 def fetch_constituents(index_key: str, date: str | None = None) -> list[dict[str, str]]:
     info = INDEXES[index_key]
     index_code = info["index_code"]
@@ -99,13 +123,20 @@ def fetch_constituents(index_key: str, date: str | None = None) -> list[dict[str
             f"pykrx 반환값={type(values).__name__}, count=0"
         )
 
+    name_map = _fetch_stock_names(info["market"], date=date)
+    missing_names = [code for code in codes if code not in name_map]
+    if missing_names:
+        raise RuntimeError(
+            f"{info['name']} 구성종목 중 종목명을 확인하지 못한 종목이 "
+            f"{len(missing_names)}개 있습니다: {', '.join(missing_names[:10])}"
+            + (" ..." if len(missing_names) > 10 else "")
+        )
+
     rows = [
         {
             "code": code,
-            "name": "",
+            "name": name_map[code],
             "index": info["name"],
-            "index_code": index_code,
-            "as_of_date": date or "",
         }
         for code in codes
     ]
@@ -117,7 +148,7 @@ def write_csv(rows: list[dict[str, str]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(
         rows,
-        columns=["code", "name", "index", "index_code", "as_of_date"],
+        columns=["code", "name", "index"],
     ).to_csv(path, index=False, encoding="utf-8-sig")
 
 
