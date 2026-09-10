@@ -62,6 +62,8 @@ def _prepare_frame(frame: pd.DataFrame) -> pd.DataFrame:
     out = out.sort_values("datetime").drop_duplicates("datetime").reset_index(drop=True)
     if out.empty:
         raise ValueError("No valid OHLCV rows remain after normalization")
+    if out["code"].astype(str).nunique() != 1:
+        raise ValueError("run_backtest accepts exactly one stock code per run")
     return out
 
 
@@ -90,7 +92,6 @@ def run_backtest(
     quantity = 0
     entry_time: pd.Timestamp | None = None
     entry_price = 0.0
-    entry_gross = 0.0
     entry_fees = 0.0
     trades: list[Trade] = []
     equity_rows: list[dict] = []
@@ -99,7 +100,7 @@ def run_backtest(
     pending_index: int | None = None
 
     def execute(action: Action, index: int) -> None:
-        nonlocal cash, quantity, entry_time, entry_price, entry_gross, entry_fees
+        nonlocal cash, quantity, entry_time, entry_price, entry_fees
         bar = bars.iloc[index]
         price = float(bar["close"] if config.execution == "close" else bar["open"])
         timestamp = pd.Timestamp(bar["datetime"])
@@ -115,7 +116,6 @@ def run_backtest(
             quantity = max_qty
             entry_time = timestamp
             entry_price = execution_price
-            entry_gross = notional
             entry_fees = fees
             return
 
@@ -146,10 +146,21 @@ def run_backtest(
             quantity = 0
             entry_time = None
             entry_price = 0.0
-            entry_gross = 0.0
             entry_fees = 0.0
 
+    def force_close(index: int) -> None:
+        nonlocal pending, pending_index
+        pending = "HOLD"
+        pending_index = None
+        if quantity > 0:
+            execute("SELL", index)
+
     for i in range(len(bars)):
+        current_day = bars.iloc[i]["datetime"].date()
+        next_day = (
+            bars.iloc[i + 1]["datetime"].date() if i + 1 < len(bars) else None
+        )
+
         if pending_index is not None and pending_index == i:
             execute(pending, i)
             pending = "HOLD"
@@ -160,31 +171,49 @@ def run_backtest(
         if action not in {"BUY", "SELL", "HOLD"}:
             raise ValueError(f"Strategy returned invalid action: {action!r}")
 
+        is_day_end = next_day != current_day
         if config.execution == "close":
             execute(action, i)
-        elif i + 1 < len(bars):
+            if is_day_end and config.force_close_eod:
+                force_close(i)
+        elif not is_day_end:
             pending = action
             pending_index = i + 1
+        elif config.force_close_eod:
+            force_close(i)
+        else:
+            pending = "HOLD"
+            pending_index = None
 
         mark = cash + quantity * float(bars.iloc[i]["close"])
-        equity_rows.append({"datetime": bars.iloc[i]["datetime"], "equity": mark})
-
-    if quantity > 0 and config.force_close_eod:
-        execute("SELL", len(bars) - 1)
-        equity_rows[-1]["equity"] = cash
+        equity_rows.append(
+            {"datetime": bars.iloc[i]["datetime"], "equity": mark}
+        )
+        if is_day_end and quantity == 0:
+            equity_rows[-1]["equity"] = cash
 
     equity = pd.DataFrame(equity_rows)
     if equity.empty:
         equity = pd.DataFrame(columns=["datetime", "equity"])
     peak = equity["equity"].cummax() if not equity.empty else pd.Series(dtype=float)
-    drawdown = (equity["equity"] / peak - 1.0) * 100.0 if not equity.empty else pd.Series(dtype=float)
+    drawdown = (
+        (equity["equity"] / peak - 1.0) * 100.0
+        if not equity.empty
+        else pd.Series(dtype=float)
+    )
     max_dd = abs(float(drawdown.min())) if not drawdown.empty else 0.0
 
     wins = sum(t.net_pnl > 0 for t in trades)
     losses = sum(t.net_pnl < 0 for t in trades)
     gross_profit = sum(t.net_pnl for t in trades if t.net_pnl > 0)
     gross_loss = abs(sum(t.net_pnl for t in trades if t.net_pnl < 0))
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf") if gross_profit > 0 else 0.0
+    profit_factor = (
+        gross_profit / gross_loss
+        if gross_loss > 0
+        else float("inf")
+        if gross_profit > 0
+        else 0.0
+    )
 
     return BacktestResult(
         code=code,
