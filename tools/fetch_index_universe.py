@@ -21,7 +21,6 @@ except ImportError as exc:  # pragma: no cover
 
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "universe"
 
-# KRX index codes used by pykrx.
 INDEXES = {
     "kospi200": {"index_code": "1028", "market": "KOSPI", "name": "KOSPI 200"},
     "kosdaq150": {"index_code": "2203", "market": "KOSDAQ", "name": "KOSDAQ 150"},
@@ -36,7 +35,7 @@ def parse_args() -> argparse.Namespace:
         "--index",
         choices=["kospi200", "kosdaq150", "all"],
         default="all",
-        help="가져올 지수. 기본값: all",
+        help="가져올 지수. 기본값: all (KOSPI200 먼저, KOSDAQ150 다음)",
     )
     parser.add_argument(
         "--date",
@@ -65,8 +64,13 @@ def _validate_krx_credentials() -> None:
         )
 
 
-def _normalize_codes(values: list[str] | tuple[str, ...]) -> list[str]:
+def _normalize_codes(values) -> list[str]:
     codes: list[str] = []
+    if isinstance(values, pd.DataFrame):
+        values = values.index.tolist()
+    elif isinstance(values, pd.Series):
+        values = values.tolist()
+
     for value in values:
         text = str(value).strip()
         if text.endswith(".0"):
@@ -78,12 +82,12 @@ def _normalize_codes(values: list[str] | tuple[str, ...]) -> list[str]:
 
 
 def _fetch_stock_names(market: str, date: str | None = None) -> dict[str, str]:
-    """Fetch a single market-wide ticker->name map instead of one API call per stock."""
+    """Fetch the market ticker list, then map each ticker to its name."""
     try:
         tickers = stock.get_market_ticker_list(date=date, market=market)
     except Exception as exc:
         raise RuntimeError(
-            f"{market} 종목명 목록 조회 실패: {type(exc).__name__}: {exc}"
+            f"{market} 종목 목록 조회 실패: {type(exc).__name__}: {exc}"
         ) from exc
 
     names: dict[str, str] = {}
@@ -105,10 +109,11 @@ def fetch_constituents(index_key: str, date: str | None = None) -> list[dict[str
     info = INDEXES[index_key]
     index_code = info["index_code"]
     print(
-        f"[{info['name']}] pykrx 조회: index_code={index_code}"
+        f"[{info['name']}] 구성종목 수집 시작: index_code={index_code}"
         + (f", date={date}" if date else ""),
         flush=True,
     )
+
     try:
         values = stock.get_index_portfolio_deposit_file(index_code, date=date)
     except Exception as exc:
@@ -123,19 +128,14 @@ def fetch_constituents(index_key: str, date: str | None = None) -> list[dict[str
             f"pykrx 반환값={type(values).__name__}, count=0"
         )
 
+    print(f"[{info['name']}] 구성종목 코드 {len(codes)}개 확인")
+    print(f"[{info['name']}] 종목명 매핑 중...", flush=True)
     name_map = _fetch_stock_names(info["market"], date=date)
-    missing_names = [code for code in codes if code not in name_map]
-    if missing_names:
-        raise RuntimeError(
-            f"{info['name']} 구성종목 중 종목명을 확인하지 못한 종목이 "
-            f"{len(missing_names)}개 있습니다: {', '.join(missing_names[:10])}"
-            + (" ..." if len(missing_names) > 10 else "")
-        )
 
     rows = [
         {
             "code": code,
-            "name": name_map[code],
+            "name": name_map.get(code, ""),
             "index": info["name"],
         }
         for code in codes
@@ -146,23 +146,9 @@ def fetch_constituents(index_key: str, date: str | None = None) -> list[dict[str
 
 def write_csv(rows: list[dict[str, str]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(
-        rows,
-        columns=["code", "name", "index"],
-    ).to_csv(path, index=False, encoding="utf-8-sig")
-
-
-def write_combined(rows: list[dict[str, str]], path: Path) -> None:
-    grouped: dict[str, dict[str, str]] = {}
-    for row in rows:
-        code = row["code"]
-        if code not in grouped:
-            grouped[code] = dict(row)
-            continue
-        memberships = {x.strip() for x in grouped[code]["index"].split("|") if x.strip()}
-        memberships.add(row["index"])
-        grouped[code]["index"] = "|".join(sorted(memberships))
-    write_csv(sorted(grouped.values(), key=lambda row: row["code"]), path)
+    pd.DataFrame(rows, columns=["code", "name", "index"]).to_csv(
+        path, index=False, encoding="utf-8-sig"
+    )
 
 
 def main() -> int:
@@ -173,13 +159,13 @@ def main() -> int:
         print(f"[KRX 인증 필요] {exc}", file=sys.stderr)
         return 2
 
-    selected = list(INDEXES) if args.index == "all" else [args.index]
+    selected = ["kospi200", "kosdaq150"] if args.index == "all" else [args.index]
     retrieved_at = datetime.now().astimezone().isoformat(timespec="seconds")
-    all_rows: list[dict[str, str]] = []
     print(f"지수 구성종목 수집 시작: {retrieved_at}")
 
-    for index_key in selected:
+    for order, index_key in enumerate(selected, start=1):
         info = INDEXES[index_key]
+        print(f"\n===== {order}/{len(selected)}: {info['name']} =====")
         try:
             rows = fetch_constituents(index_key, args.date)
         except Exception as exc:
@@ -191,16 +177,13 @@ def main() -> int:
 
         path = args.output_dir / f"{index_key}.csv"
         write_csv(rows, path)
-        all_rows.extend(rows)
-        print(f"[{info['name']}] {len(rows)}종목 -> {path}")
+        missing_names = sum(1 for row in rows if not row["name"])
+        print(
+            f"[{info['name']}] {len(rows)}종목 -> {path}"
+            + (f" (종목명 미매핑 {missing_names}개)" if missing_names else "")
+        )
 
-    if len(selected) > 1:
-        combined_path = args.output_dir / "all.csv"
-        write_combined(all_rows, combined_path)
-        unique_codes = len({row["code"] for row in all_rows})
-        print(f"[ALL] {unique_codes}개 고유 종목 -> {combined_path}")
-
-    print(f"완료: {retrieved_at}")
+    print("\n수집 완료: KOSPI200과 KOSDAQ150을 각각 별도 CSV로 저장했습니다.")
     return 0
 
 
