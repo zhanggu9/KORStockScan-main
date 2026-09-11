@@ -4503,7 +4503,7 @@ def fetch_kiwoom_api_continuous(
             meta["continuous_page_limit_reached"] = True
             break
         
-        # time.sleep(0.5)  # 연속조회 시 서버 배려를 위한 딜레이(실전서버)
+        # time.sleep(0.25)  # 연속조회 시 서버 배려를 위한 딜레이(실전서버)
         # time.sleep(1.2)  # 연속조회 시 서버 배려를 위한 딜레이(모의투자서버)
 
         # 실전 서버: ka10080 분봉 연속조회는 더 빠르게,
