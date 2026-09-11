@@ -72,6 +72,7 @@ def collect_one_day(token: str, code: str, day, output_dir: Path, limit: int) ->
         code,
         limit=limit,
         base_dt=base_dt,
+        explicit_request_code=True,
     )
 
     normalized = [normalize_row(code, row, base_dt) for row in rows]
