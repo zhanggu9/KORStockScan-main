@@ -235,6 +235,15 @@ def collect_universe(args, token: str, end) -> int:
         target_index = "KOSPI 200" if args.index == "kospi200" else "KOSDAQ 150"
         rows = [row for row in rows if row["index"] == target_index]
 
+    if args.start_stock is not None:
+        if args.start_stock > len(rows):
+            print(
+                f"--start-stock={args.start_stock}가 현재 유니버스 종목 수({len(rows)})를 초과합니다.",
+                file=sys.stderr,
+            )
+            return 1
+        rows = rows[args.start_stock - 1 :]
+
     if args.max_stocks is not None:
         rows = rows[: args.max_stocks]
 
@@ -256,6 +265,8 @@ def collect_universe(args, token: str, end) -> int:
         f"대량 수집 시작: {started_at} | "
         f"stocks={len(rows)}, days={len(days)}, jobs={total_jobs}"
     )
+    if args.start_stock is not None:
+        print(f"시작 종목 순번: {args.start_stock}")
     print(f"유니버스: {args.universe}")
     print(f"저장 루트: {args.output_dir}")
 
@@ -263,21 +274,23 @@ def collect_universe(args, token: str, end) -> int:
     seen_codes: set[str] = set()
 
     for stock_no, row in enumerate(rows, start=1):
+        display_stock_no = stock_no + (args.start_stock - 1 if args.start_stock is not None else 0)
         if row["index"] != current_index:
             current_index = row["index"]
             print(f"\n===== {current_index} =====", flush=True)
 
         if row["code"] in seen_codes:
             print(
-                f"[{stock_no}/{len(rows)}] {row['code']} {row['name']} | "
+                f"[{display_stock_no}/{display_stock_no + len(rows) - stock_no}] {row['code']} {row['name']} | "
                 "DUPLICATE CODE - skip",
                 flush=True,
             )
             continue
         seen_codes.add(row["code"])
 
+        total_stock_count = len(rows) + (args.start_stock - 1 if args.start_stock is not None else 0)
         print(
-            f"[{stock_no}/{len(rows)}] {row['code']} {row['name']} | {row['index']}",
+            f"[{display_stock_no}/{total_stock_count}] {row['code']} {row['name']} | {row['index']}",
             flush=True,
         )
 
@@ -387,6 +400,11 @@ def main() -> int:
         help="--universe 테스트용 최대 종목 수",
     )
     parser.add_argument(
+        "--start-stock",
+        type=int,
+        help="--universe에서 필터링된 종목 목록의 1-based 시작 순번. 예: 53이면 53번째 종목부터 수집",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="--universe에서 이미 존재하는 일별 CSV도 다시 수집",
@@ -404,6 +422,10 @@ def main() -> int:
         parser.error("sleep 관련 옵션은 0 이상이어야 합니다.")
     if args.max_stocks is not None and args.max_stocks < 1:
         parser.error("--max-stocks는 1 이상이어야 합니다.")
+    if args.start_stock is not None and args.start_stock < 1:
+        parser.error("--start-stock은 1 이상이어야 합니다.")
+    if args.start_stock is not None and args.code:
+        parser.error("--start-stock은 --universe에서만 사용할 수 있습니다.")
 
     end = args.end or args.start
     if end < args.start:
