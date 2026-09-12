@@ -17,6 +17,7 @@ from src.backtest.strategies import (  # noqa: E402
     ema_cross_strategy,
     one_minute_scalping_proxy_strategy,
 )
+from src.backtest.trend_scalping import trend_scalping_strategy  # noqa: E402
 
 
 def parse_date(value: str):
@@ -82,6 +83,19 @@ def result_row(result):
 def build_strategy(args):
     if args.strategy == "ema":
         return ema_cross_strategy(args.fast, args.slow)
+    if args.strategy == "trend_scalping":
+        return trend_scalping_strategy(
+            fast_ema=args.trend_fast_ema,
+            slow_ema=args.trend_slow_ema,
+            trend_ema=args.trend_ema,
+            slope_bars=args.slope_bars,
+            rsi_period=args.trend_rsi_period,
+            rsi_min=args.rsi_min,
+            rsi_max=args.rsi_max,
+            volume_multiplier=args.trend_volume_multiplier,
+            pullback_pct=args.pullback_pct,
+            sell_rsi=args.trend_sell_rsi,
+        )
     return one_minute_scalping_proxy_strategy(
         rsi_period=args.rsi_period,
         rsi_buy=args.rsi_buy,
@@ -100,7 +114,6 @@ def build_trade_details(
     rsi_period: int,
     average_window: int,
 ) -> pd.DataFrame:
-    """Create one row per trade with signal-time and post-entry statistics."""
     if not result.trades:
         return pd.DataFrame()
 
@@ -117,16 +130,11 @@ def build_trade_details(
 
     rows: list[dict] = []
     for trade_no, trade in enumerate(result.trades, start=1):
-        entry_positions = bars.index[
-            bars["datetime"] == pd.Timestamp(trade.entry_time)
-        ].tolist()
+        entry_positions = bars.index[bars["datetime"] == pd.Timestamp(trade.entry_time)].tolist()
         if not entry_positions:
             continue
         entry_idx = entry_positions[0]
-
-        exit_positions = bars.index[
-            bars["datetime"] == pd.Timestamp(trade.exit_time)
-        ].tolist()
+        exit_positions = bars.index[bars["datetime"] == pd.Timestamp(trade.exit_time)].tolist()
         exit_idx = exit_positions[0] if exit_positions else entry_idx
         if exit_idx < entry_idx:
             exit_idx = entry_idx
@@ -136,22 +144,18 @@ def build_trade_details(
         min_low = float(trade_bars["low"].min())
         mfe_pct = (max_high / trade.entry_price - 1.0) * 100.0
         mae_pct = (min_low / trade.entry_price - 1.0) * 100.0
-        holding_minutes = (
-            pd.Timestamp(trade.exit_time) - pd.Timestamp(trade.entry_time)
-        ).total_seconds() / 60.0
+        holding_minutes = (pd.Timestamp(trade.exit_time) - pd.Timestamp(trade.entry_time)).total_seconds() / 60.0
 
         signal_time = pd.NaT
         signal_close = float("nan")
         signal_rsi = float("nan")
         volume_ratio = float("nan")
         price_distance_pct = float("nan")
-
         if entry_idx > 0:
             signal_idx = entry_idx - 1
             signal_time = pd.Timestamp(bars.iloc[signal_idx]["datetime"])
             signal_close = float(bars.iloc[signal_idx]["close"])
-
-            if strategy_name == "scalping_proxy":
+            if strategy_name in {"scalping_proxy", "trend_scalping"}:
                 history = bars.iloc[: signal_idx + 1]
                 closes = history["close"]
                 volumes = history["volume"]
@@ -166,31 +170,28 @@ def build_trade_details(
                     if avg_volume > 0:
                         volume_ratio = float(bars.iloc[signal_idx]["volume"]) / avg_volume
 
-        rows.append(
-            {
-                "trade_no": trade_no,
-                "code": trade.code,
-                "signal_time": signal_time,
-                "entry_time": trade.entry_time,
-                "entry_price": trade.entry_price,
-                "exit_time": trade.exit_time,
-                "exit_price": trade.exit_price,
-                "quantity": trade.quantity,
-                "holding_minutes": holding_minutes,
-                "gross_pnl": trade.gross_pnl,
-                "fees": trade.fees,
-                "net_pnl": trade.net_pnl,
-                "return_pct": trade.return_pct,
-                "signal_close": signal_close,
-                "signal_rsi": signal_rsi,
-                "signal_volume_ratio": volume_ratio,
-                "signal_price_distance_pct": price_distance_pct,
-                "max_favorable_excursion_pct": mfe_pct,
-                "max_adverse_excursion_pct": mae_pct,
-                "result": "WIN" if trade.net_pnl > 0 else "LOSS" if trade.net_pnl < 0 else "FLAT",
-            }
-        )
-
+        rows.append({
+            "trade_no": trade_no,
+            "code": trade.code,
+            "signal_time": signal_time,
+            "entry_time": trade.entry_time,
+            "entry_price": trade.entry_price,
+            "exit_time": trade.exit_time,
+            "exit_price": trade.exit_price,
+            "quantity": trade.quantity,
+            "holding_minutes": holding_minutes,
+            "gross_pnl": trade.gross_pnl,
+            "fees": trade.fees,
+            "net_pnl": trade.net_pnl,
+            "return_pct": trade.return_pct,
+            "signal_close": signal_close,
+            "signal_rsi": signal_rsi,
+            "signal_volume_ratio": volume_ratio,
+            "signal_price_distance_pct": price_distance_pct,
+            "max_favorable_excursion_pct": mfe_pct,
+            "max_adverse_excursion_pct": mae_pct,
+            "result": "WIN" if trade.net_pnl > 0 else "LOSS" if trade.net_pnl < 0 else "FLAT",
+        })
     return pd.DataFrame(rows)
 
 
@@ -214,21 +215,11 @@ def save_single_outputs(args, frame, result, file_count, code: str):
     trades_path = args.output_dir / f"{prefix}_trades.csv"
     trade_details_path = args.output_dir / f"{prefix}_trade_details.csv"
     equity_path = args.output_dir / f"{prefix}_equity.csv"
-
     pd.DataFrame([result_row(result)]).to_csv(summary_path, index=False, encoding="utf-8-sig")
-    pd.DataFrame([t.__dict__ for t in result.trades]).to_csv(
-        trades_path, index=False, encoding="utf-8-sig"
-    )
-    trade_details = build_trade_details(
-        frame,
-        result,
-        strategy_name=args.strategy,
-        rsi_period=args.rsi_period,
-        average_window=args.average_window,
-    )
+    pd.DataFrame([t.__dict__ for t in result.trades]).to_csv(trades_path, index=False, encoding="utf-8-sig")
+    trade_details = build_trade_details(frame, result, strategy_name=args.strategy, rsi_period=args.rsi_period, average_window=args.average_window)
     trade_details.to_csv(trade_details_path, index=False, encoding="utf-8-sig")
     result.equity_curve.to_csv(equity_path, index=False)
-
     return summary_path, trade_details_path
 
 
@@ -246,7 +237,6 @@ def print_result(args, result, file_count, code: str):
 
 def print_diagnostics(args, frame):
     from src.backtest.strategies import diagnose_one_minute_scalping_proxy
-
     diagnostics = diagnose_one_minute_scalping_proxy(
         frame,
         rsi_period=args.rsi_period,
@@ -282,7 +272,7 @@ def main() -> int:
     parser.add_argument("--initial-cash", type=float, default=10_000_000.0)
     parser.add_argument("--fee-bps", type=float, default=15.0)
     parser.add_argument("--slippage-bps", type=float, default=5.0)
-    parser.add_argument("--strategy", choices=["scalping_proxy", "ema"], default="scalping_proxy")
+    parser.add_argument("--strategy", choices=["scalping_proxy", "trend_scalping", "ema"], default="scalping_proxy")
     parser.add_argument("--fast", type=int, default=5)
     parser.add_argument("--slow", type=int, default=20)
     parser.add_argument("--rsi-period", type=int, default=14)
@@ -291,6 +281,16 @@ def main() -> int:
     parser.add_argument("--volume-multiplier", type=float, default=2.5)
     parser.add_argument("--average-window", type=int, default=3)
     parser.add_argument("--price-distance-pct", type=float, default=2.0)
+    parser.add_argument("--trend-fast-ema", type=int, default=5)
+    parser.add_argument("--trend-slow-ema", type=int, default=20)
+    parser.add_argument("--trend-ema", type=int, default=60)
+    parser.add_argument("--slope-bars", type=int, default=3)
+    parser.add_argument("--trend-rsi-period", type=int, default=14)
+    parser.add_argument("--rsi-min", type=float, default=55.0)
+    parser.add_argument("--rsi-max", type=float, default=78.0)
+    parser.add_argument("--trend-volume-multiplier", type=float, default=1.5)
+    parser.add_argument("--pullback-pct", type=float, default=0.8)
+    parser.add_argument("--trend-sell-rsi", type=float, default=45.0)
     parser.add_argument("--diagnostics", action="store_true")
     parser.add_argument("--execution", choices=["next_open", "close"], default="next_open")
     args = parser.parse_args()
@@ -313,7 +313,6 @@ def main() -> int:
         except Exception as exc:
             print(f"백테스트 실패: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 2
-
         print_result(args, result, file_count, args.code)
         if args.diagnostics and args.strategy == "scalping_proxy":
             print_diagnostics(args, frame)
@@ -327,16 +326,11 @@ def main() -> int:
         print(f"유니버스 로드 실패: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
 
-    print(
-        f"일괄 백테스트 시작: {args.start:%Y%m%d} ~ {args.end:%Y%m%d} | "
-        f"stocks={len(universe)}"
-    )
+    print(f"일괄 백테스트 시작: {args.start:%Y%m%d} ~ {args.end:%Y%m%d} | stocks={len(universe)}")
     print(f"유니버스: {args.universe_file}")
-
     rows: list[dict] = []
     skipped = 0
     failed = 0
-
     for n, item in enumerate(universe.itertuples(index=False), start=1):
         code = str(item.code).zfill(6)
         name = str(item.name)
@@ -352,33 +346,20 @@ def main() -> int:
             print(f"    ↳ FAIL: {type(exc).__name__}: {exc}")
             failed += 1
             continue
-
         row = result_row(result)
         row.update({"name": name, "index": index_name, "files": file_count})
         rows.append(row)
-        print(
-            f"    ↳ return={result.equity_return_pct:.2f}% | "
-            f"MDD={result.max_drawdown_pct:.2f}% | trades={result.total_trades} | "
-            f"win={result.win_rate_pct:.2f}% | PF={result.profit_factor:.3f}"
-        )
+        print(f"    ↳ return={result.equity_return_pct:.2f}% | MDD={result.max_drawdown_pct:.2f}% | trades={result.total_trades} | win={result.win_rate_pct:.2f}% | PF={result.profit_factor:.3f}")
 
     if not rows:
         print("일괄 백테스트 결과가 없습니다.", file=sys.stderr)
         return 2
 
     result_frame = pd.DataFrame(rows)
-    result_frame = result_frame[
-        [
-            "code", "name", "index", "files", "initial_cash", "final_cash",
-            "equity_return_pct", "max_drawdown_pct", "total_trades",
-            "winning_trades", "losing_trades", "win_rate_pct", "profit_factor",
-        ]
-    ].sort_values("equity_return_pct", ascending=False)
-
+    result_frame = result_frame[["code", "name", "index", "files", "initial_cash", "final_cash", "equity_return_pct", "max_drawdown_pct", "total_trades", "winning_trades", "losing_trades", "win_rate_pct", "profit_factor"]].sort_values("equity_return_pct", ascending=False)
     prefix = f"universe_{args.start:%Y%m%d}_{args.end:%Y%m%d}_{args.strategy}"
     output_path = args.output_dir / f"{prefix}_summary.csv"
     result_frame.to_csv(output_path, index=False, encoding="utf-8-sig")
-
     profitable = int((result_frame["equity_return_pct"] > 0).sum())
     pf_positive = int((result_frame["profit_factor"] > 1).sum())
     print("\n===== 일괄 백테스트 완료 =====")
@@ -389,11 +370,7 @@ def main() -> int:
     print(f"중앙값 수익률: {result_frame['equity_return_pct'].median():.2f}%")
     print(f"결과: {output_path}")
     print("\n[수익률 상위 10]")
-    print(
-        result_frame[["code", "name", "index", "equity_return_pct", "max_drawdown_pct", "total_trades", "win_rate_pct", "profit_factor"]]
-        .head(10)
-        .to_string(index=False)
-    )
+    print(result_frame[["code", "name", "index", "equity_return_pct", "max_drawdown_pct", "total_trades", "win_rate_pct", "profit_factor"]].head(10).to_string(index=False))
     return 0
 
 
