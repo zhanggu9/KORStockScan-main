@@ -13,7 +13,8 @@ SignalFn = Callable[[pd.Series, pd.DataFrame], Action]
 class BacktestConfig:
     initial_cash: float = 10_000_000.0
     fee_bps: float = 15.0
-    slippage_bps: float = 5.0
+    entry_slippage_bps: float = 0.0
+    exit_slippage_bps: float = 5.0
     execution: Literal["next_open", "close"] = "next_open"
     force_close_eod: bool = True
 
@@ -28,6 +29,7 @@ class Trade:
     quantity: int
     gross_pnl: float
     fees: float
+    slippage_cost: float
     net_pnl: float
     return_pct: float
 
@@ -67,11 +69,11 @@ def _prepare_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _buy_price(raw_price: float, slippage_bps: float) -> float:
+def _apply_buy_slippage(raw_price: float, slippage_bps: float) -> float:
     return raw_price * (1.0 + slippage_bps / 10_000.0)
 
 
-def _sell_price(raw_price: float, slippage_bps: float) -> float:
+def _apply_sell_slippage(raw_price: float, slippage_bps: float) -> float:
     return raw_price * (1.0 - slippage_bps / 10_000.0)
 
 
@@ -85,6 +87,9 @@ def run_backtest(
     config: BacktestConfig | None = None,
 ) -> BacktestResult:
     config = config or BacktestConfig()
+    if config.fee_bps < 0 or config.entry_slippage_bps < 0 or config.exit_slippage_bps < 0:
+        raise ValueError("fee/slippage values must be >= 0")
+
     bars = _prepare_frame(frame)
     code = str(bars["code"].iloc[0])
 
@@ -93,6 +98,7 @@ def run_backtest(
     entry_time: pd.Timestamp | None = None
     entry_price = 0.0
     entry_fees = 0.0
+    entry_slippage_cost = 0.0
     trades: list[Trade] = []
     equity_rows: list[dict] = []
 
@@ -100,13 +106,13 @@ def run_backtest(
     pending_index: int | None = None
 
     def execute(action: Action, index: int) -> None:
-        nonlocal cash, quantity, entry_time, entry_price, entry_fees
+        nonlocal cash, quantity, entry_time, entry_price, entry_fees, entry_slippage_cost
         bar = bars.iloc[index]
-        price = float(bar["close"] if config.execution == "close" else bar["open"])
+        raw_price = float(bar["close"] if config.execution == "close" else bar["open"])
         timestamp = pd.Timestamp(bar["datetime"])
 
         if action == "BUY" and quantity == 0:
-            execution_price = _buy_price(price, config.slippage_bps)
+            execution_price = _apply_buy_slippage(raw_price, config.entry_slippage_bps)
             max_qty = int(cash / (execution_price * (1.0 + config.fee_bps / 10_000.0)))
             if max_qty <= 0:
                 return
@@ -117,14 +123,17 @@ def run_backtest(
             entry_time = timestamp
             entry_price = execution_price
             entry_fees = fees
+            entry_slippage_cost = abs(execution_price - raw_price) * max_qty
             return
 
         if action == "SELL" and quantity > 0:
-            execution_price = _sell_price(price, config.slippage_bps)
+            execution_price = _apply_sell_slippage(raw_price, config.exit_slippage_bps)
             notional = execution_price * quantity
             fees = _fee(notional, config.fee_bps)
             cash += notional - fees
             gross_pnl = (execution_price - entry_price) * quantity
+            exit_slippage_cost = abs(raw_price - execution_price) * quantity
+            total_slippage_cost = entry_slippage_cost + exit_slippage_cost
             total_fees = entry_fees + fees
             net_pnl = gross_pnl - total_fees
             invested = entry_price * quantity + entry_fees
@@ -139,6 +148,7 @@ def run_backtest(
                     quantity=quantity,
                     gross_pnl=gross_pnl,
                     fees=total_fees,
+                    slippage_cost=total_slippage_cost,
                     net_pnl=net_pnl,
                     return_pct=return_pct,
                 )
@@ -147,6 +157,7 @@ def run_backtest(
             entry_time = None
             entry_price = 0.0
             entry_fees = 0.0
+            entry_slippage_cost = 0.0
 
     def force_close(index: int) -> None:
         nonlocal pending, pending_index
@@ -157,9 +168,7 @@ def run_backtest(
 
     for i in range(len(bars)):
         current_day = bars.iloc[i]["datetime"].date()
-        next_day = (
-            bars.iloc[i + 1]["datetime"].date() if i + 1 < len(bars) else None
-        )
+        next_day = bars.iloc[i + 1]["datetime"].date() if i + 1 < len(bars) else None
 
         if pending_index is not None and pending_index == i:
             execute(pending, i)
@@ -186,9 +195,7 @@ def run_backtest(
             pending_index = None
 
         mark = cash + quantity * float(bars.iloc[i]["close"])
-        equity_rows.append(
-            {"datetime": bars.iloc[i]["datetime"], "equity": mark}
-        )
+        equity_rows.append({"datetime": bars.iloc[i]["datetime"], "equity": mark})
         if is_day_end and quantity == 0:
             equity_rows[-1]["equity"] = cash
 
@@ -196,24 +203,14 @@ def run_backtest(
     if equity.empty:
         equity = pd.DataFrame(columns=["datetime", "equity"])
     peak = equity["equity"].cummax() if not equity.empty else pd.Series(dtype=float)
-    drawdown = (
-        (equity["equity"] / peak - 1.0) * 100.0
-        if not equity.empty
-        else pd.Series(dtype=float)
-    )
+    drawdown = (equity["equity"] / peak - 1.0) * 100.0 if not equity.empty else pd.Series(dtype=float)
     max_dd = abs(float(drawdown.min())) if not drawdown.empty else 0.0
 
     wins = sum(t.net_pnl > 0 for t in trades)
     losses = sum(t.net_pnl < 0 for t in trades)
     gross_profit = sum(t.net_pnl for t in trades if t.net_pnl > 0)
     gross_loss = abs(sum(t.net_pnl for t in trades if t.net_pnl < 0))
-    profit_factor = (
-        gross_profit / gross_loss
-        if gross_loss > 0
-        else float("inf")
-        if gross_profit > 0
-        else 0.0
-    )
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
 
     return BacktestResult(
         code=code,
