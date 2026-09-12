@@ -15,6 +15,8 @@ class BacktestConfig:
     fee_bps: float = 15.0
     entry_slippage_bps: float = 0.0
     exit_slippage_bps: float = 5.0
+    # Backward-compatible CLI/config alias. When supplied, it means exit slippage.
+    slippage_bps: float | None = None
     execution: Literal["next_open", "close"] = "next_open"
     force_close_eod: bool = True
 
@@ -55,7 +57,6 @@ def _prepare_frame(frame: pd.DataFrame) -> pd.DataFrame:
     missing = required.difference(frame.columns)
     if missing:
         raise ValueError(f"Missing OHLCV columns: {sorted(missing)}")
-
     out = frame.copy()
     out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
     for col in ["open", "high", "low", "close", "volume"]:
@@ -81,13 +82,16 @@ def _fee(notional: float, fee_bps: float) -> float:
     return notional * fee_bps / 10_000.0
 
 
-def run_backtest(
-    frame: pd.DataFrame,
-    strategy: SignalFn,
-    config: BacktestConfig | None = None,
-) -> BacktestResult:
+def run_backtest(frame: pd.DataFrame, strategy: SignalFn, config: BacktestConfig | None = None) -> BacktestResult:
     config = config or BacktestConfig()
-    if config.fee_bps < 0 or config.entry_slippage_bps < 0 or config.exit_slippage_bps < 0:
+    if config.slippage_bps is not None:
+        if config.slippage_bps < 0:
+            raise ValueError("slippage_bps must be >= 0")
+        exit_slippage_bps = config.slippage_bps
+    else:
+        exit_slippage_bps = config.exit_slippage_bps
+
+    if config.fee_bps < 0 or config.entry_slippage_bps < 0 or exit_slippage_bps < 0:
         raise ValueError("fee/slippage values must be >= 0")
 
     bars = _prepare_frame(frame)
@@ -127,7 +131,7 @@ def run_backtest(
             return
 
         if action == "SELL" and quantity > 0:
-            execution_price = _apply_sell_slippage(raw_price, config.exit_slippage_bps)
+            execution_price = _apply_sell_slippage(raw_price, exit_slippage_bps)
             notional = execution_price * quantity
             fees = _fee(notional, config.fee_bps)
             cash += notional - fees
