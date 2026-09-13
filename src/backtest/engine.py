@@ -15,10 +15,14 @@ class BacktestConfig:
     fee_bps: float = 15.0
     entry_slippage_bps: float = 0.0
     exit_slippage_bps: float = 5.0
-    # Backward-compatible CLI/config alias. When supplied, it means exit slippage.
     slippage_bps: float | None = None
     execution: Literal["next_open", "close"] = "next_open"
     force_close_eod: bool = True
+    atr_period: int | None = None
+    stop_atr: float | None = None
+    target_atr: float | None = None
+    trailing_atr: float | None = None
+    max_hold_bars: int | None = None
 
 
 @dataclass
@@ -34,6 +38,7 @@ class Trade:
     slippage_cost: float
     net_pnl: float
     return_pct: float
+    exit_reason: str = "SIGNAL"
 
 
 @dataclass
@@ -70,6 +75,19 @@ def _prepare_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _atr(frame: pd.DataFrame, period: int) -> pd.Series:
+    prev_close = frame["close"].shift(1)
+    true_range = pd.concat(
+        [
+            frame["high"] - frame["low"],
+            (frame["high"] - prev_close).abs(),
+            (frame["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return true_range.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+
+
 def _apply_buy_slippage(raw_price: float, slippage_bps: float) -> float:
     return raw_price * (1.0 + slippage_bps / 10_000.0)
 
@@ -84,17 +102,14 @@ def _fee(notional: float, fee_bps: float) -> float:
 
 def run_backtest(frame: pd.DataFrame, strategy: SignalFn, config: BacktestConfig | None = None) -> BacktestResult:
     config = config or BacktestConfig()
-    if config.slippage_bps is not None:
-        if config.slippage_bps < 0:
-            raise ValueError("slippage_bps must be >= 0")
-        exit_slippage_bps = config.slippage_bps
-    else:
-        exit_slippage_bps = config.exit_slippage_bps
-
-    if config.fee_bps < 0 or config.entry_slippage_bps < 0 or exit_slippage_bps < 0:
+    exit_slippage_bps = config.slippage_bps if config.slippage_bps is not None else config.exit_slippage_bps
+    if exit_slippage_bps < 0 or config.fee_bps < 0 or config.entry_slippage_bps < 0:
         raise ValueError("fee/slippage values must be >= 0")
+    if any(v is not None and v <= 0 for v in [config.atr_period, config.stop_atr, config.target_atr, config.trailing_atr, config.max_hold_bars]):
+        raise ValueError("risk parameters must be > 0 when provided")
 
     bars = _prepare_frame(frame)
+    atr_series = _atr(bars, config.atr_period) if config.atr_period else pd.Series(float("nan"), index=bars.index)
     code = str(bars["code"].iloc[0])
 
     cash = float(config.initial_cash)
@@ -103,14 +118,18 @@ def run_backtest(frame: pd.DataFrame, strategy: SignalFn, config: BacktestConfig
     entry_price = 0.0
     entry_fees = 0.0
     entry_slippage_cost = 0.0
+    entry_atr: float | None = None
+    highest_high = 0.0
+    hold_bars = 0
     trades: list[Trade] = []
     equity_rows: list[dict] = []
 
     pending: Action = "HOLD"
     pending_index: int | None = None
 
-    def execute(action: Action, index: int) -> None:
+    def execute(action: Action, index: int, reason: str = "SIGNAL") -> None:
         nonlocal cash, quantity, entry_time, entry_price, entry_fees, entry_slippage_cost
+        nonlocal entry_atr, highest_high, hold_bars
         bar = bars.iloc[index]
         raw_price = float(bar["close"] if config.execution == "close" else bar["open"])
         timestamp = pd.Timestamp(bar["datetime"])
@@ -128,6 +147,10 @@ def run_backtest(frame: pd.DataFrame, strategy: SignalFn, config: BacktestConfig
             entry_price = execution_price
             entry_fees = fees
             entry_slippage_cost = abs(execution_price - raw_price) * max_qty
+            atr_value = float(atr_series.iloc[index]) if not pd.isna(atr_series.iloc[index]) else None
+            entry_atr = atr_value
+            highest_high = float(bar["high"])
+            hold_bars = 0
             return
 
         if action == "SELL" and quantity > 0:
@@ -155,6 +178,7 @@ def run_backtest(frame: pd.DataFrame, strategy: SignalFn, config: BacktestConfig
                     slippage_cost=total_slippage_cost,
                     net_pnl=net_pnl,
                     return_pct=return_pct,
+                    exit_reason=reason,
                 )
             )
             quantity = 0
@@ -162,13 +186,47 @@ def run_backtest(frame: pd.DataFrame, strategy: SignalFn, config: BacktestConfig
             entry_price = 0.0
             entry_fees = 0.0
             entry_slippage_cost = 0.0
+            entry_atr = None
+            highest_high = 0.0
+            hold_bars = 0
 
-    def force_close(index: int) -> None:
-        nonlocal pending, pending_index
-        pending = "HOLD"
-        pending_index = None
-        if quantity > 0:
-            execute("SELL", index)
+    def risk_exit(index: int) -> bool:
+        nonlocal highest_high, hold_bars
+        if quantity <= 0:
+            return False
+        bar = bars.iloc[index]
+        highest_high = max(highest_high, float(bar["high"]))
+        hold_bars += 1
+        atr = entry_atr
+        stop_price = None
+        target_price = None
+        trail_price = None
+        if atr is not None:
+            if config.stop_atr is not None:
+                stop_price = entry_price - atr * config.stop_atr
+            if config.target_atr is not None:
+                target_price = entry_price + atr * config.target_atr
+            if config.trailing_atr is not None:
+                trail_price = highest_high - atr * config.trailing_atr
+
+        low = float(bar["low"])
+        high = float(bar["high"])
+        close = float(bar["close"])
+        # Conservative intrabar rule: when stop and target are both touched,
+        # assume the stop was hit first because OHLC does not reveal tick order.
+        if stop_price is not None and low <= stop_price:
+            execute("SELL", index, "ATR_STOP")
+            return True
+        if target_price is not None and high >= target_price:
+            execute("SELL", index, "ATR_TARGET")
+            return True
+        if trail_price is not None and low <= trail_price and highest_high > entry_price:
+            execute("SELL", index, "ATR_TRAILING")
+            return True
+        if config.max_hold_bars is not None and hold_bars >= config.max_hold_bars:
+            execute("SELL", index, "TIME_STOP")
+            return True
+        return False
 
     for i in range(len(bars)):
         current_day = bars.iloc[i]["datetime"].date()
@@ -179,8 +237,9 @@ def run_backtest(frame: pd.DataFrame, strategy: SignalFn, config: BacktestConfig
             pending = "HOLD"
             pending_index = None
 
+        risk_triggered = risk_exit(i)
         history = bars.iloc[: i + 1]
-        action = strategy(bars.iloc[i], history)
+        action = "HOLD" if risk_triggered else strategy(bars.iloc[i], history)
         if action not in {"BUY", "SELL", "HOLD"}:
             raise ValueError(f"Strategy returned invalid action: {action!r}")
 
@@ -188,13 +247,14 @@ def run_backtest(frame: pd.DataFrame, strategy: SignalFn, config: BacktestConfig
         if config.execution == "close":
             execute(action, i)
             if is_day_end and config.force_close_eod:
-                force_close(i)
+                if quantity > 0:
+                    execute("SELL", i, "EOD")
         elif not is_day_end:
             pending = action
             pending_index = i + 1
         elif config.force_close_eod:
-            force_close(i)
-        else:
+            if quantity > 0:
+                execute("SELL", i, "EOD")
             pending = "HOLD"
             pending_index = None
 
