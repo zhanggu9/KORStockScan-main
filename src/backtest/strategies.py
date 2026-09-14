@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 
@@ -10,7 +11,9 @@ def ema_cross_strategy(
     if fast < 1 or slow <= fast:
         raise ValueError("slow must be greater than fast, and fast must be >= 1")
 
-    def strategy(bar: pd.Series, history: pd.DataFrame) -> str:
+    def strategy(bar: pd.Series, history: pd.DataFrame | None = None) -> str:
+        if history is None or history.empty:
+            return "HOLD"
         closes = pd.to_numeric(history["close"], errors="coerce")
         fast_ema = closes.ewm(span=fast, adjust=False, min_periods=fast).mean().iloc[-1]
         slow_ema = closes.ewm(span=slow, adjust=False, min_periods=slow).mean().iloc[-1]
@@ -28,6 +31,21 @@ def ema_cross_strategy(
             return "SELL"
         return "HOLD"
 
+    def prepare_signals(frame: pd.DataFrame) -> np.ndarray:
+        closes = pd.to_numeric(frame["close"], errors="coerce")
+        fast_ema = closes.ewm(span=fast, adjust=False, min_periods=fast).mean().to_numpy(dtype=float)
+        slow_ema = closes.ewm(span=slow, adjust=False, min_periods=slow).mean().to_numpy(dtype=float)
+        actions = np.full(len(frame), "HOLD", dtype="U4")
+        valid = ~np.isnan(fast_ema) & ~np.isnan(slow_ema)
+        cross_up = valid & (fast_ema > slow_ema) & (np.roll(fast_ema, 1) <= np.roll(slow_ema, 1))
+        cross_down = valid & (fast_ema < slow_ema) & (np.roll(fast_ema, 1) >= np.roll(slow_ema, 1))
+        cross_up[0] = False
+        cross_down[0] = False
+        actions[cross_up] = "BUY"
+        actions[cross_down] = "SELL"
+        return actions
+
+    strategy.prepare_signals = prepare_signals
     return strategy
 
 
@@ -79,8 +97,8 @@ def one_minute_scalping_proxy_strategy(
 
     min_history = max(rsi_period + 1, average_window + 1)
 
-    def strategy(bar: pd.Series, history: pd.DataFrame) -> str:
-        if len(history) < min_history:
+    def strategy(bar: pd.Series, history: pd.DataFrame | None = None) -> str:
+        if history is None or len(history) < min_history:
             return "HOLD"
 
         closes = pd.to_numeric(history["close"], errors="coerce")
@@ -110,6 +128,34 @@ def one_minute_scalping_proxy_strategy(
             return "SELL"
         return "HOLD"
 
+    def prepare_signals(frame: pd.DataFrame) -> np.ndarray:
+        closes = pd.to_numeric(frame["close"], errors="coerce")
+        volumes = pd.to_numeric(frame["volume"], errors="coerce")
+        actions = np.full(len(frame), "HOLD", dtype="U4")
+        if len(frame) < min_history or closes.isna().any() or volumes.isna().any():
+            return actions
+
+        rsi = _rsi_series(closes, rsi_period).to_numpy(dtype=float)
+        close_values = closes.to_numpy(dtype=float)
+        volume_values = volumes.to_numpy(dtype=float)
+        prior_close_avg = closes.shift(1).rolling(average_window).mean().to_numpy(dtype=float)
+        prior_volume_avg = volumes.shift(1).rolling(average_window).mean().to_numpy(dtype=float)
+        valid = (
+            ~np.isnan(rsi)
+            & ~np.isnan(prior_close_avg)
+            & ~np.isnan(prior_volume_avg)
+            & (prior_close_avg > 0)
+            & (prior_volume_avg > 0)
+        )
+        buy = valid & (rsi >= rsi_buy)
+        buy &= volume_values >= prior_volume_avg * volume_multiplier
+        buy &= close_values >= prior_close_avg * (1.0 + price_distance_pct / 100.0)
+        sell = valid & (rsi <= rsi_sell)
+        actions[buy] = "BUY"
+        actions[sell & ~buy] = "SELL"
+        return actions
+
+    strategy.prepare_signals = prepare_signals
     return strategy
 
 
