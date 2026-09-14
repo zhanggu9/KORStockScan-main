@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
+import numpy as np
 import pandas as pd
 
 Action = Literal["BUY", "SELL", "HOLD"]
-SignalFn = Callable[[pd.Series, pd.DataFrame], Action]
+SignalFn = Callable[[pd.Series, pd.DataFrame | None], Action]
 
 
 @dataclass(frozen=True)
@@ -109,26 +110,31 @@ def run_backtest(frame: pd.DataFrame, strategy: SignalFn, config: BacktestConfig
     exit_slippage_bps = config.slippage_bps if config.slippage_bps is not None else config.exit_slippage_bps
     if exit_slippage_bps < 0 or config.fee_bps < 0 or config.entry_slippage_bps < 0:
         raise ValueError("fee/slippage values must be >= 0")
-    risk_values = [
-        config.atr_period,
-        config.stop_atr,
-        config.target_atr,
-        config.trailing_atr,
-        config.max_hold_bars,
-        config.peak_retrace_1_pct,
-        config.peak_retrace_2_pct,
-    ]
+    risk_values = [config.atr_period, config.stop_atr, config.target_atr, config.trailing_atr, config.max_hold_bars, config.peak_retrace_1_pct, config.peak_retrace_2_pct]
     if any(v is not None and v <= 0 for v in risk_values):
         raise ValueError("risk parameters must be > 0 when provided")
     if not 0 < config.peak_retrace_1_ratio <= 1 or not 0 < config.peak_retrace_2_ratio <= 1:
         raise ValueError("peak retrace ratios must be in (0, 1]")
-    if config.peak_retrace_1_pct is not None and config.peak_retrace_2_pct is not None:
-        if config.peak_retrace_2_pct <= config.peak_retrace_1_pct:
-            raise ValueError("peak_retrace_2_pct must be greater than peak_retrace_1_pct")
+    if config.peak_retrace_1_pct is not None and config.peak_retrace_2_pct is not None and config.peak_retrace_2_pct <= config.peak_retrace_1_pct:
+        raise ValueError("peak_retrace_2_pct must be greater than peak_retrace_1_pct")
 
     bars = _prepare_frame(frame)
     atr_series = _atr(bars, config.atr_period) if config.atr_period else pd.Series(float("nan"), index=bars.index)
+    atr_values = atr_series.to_numpy(dtype=float)
+    datetimes = bars["datetime"].to_numpy()
+    days = bars["datetime"].dt.date.to_numpy()
+    opens = bars["open"].to_numpy(dtype=float)
+    highs = bars["high"].to_numpy(dtype=float)
+    lows = bars["low"].to_numpy(dtype=float)
+    closes = bars["close"].to_numpy(dtype=float)
     code = str(bars["code"].iloc[0])
+
+    prepared = getattr(strategy, "prepare_signals", None)
+    prepared_actions: np.ndarray | None = None
+    if callable(prepared):
+        prepared_actions = np.asarray(prepared(bars))
+        if len(prepared_actions) != len(bars):
+            raise ValueError("prepare_signals must return one action per bar")
 
     cash = float(config.initial_cash)
     quantity = 0
@@ -142,19 +148,17 @@ def run_backtest(frame: pd.DataFrame, strategy: SignalFn, config: BacktestConfig
     peak_stage = 0
     trades: list[Trade] = []
     equity_rows: list[dict] = []
-
     pending: Action = "HOLD"
     pending_index: int | None = None
 
     def execute(action: Action, index: int, reason: str = "SIGNAL", quantity_override: int | None = None) -> int:
         nonlocal cash, quantity, entry_time, entry_price, entry_fees, entry_slippage_cost
         nonlocal entry_atr, highest_high, hold_bars, peak_stage
-        bar = bars.iloc[index]
-        raw_price = float(bar["close"] if config.execution == "close" else bar["open"])
-        timestamp = pd.Timestamp(bar["datetime"])
+        raw_price = closes[index] if config.execution == "close" else opens[index]
+        timestamp = pd.Timestamp(datetimes[index])
 
         if action == "BUY" and quantity == 0:
-            execution_price = _apply_buy_slippage(raw_price, config.entry_slippage_bps)
+            execution_price = _apply_buy_slippage(float(raw_price), config.entry_slippage_bps)
             max_qty = int(cash / (execution_price * (1.0 + config.fee_bps / 10_000.0)))
             if max_qty <= 0:
                 return 0
@@ -166,9 +170,9 @@ def run_backtest(frame: pd.DataFrame, strategy: SignalFn, config: BacktestConfig
             entry_price = execution_price
             entry_fees = fees
             entry_slippage_cost = abs(execution_price - raw_price) * max_qty
-            atr_value = float(atr_series.iloc[index]) if not pd.isna(atr_series.iloc[index]) else None
-            entry_atr = atr_value
-            highest_high = float(bar["high"])
+            atr_value = atr_values[index]
+            entry_atr = float(atr_value) if not np.isnan(atr_value) else None
+            highest_high = highs[index]
             hold_bars = 0
             peak_stage = 0
             return max_qty
@@ -177,7 +181,7 @@ def run_backtest(frame: pd.DataFrame, strategy: SignalFn, config: BacktestConfig
             sell_qty = quantity if quantity_override is None else min(int(quantity_override), quantity)
             if sell_qty <= 0:
                 return 0
-            execution_price = _apply_sell_slippage(raw_price, exit_slippage_bps)
+            execution_price = _apply_sell_slippage(float(raw_price), exit_slippage_bps)
             notional = execution_price * sell_qty
             fees = _fee(notional, config.fee_bps)
             cash += notional - fees
@@ -189,23 +193,8 @@ def run_backtest(frame: pd.DataFrame, strategy: SignalFn, config: BacktestConfig
             total_fees = allocated_entry_fees + fees
             net_pnl = gross_pnl - total_fees
             invested = entry_price * sell_qty + allocated_entry_fees
-            return_pct = (net_pnl / invested * 100.0) if invested else 0.0
-            trades.append(
-                Trade(
-                    code=code,
-                    entry_time=entry_time or timestamp,
-                    entry_price=entry_price,
-                    exit_time=timestamp,
-                    exit_price=execution_price,
-                    quantity=sell_qty,
-                    gross_pnl=gross_pnl,
-                    fees=total_fees,
-                    slippage_cost=total_slippage_cost,
-                    net_pnl=net_pnl,
-                    return_pct=return_pct,
-                    exit_reason=reason,
-                )
-            )
+            return_pct = net_pnl / invested * 100.0 if invested else 0.0
+            trades.append(Trade(code, entry_time or timestamp, entry_price, timestamp, execution_price, sell_qty, gross_pnl, total_fees, total_slippage_cost, net_pnl, return_pct, reason))
             quantity -= sell_qty
             entry_fees -= allocated_entry_fees
             entry_slippage_cost -= allocated_entry_slippage
@@ -225,23 +214,13 @@ def run_backtest(frame: pd.DataFrame, strategy: SignalFn, config: BacktestConfig
         nonlocal highest_high, hold_bars, peak_stage
         if quantity <= 0:
             return False
-        bar = bars.iloc[index]
-        highest_high = max(highest_high, float(bar["high"]))
+        highest_high = max(highest_high, highs[index])
         hold_bars += 1
         atr = entry_atr
-        stop_price = None
-        target_price = None
-        trail_price = None
-        if atr is not None:
-            if config.stop_atr is not None:
-                stop_price = entry_price - atr * config.stop_atr
-            if config.target_atr is not None:
-                target_price = entry_price + atr * config.target_atr
-            if config.trailing_atr is not None:
-                trail_price = highest_high - atr * config.trailing_atr
-
-        low = float(bar["low"])
-        high = float(bar["high"])
+        stop_price = entry_price - atr * config.stop_atr if atr is not None and config.stop_atr is not None else None
+        target_price = entry_price + atr * config.target_atr if atr is not None and config.target_atr is not None else None
+        trail_price = highest_high - atr * config.trailing_atr if atr is not None and config.trailing_atr is not None else None
+        low, high = lows[index], highs[index]
 
         if stop_price is not None and low <= stop_price:
             execute("SELL", index, "ATR_STOP")
@@ -253,9 +232,7 @@ def run_backtest(frame: pd.DataFrame, strategy: SignalFn, config: BacktestConfig
         if config.peak_retrace_2_pct is not None and peak_stage < 2:
             retrace_2 = (highest_high - low) / highest_high * 100.0 if highest_high > 0 else 0.0
             if retrace_2 >= config.peak_retrace_2_pct and peak_stage >= 1:
-                sell_qty = int(round(quantity * config.peak_retrace_2_ratio))
-                if sell_qty <= 0:
-                    sell_qty = quantity
+                sell_qty = int(round(quantity * config.peak_retrace_2_ratio)) or quantity
                 execute("SELL", index, "PEAK_RETRACE_2", sell_qty)
                 peak_stage = 2
                 return quantity == 0
@@ -281,21 +258,25 @@ def run_backtest(frame: pd.DataFrame, strategy: SignalFn, config: BacktestConfig
         return False
 
     for i in range(len(bars)):
-        current_day = bars.iloc[i]["datetime"].date()
-        next_day = bars.iloc[i + 1]["datetime"].date() if i + 1 < len(bars) else None
+        next_day = days[i + 1] if i + 1 < len(bars) else None
+        is_day_end = next_day != days[i]
 
-        if pending_index is not None and pending_index == i:
+        if pending_index == i:
             execute(pending, i)
             pending = "HOLD"
             pending_index = None
 
         risk_triggered = risk_exit(i)
-        history = bars.iloc[: i + 1]
-        action = "HOLD" if risk_triggered else strategy(bars.iloc[i], history)
+        if risk_triggered:
+            action: Action = "HOLD"
+        elif prepared_actions is not None:
+            action = str(prepared_actions[i])
+        else:
+            history = bars.iloc[: i + 1]
+            action = strategy(bars.iloc[i], history)
         if action not in {"BUY", "SELL", "HOLD"}:
             raise ValueError(f"Strategy returned invalid action: {action!r}")
 
-        is_day_end = next_day != current_day
         if config.execution == "close":
             execute(action, i)
             if is_day_end and config.force_close_eod and quantity > 0:
@@ -309,10 +290,8 @@ def run_backtest(frame: pd.DataFrame, strategy: SignalFn, config: BacktestConfig
             pending = "HOLD"
             pending_index = None
 
-        mark = cash + quantity * float(bars.iloc[i]["close"])
-        equity_rows.append({"datetime": bars.iloc[i]["datetime"], "equity": mark})
-        if is_day_end and quantity == 0:
-            equity_rows[-1]["equity"] = cash
+        mark = cash + quantity * closes[i]
+        equity_rows.append({"datetime": pd.Timestamp(datetimes[i]), "equity": mark if not (is_day_end and quantity == 0) else cash})
 
     equity = pd.DataFrame(equity_rows)
     if equity.empty:
@@ -326,7 +305,6 @@ def run_backtest(frame: pd.DataFrame, strategy: SignalFn, config: BacktestConfig
     gross_profit = sum(t.net_pnl for t in trades if t.net_pnl > 0)
     gross_loss = abs(sum(t.net_pnl for t in trades if t.net_pnl < 0))
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
-
     return BacktestResult(
         code=code,
         initial_cash=config.initial_cash,
