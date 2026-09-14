@@ -12,12 +12,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.backtest.engine import BacktestConfig, run_backtest  # noqa: E402
+from src.backtest.scalping_proxy_v2 import scalping_proxy_v2_strategy  # noqa: E402
 from src.backtest.strategies import (  # noqa: E402
     _rsi,
     ema_cross_strategy,
     one_minute_scalping_proxy_strategy,
 )
-from src.backtest.trend_scalping import trend_scalping_strategy  # noqa: E402
+from src.backtest.trend_scaling import trend_scaling_strategy  # noqa: E402
 
 
 def parse_date(value: str):
@@ -84,7 +85,7 @@ def build_strategy(args):
     if args.strategy == "ema":
         return ema_cross_strategy(args.fast, args.slow)
     if args.strategy == "trend_scalping":
-        return trend_scalping_strategy(
+        return trend_scaling_strategy(
             fast_ema=args.trend_fast_ema,
             slow_ema=args.trend_slow_ema,
             trend_ema=args.trend_ema,
@@ -95,6 +96,18 @@ def build_strategy(args):
             volume_multiplier=args.trend_volume_multiplier,
             pullback_pct=args.pullback_pct,
             sell_rsi=args.trend_sell_rsi,
+        )
+    if args.strategy == "scalping_proxy_v2":
+        return scalping_proxy_v2_strategy(
+            rsi_period=args.v2_rsi_period,
+            rsi_min=args.v2_rsi_min,
+            rsi_max=args.v2_rsi_max,
+            volume_multiplier=args.v2_volume_multiplier,
+            volume_window=args.v2_volume_window,
+            fast_ema=args.v2_fast_ema,
+            slow_ema=args.v2_slow_ema,
+            breakout_lookback=args.v2_breakout_lookback,
+            require_vwap_rising=args.v2_require_vwap_rising,
         )
     return one_minute_scalping_proxy_strategy(
         rsi_period=args.rsi_period,
@@ -272,7 +285,7 @@ def main() -> int:
     parser.add_argument("--initial-cash", type=float, default=10_000_000.0)
     parser.add_argument("--fee-bps", type=float, default=15.0)
     parser.add_argument("--slippage-bps", type=float, default=5.0)
-    parser.add_argument("--strategy", choices=["scalping_proxy", "trend_scalping", "ema"], default="scalping_proxy")
+    parser.add_argument("--strategy", choices=["scalping_proxy", "scalping_proxy_v2", "trend_scalping", "ema"], default="scalping_proxy")
     parser.add_argument("--fast", type=int, default=5)
     parser.add_argument("--slow", type=int, default=20)
     parser.add_argument("--rsi-period", type=int, default=14)
@@ -281,6 +294,15 @@ def main() -> int:
     parser.add_argument("--volume-multiplier", type=float, default=2.5)
     parser.add_argument("--average-window", type=int, default=3)
     parser.add_argument("--price-distance-pct", type=float, default=2.0)
+    parser.add_argument("--v2-rsi-period", type=int, default=14)
+    parser.add_argument("--v2-rsi-min", type=float, default=70.0)
+    parser.add_argument("--v2-rsi-max", type=float, default=85.0)
+    parser.add_argument("--v2-volume-multiplier", type=float, default=2.0)
+    parser.add_argument("--v2-volume-window", type=int, default=3)
+    parser.add_argument("--v2-fast-ema", type=int, default=9)
+    parser.add_argument("--v2-slow-ema", type=int, default=20)
+    parser.add_argument("--v2-breakout-lookback", type=int, default=2)
+    parser.add_argument("--v2-require-vwap-rising", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--trend-fast-ema", type=int, default=5)
     parser.add_argument("--trend-slow-ema", type=int, default=20)
     parser.add_argument("--trend-ema", type=int, default=60)
