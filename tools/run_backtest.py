@@ -18,7 +18,7 @@ from src.backtest.strategies import (  # noqa: E402
     ema_cross_strategy,
     one_minute_scalping_proxy_strategy,
 )
-from src.backtest.trend_scaling import trend_scaling_strategy  # noqa: E402
+from src.backtest.trend_scalping import trend_scalping_strategy  # noqa: E402
 
 
 def parse_date(value: str):
@@ -85,7 +85,7 @@ def build_strategy(args):
     if args.strategy == "ema":
         return ema_cross_strategy(args.fast, args.slow)
     if args.strategy == "trend_scalping":
-        return trend_scaling_strategy(
+        return trend_scalping_strategy(
             fast_ema=args.trend_fast_ema,
             slow_ema=args.trend_slow_ema,
             trend_ema=args.trend_ema,
