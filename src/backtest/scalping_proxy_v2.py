@@ -29,16 +29,22 @@ def _rsi(series: pd.Series, period: int) -> pd.Series:
 def scalping_proxy_v2_indicators(
     frame: pd.DataFrame,
     rsi_period: int = 14,
+    rsi_min: float = 70.0,
+    rsi_max: float = 85.0,
+    volume_multiplier: float = 2.0,
     volume_window: int = 3,
     fast_ema: int = 9,
     slow_ema: int = 20,
     breakout_lookback: int = 2,
+    require_vwap_rising: bool = True,
 ) -> pd.DataFrame:
     """Reconstruct v2 signal-time indicators for trade diagnostics."""
     if not (1 <= fast_ema < slow_ema):
         raise ValueError("fast_ema must be smaller than slow_ema")
-    if rsi_period < 2 or volume_window < 1 or breakout_lookback < 1:
-        raise ValueError("invalid diagnostic parameters")
+    if rsi_period < 2 or not (0 <= rsi_min < rsi_max <= 100):
+        raise ValueError("invalid RSI parameters")
+    if volume_multiplier <= 0 or volume_window < 1 or breakout_lookback < 1:
+        raise ValueError("invalid volume/breakout parameters")
 
     out = frame.copy()
     out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
@@ -62,7 +68,8 @@ def scalping_proxy_v2_indicators(
 
     typical = (out["high"] + out["low"] + out["close"]) / 3.0
     day = out["datetime"].dt.date
-    out["v2_vwap"] = (typical * out["volume"]).groupby(day).cumsum() / out["volume"].groupby(day).cumsum().replace(0.0, float("nan"))
+    cumulative_volume = out["volume"].groupby(day).cumsum()
+    out["v2_vwap"] = (typical * out["volume"]).groupby(day).cumsum() / cumulative_volume.replace(0.0, float("nan"))
     out["v2_vwap_distance_pct"] = (out["close"] / out["v2_vwap"] - 1.0) * 100.0
     out["v2_vwap_slope_pct"] = (out["v2_vwap"] / out["v2_vwap"].shift(1) - 1.0) * 100.0
 
@@ -71,9 +78,11 @@ def scalping_proxy_v2_indicators(
     out["v2_volume_ratio"] = out["volume"] / prior_volume.replace(0.0, float("nan"))
     out["v2_breakout_distance_pct"] = (out["close"] / prior_high - 1.0) * 100.0
     out["v2_trend_ok"] = (out["v2_ema_fast"] > out["v2_ema_slow"]) & (out["v2_ema_slow_slope_pct"] > 0)
-    out["v2_vwap_ok"] = (out["close"] > out["v2_vwap"]) & (out["v2_vwap_slope_pct"] >= 0)
-    out["v2_momentum_ok"] = out["v2_rsi"].between(70.0, 85.0, inclusive="both")
-    out["v2_volume_ok"] = out["v2_volume_ratio"] >= 2.0
+    out["v2_vwap_ok"] = (out["close"] > out["v2_vwap"]) & (
+        ~require_vwap_rising | (out["v2_vwap_slope_pct"] >= 0)
+    )
+    out["v2_momentum_ok"] = out["v2_rsi"].between(rsi_min, rsi_max, inclusive="both")
+    out["v2_volume_ok"] = out["v2_volume_ratio"] >= volume_multiplier
     out["v2_breakout_ok"] = out["close"] > prior_high
     out["v2_signal_strength"] = (
         out[["v2_trend_ok", "v2_vwap_ok", "v2_momentum_ok", "v2_volume_ok", "v2_breakout_ok"]]
