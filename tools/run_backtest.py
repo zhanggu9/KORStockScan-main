@@ -311,6 +311,25 @@ def print_v2_diagnostics(trade_details: pd.DataFrame):
     print(f"진입 자체가 나빴다고 볼 수 있는 거래(MFE < 0.5%, LOSS): {len(bad_entry)}")
     print(f"진입 후 충분히 올랐지만 손실로 끝난 거래(MFE >= 1.0%, LOSS): {len(delayed_exit)}")
 
+    print("\n[청산 사유별]")
+    reason = (
+        df.groupby("exit_reason", dropna=False)
+        .agg(
+            trades=("trade_no", "count"),
+            win_rate=("net_pnl", lambda s: (s > 0).mean() * 100.0),
+            avg_return=("return_pct", "mean"),
+            avg_net=("net_pnl", "mean"),
+            total_net=("net_pnl", "sum"),
+        )
+        .sort_values("total_net", ascending=False)
+    )
+    print(reason.to_string(float_format=lambda x: f"{x:.3f}"))
+    for exit_reason, group in df.groupby("exit_reason", dropna=False):
+        gross_profit = group.loc[group["net_pnl"] > 0, "net_pnl"].sum()
+        gross_loss = -group.loc[group["net_pnl"] < 0, "net_pnl"].sum()
+        pf = gross_profit / gross_loss if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
+        print(f"  {exit_reason}: PF={pf:.3f}")
+
 
 def risk_tag(args) -> str:
     parts = []
