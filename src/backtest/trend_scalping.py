@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from typing import Callable, Literal
 
+import numpy as np
 import pandas as pd
 
 Action = Literal["BUY", "SELL", "HOLD"]
-SignalFn = Callable[[pd.Series, pd.DataFrame], Action]
+SignalFn = Callable[[pd.Series, pd.DataFrame | None], Action]
 
 
 def _ema(closes: pd.Series, span: int) -> pd.Series:
@@ -37,19 +38,7 @@ def trend_scalping_strategy(
     pullback_pct: float = 0.8,
     sell_rsi: float = 45.0,
 ) -> SignalFn:
-    """OHLCV-only intraday continuation strategy.
-
-    BUY requires a stacked/rising trend instead of simply chasing RSI >= 70:
-      * fast EMA > slow EMA > trend EMA
-      * fast and slow EMA are rising over ``slope_bars`` bars
-      * current close is not materially below fast EMA
-      * RSI stays inside a momentum band
-      * current volume is above the prior-window average
-
-    SELL occurs when momentum fails (close below fast EMA) or RSI falls below
-    ``sell_rsi``. The backtest engine executes the signal on the next bar open
-    by default, so the signal never uses future data.
-    """
+    """OHLCV-only intraday continuation strategy."""
     if not (1 <= fast_ema < slow_ema < trend_ema):
         raise ValueError("EMA periods must satisfy fast_ema < slow_ema < trend_ema")
     if slope_bars < 1:
@@ -67,8 +56,8 @@ def trend_scalping_strategy(
 
     min_history = max(trend_ema + 1, rsi_period + 1, slope_bars + 1, 4)
 
-    def strategy(bar: pd.Series, history: pd.DataFrame) -> Action:
-        if len(history) < min_history:
+    def strategy(bar: pd.Series, history: pd.DataFrame | None = None) -> Action:
+        if history is None or len(history) < min_history:
             return "HOLD"
 
         closes = pd.to_numeric(history["close"], errors="coerce")
@@ -114,4 +103,47 @@ def trend_scalping_strategy(
 
         return "HOLD"
 
+    def prepare_signals(frame: pd.DataFrame) -> np.ndarray:
+        closes = pd.to_numeric(frame["close"], errors="coerce")
+        volumes = pd.to_numeric(frame["volume"], errors="coerce")
+        actions = np.full(len(frame), "HOLD", dtype="U4")
+        if len(frame) < min_history or closes.isna().any() or volumes.isna().any():
+            return actions
+
+        ema_fast = _ema(closes, fast_ema).to_numpy(dtype=float)
+        ema_slow = _ema(closes, slow_ema).to_numpy(dtype=float)
+        ema_trend = _ema(closes, trend_ema).to_numpy(dtype=float)
+        rsi = _rsi_series(closes, rsi_period).to_numpy(dtype=float)
+        close_values = closes.to_numpy(dtype=float)
+        volume_values = volumes.to_numpy(dtype=float)
+        prior_volume_avg = volumes.shift(1).rolling(3).mean().to_numpy(dtype=float)
+
+        prev_fast = np.full(len(frame), np.nan, dtype=float)
+        prev_slow = np.full(len(frame), np.nan, dtype=float)
+        if slope_bars < len(frame):
+            prev_fast[slope_bars:] = ema_fast[:-slope_bars]
+            prev_slow[slope_bars:] = ema_slow[:-slope_bars]
+
+        valid = (
+            ~np.isnan(ema_fast)
+            & ~np.isnan(ema_slow)
+            & ~np.isnan(ema_trend)
+            & ~np.isnan(rsi)
+            & ~np.isnan(prev_fast)
+            & ~np.isnan(prev_slow)
+            & (prior_volume_avg > 0)
+        )
+        fast_rising = ema_fast > prev_fast
+        slow_rising = ema_slow > prev_slow
+        stacked = (ema_fast > ema_slow) & (ema_slow > ema_trend)
+        not_extended = close_values >= ema_fast * (1.0 - pullback_pct / 100.0)
+        momentum_ok = (rsi >= rsi_min) & (rsi <= rsi_max)
+        volume_ok = volume_values >= prior_volume_avg * volume_multiplier
+        buy = valid & stacked & fast_rising & slow_rising & not_extended & momentum_ok & volume_ok
+        sell = valid & ((close_values < ema_fast) | (rsi <= sell_rsi))
+        actions[buy] = "BUY"
+        actions[sell & ~buy] = "SELL"
+        return actions
+
+    strategy.prepare_signals = prepare_signals
     return strategy
