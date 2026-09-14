@@ -9,6 +9,80 @@ Action = Literal["BUY", "SELL", "HOLD"]
 SignalFn = Callable[[pd.Series, pd.DataFrame], Action]
 
 
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False, min_periods=span).mean()
+
+
+def _rsi(series: pd.Series, period: int) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0.0, float("nan"))
+    out = 100.0 - (100.0 / (1.0 + rs))
+    out = out.mask(avg_loss == 0.0, 100.0)
+    out = out.mask((avg_gain == 0.0) & (avg_loss > 0.0), 0.0)
+    return out
+
+
+def scalping_proxy_v2_indicators(
+    frame: pd.DataFrame,
+    rsi_period: int = 14,
+    volume_window: int = 3,
+    fast_ema: int = 9,
+    slow_ema: int = 20,
+    breakout_lookback: int = 2,
+) -> pd.DataFrame:
+    """Reconstruct v2 signal-time indicators for trade diagnostics."""
+    if not (1 <= fast_ema < slow_ema):
+        raise ValueError("fast_ema must be smaller than slow_ema")
+    if rsi_period < 2 or volume_window < 1 or breakout_lookback < 1:
+        raise ValueError("invalid diagnostic parameters")
+
+    out = frame.copy()
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    for col in ["high", "low", "close", "volume"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    out = (
+        out.dropna(subset=["datetime", "high", "low", "close", "volume"])
+        .sort_values("datetime")
+        .drop_duplicates("datetime")
+        .reset_index(drop=True)
+    )
+    if out.empty:
+        return pd.DataFrame(index=out.index)
+
+    close = out["close"]
+    out["v2_ema_fast"] = _ema(close, fast_ema)
+    out["v2_ema_slow"] = _ema(close, slow_ema)
+    out["v2_ema_spread_pct"] = (out["v2_ema_fast"] / out["v2_ema_slow"] - 1.0) * 100.0
+    out["v2_ema_slow_slope_pct"] = (out["v2_ema_slow"] / out["v2_ema_slow"].shift(1) - 1.0) * 100.0
+    out["v2_rsi"] = _rsi(close, rsi_period)
+
+    typical = (out["high"] + out["low"] + out["close"]) / 3.0
+    day = out["datetime"].dt.date
+    out["v2_vwap"] = (typical * out["volume"]).groupby(day).cumsum() / out["volume"].groupby(day).cumsum().replace(0.0, float("nan"))
+    out["v2_vwap_distance_pct"] = (out["close"] / out["v2_vwap"] - 1.0) * 100.0
+    out["v2_vwap_slope_pct"] = (out["v2_vwap"] / out["v2_vwap"].shift(1) - 1.0) * 100.0
+
+    prior_volume = out["volume"].shift(1).rolling(volume_window).mean()
+    prior_high = out["high"].shift(1).rolling(breakout_lookback).max()
+    out["v2_volume_ratio"] = out["volume"] / prior_volume.replace(0.0, float("nan"))
+    out["v2_breakout_distance_pct"] = (out["close"] / prior_high - 1.0) * 100.0
+    out["v2_trend_ok"] = (out["v2_ema_fast"] > out["v2_ema_slow"]) & (out["v2_ema_slow_slope_pct"] > 0)
+    out["v2_vwap_ok"] = (out["close"] > out["v2_vwap"]) & (out["v2_vwap_slope_pct"] >= 0)
+    out["v2_momentum_ok"] = out["v2_rsi"].between(70.0, 85.0, inclusive="both")
+    out["v2_volume_ok"] = out["v2_volume_ratio"] >= 2.0
+    out["v2_breakout_ok"] = out["close"] > prior_high
+    out["v2_signal_strength"] = (
+        out[["v2_trend_ok", "v2_vwap_ok", "v2_momentum_ok", "v2_volume_ok", "v2_breakout_ok"]]
+        .astype(int)
+        .sum(axis=1)
+    )
+    return out
+
+
 def scalping_proxy_v2_strategy(
     rsi_period: int = 14,
     rsi_min: float = 70.0,
