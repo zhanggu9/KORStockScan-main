@@ -38,7 +38,8 @@ def trading_files(data_dir: Path, code: str, start, end):
             path = data_dir / code / f"{day:%Y%m%d}.csv"
             if path.exists():
                 yield path
-        day = day.fromordinal(day.toordinal() + 1)
+        day = day.fromordinal(day.toordinal() + 1
+)
 
 
 def load_code(data_dir: Path, code: str, start, end) -> tuple[pd.DataFrame, int]:
@@ -101,7 +102,7 @@ def build_strategy(args):
             sell_rsi=args.trend_sell_rsi,
         )
     if args.strategy == "scalping_proxy_v2":
-        return scalping_proxy_v2_strategy(
+        base_strategy = scalping_proxy_v2_strategy(
             rsi_period=args.v2_rsi_period,
             rsi_min=args.v2_rsi_min,
             rsi_max=args.v2_rsi_max,
@@ -117,6 +118,14 @@ def build_strategy(args):
             min_breakout_distance_pct=args.v2_min_breakout_distance_pct,
             max_volume_ratio=args.v2_max_volume_ratio,
         )
+        if not args.v2_disable_signal_exit:
+            return base_strategy
+
+        def strategy_without_signal_exit(bar: pd.Series, history: pd.DataFrame):
+            action = base_strategy(bar, history)
+            return "HOLD" if action == "SELL" else action
+
+        return strategy_without_signal_exit
     return one_minute_scalping_proxy_strategy(
         rsi_period=args.rsi_period,
         rsi_buy=args.rsi_buy,
@@ -356,6 +365,8 @@ def v2_tag(args) -> str:
         parts.append(f"bo{args.v2_min_breakout_distance_pct:g}")
     if args.v2_max_volume_ratio is not None:
         parts.append(f"vol{args.v2_max_volume_ratio:g}")
+    if args.v2_disable_signal_exit:
+        parts.append("nosignalexit")
     return "_" + "_".join(parts) if parts else ""
 
 
@@ -436,7 +447,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--initial-cash", type=float, default=10_000_000.0)
     parser.add_argument("--fee-bps", type=float, default=15.0)
     parser.add_argument("--slippage-bps", type=float, default=5.0)
-    parser.add_argument("--strategy", choices=["scalping_proxy", "scalping_proxy_v2", "trend_scalping", "ema"], default="scalping_proxy")
+    parser.add_argument("--strategy", choices=["scalping_proxy", "scalping_proxy_v2", "trend_scaling", "ema"], default="scalping_proxy")
     parser.add_argument("--fast", type=int, default=5)
     parser.add_argument("--slow", type=int, default=20)
     parser.add_argument("--rsi-period", type=int, default=14)
@@ -460,6 +471,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--v2-min-ema-spread-pct", type=float, default=0.0)
     parser.add_argument("--v2-min-breakout-distance-pct", type=float, default=0.0)
     parser.add_argument("--v2-max-volume-ratio", type=float, default=None)
+    parser.add_argument("--v2-disable-signal-exit", action="store_true", help="suppress v2 strategy SELL signals; risk exits remain active")
 
     parser.add_argument("--trend-fast-ema", type=int, default=5)
     parser.add_argument("--trend-slow-ema", type=int, default=20)
