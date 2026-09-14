@@ -21,7 +21,7 @@ from src.backtest.strategies import (  # noqa: E402
     ema_cross_strategy,
     one_minute_scalping_proxy_strategy,
 )
-from src.backtest.trend_scalping import trend_scalping_strategy  # noqa: E402
+from src.backtest.trend_scalping import trend_scaling_strategy  # noqa: E402
 
 
 def parse_date(value: str):
@@ -47,7 +47,10 @@ def load_code(data_dir: Path, code: str, start, end) -> tuple[pd.DataFrame, int]
         raise FileNotFoundError(
             f"No minute CSV files found for {code}: {start:%Y%m%d}~{end:%Y%m%d}"
         )
-    frames = [pd.read_csv(path, encoding="utf-8-sig", dtype={"code": str}) for path in paths]
+    frames = [
+        pd.read_csv(path, encoding="utf-8-sig", dtype={"code": str})
+        for path in paths
+    ]
     return pd.concat(frames, ignore_index=True), len(paths)
 
 
@@ -85,7 +88,7 @@ def build_strategy(args):
     if args.strategy == "ema":
         return ema_cross_strategy(args.fast, args.slow)
     if args.strategy == "trend_scalping":
-        return trend_scalping_strategy(
+        return trend_scaling_strategy(
             fast_ema=args.trend_fast_ema,
             slow_ema=args.trend_slow_ema,
             trend_ema=args.trend_ema,
@@ -170,8 +173,7 @@ def build_trade_details(
         entry_idx = entry_positions[0]
         exit_positions = bars.index[bars["datetime"] == pd.Timestamp(trade.exit_time)].tolist()
         exit_idx = exit_positions[0] if exit_positions else entry_idx
-        if exit_idx < entry_idx:
-            exit_idx = entry_idx
+        exit_idx = max(exit_idx, entry_idx)
 
         trade_bars = bars.iloc[entry_idx : exit_idx + 1]
         max_high = float(trade_bars["high"].max())
@@ -229,37 +231,40 @@ def build_trade_details(
                 v2_vwap_slope_pct = float(diag["v2_vwap_slope_pct"])
                 v2_breakout_distance_pct = float(diag["v2_breakout_distance_pct"])
 
-        rows.append({
-            "trade_no": trade_no,
-            "code": trade.code,
-            "signal_time": signal_time,
-            "entry_time": trade.entry_time,
-            "entry_price": trade.entry_price,
-            "exit_time": trade.exit_time,
-            "exit_price": trade.exit_price,
-            "quantity": trade.quantity,
-            "holding_minutes": holding_minutes,
-            "gross_pnl": trade.gross_pnl,
-            "fees": trade.fees,
-            "slippage_cost": trade.slippage_cost,
-            "net_pnl": trade.net_pnl,
-            "return_pct": trade.return_pct,
-            "signal_close": signal_close,
-            "signal_rsi": signal_rsi,
-            "signal_volume_ratio": volume_ratio,
-            "signal_price_distance_pct": price_distance_pct,
-            "v2_ema_fast": v2_ema_fast,
-            "v2_ema_slow": v2_ema_slow,
-            "v2_ema_spread_pct": v2_ema_spread_pct,
-            "v2_ema_slow_slope_pct": v2_ema_slow_slope_pct,
-            "v2_vwap": v2_vwap,
-            "v2_vwap_distance_pct": v2_vwap_distance_pct,
-            "v2_vwap_slope_pct": v2_vwap_slope_pct,
-            "v2_breakout_distance_pct": v2_breakout_distance_pct,
-            "max_favorable_excursion_pct": mfe_pct,
-            "max_adverse_excursion_pct": mae_pct,
-            "result": "WIN" if trade.net_pnl > 0 else "LOSS" if trade.net_pnl < 0 else "FLAT",
-        })
+        rows.append(
+            {
+                "trade_no": trade_no,
+                "code": trade.code,
+                "signal_time": signal_time,
+                "entry_time": trade.entry_time,
+                "entry_price": trade.entry_price,
+                "exit_time": trade.exit_time,
+                "exit_price": trade.exit_price,
+                "quantity": trade.quantity,
+                "holding_minutes": holding_minutes,
+                "gross_pnl": trade.gross_pnl,
+                "fees": trade.fees,
+                "slippage_cost": trade.slippage_cost,
+                "net_pnl": trade.net_pnl,
+                "return_pct": trade.return_pct,
+                "exit_reason": trade.exit_reason,
+                "signal_close": signal_close,
+                "signal_rsi": signal_rsi,
+                "signal_volume_ratio": volume_ratio,
+                "signal_price_distance_pct": price_distance_pct,
+                "v2_ema_fast": v2_ema_fast,
+                "v2_ema_slow": v2_ema_slow,
+                "v2_ema_spread_pct": v2_ema_spread_pct,
+                "v2_ema_slow_slope_pct": v2_ema_slow_slope_pct,
+                "v2_vwap": v2_vwap,
+                "v2_vwap_distance_pct": v2_vwap_distance_pct,
+                "v2_vwap_slope_pct": v2_vwap_slope_pct,
+                "v2_breakout_distance_pct": v2_breakout_distance_pct,
+                "max_favorable_excursion_pct": mfe_pct,
+                "max_adverse_excursion_pct": mae_pct,
+                "result": "WIN" if trade.net_pnl > 0 else "LOSS" if trade.net_pnl < 0 else "FLAT",
+            }
+        )
     return pd.DataFrame(rows)
 
 
@@ -307,6 +312,34 @@ def print_v2_diagnostics(trade_details: pd.DataFrame):
     print(f"진입 후 충분히 올랐지만 손실로 끝난 거래(MFE >= 1.0%, LOSS): {len(delayed_exit)}")
 
 
+def risk_tag(args) -> str:
+    parts = []
+    if args.atr_period is not None:
+        parts.append(f"atr{args.atr_period}")
+    if args.stop_atr is not None:
+        parts.append(f"stop{args.stop_atr:g}")
+    if args.trailing_atr is not None:
+        parts.append(f"trail{args.trailing_atr:g}")
+    if args.max_hold_bars is not None:
+        parts.append(f"hold{args.max_hold_bars}")
+    return "_" + "_".join(parts) if parts else ""
+
+
+def v2_tag(args) -> str:
+    if args.strategy != "scalping_proxy_v2":
+        return ""
+    parts = []
+    if args.v2_entry_start_minute != 0 or args.v2_entry_end_minute != 1439:
+        parts.append(f"sess{args.v2_entry_start_minute}-{args.v2_entry_end_minute}")
+    if args.v2_min_ema_spread_pct != 0:
+        parts.append(f"ema{args.v2_min_ema_spread_pct:g}")
+    if args.v2_min_breakout_distance_pct != 0:
+        parts.append(f"bo{args.v2_min_breakout_distance_pct:g}")
+    if args.v2_max_volume_ratio is not None:
+        parts.append(f"vol{args.v2_max_volume_ratio:g}")
+    return "_" + "_".join(parts) if parts else ""
+
+
 def run_one(args, code: str):
     frame, file_count = load_code(args.data_dir, code, args.start, args.end)
     strategy = build_strategy(args)
@@ -315,6 +348,10 @@ def run_one(args, code: str):
         fee_bps=args.fee_bps,
         slippage_bps=args.slippage_bps,
         execution=args.execution,
+        atr_period=args.atr_period,
+        stop_atr=args.stop_atr,
+        trailing_atr=args.trailing_atr,
+        max_hold_bars=args.max_hold_bars,
     )
     result = run_backtest(frame, strategy, config)
     return frame, file_count, result
@@ -322,14 +359,17 @@ def run_one(args, code: str):
 
 def save_single_outputs(args, frame, result, file_count, code: str):
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    prefix = f"{code}_{args.start:%Y%m%d}_{args.end:%Y%m%d}_{args.strategy}"
+    prefix = (
+        f"{code}_{args.start:%Y%m%d}_{args.end:%Y%m%d}_{args.strategy}"
+        f"{v2_tag(args)}{risk_tag(args)}"
+    )
     summary_path = args.output_dir / f"{prefix}_summary.csv"
     trades_path = args.output_dir / f"{prefix}_trades.csv"
     trade_details_path = args.output_dir / f"{prefix}_trade_details.csv"
     equity_path = args.output_dir / f"{prefix}_equity.csv"
     pd.DataFrame([result_row(result)]).to_csv(summary_path, index=False, encoding="utf-8-sig")
     pd.DataFrame([t.__dict__ for t in result.trades]).to_csv(trades_path, index=False, encoding="utf-8-sig")
-    details = build_trade_details(
+    trade_details = build_trade_details(
         frame,
         result,
         strategy_name=args.strategy,
@@ -341,9 +381,9 @@ def save_single_outputs(args, frame, result, file_count, code: str):
         v2_slow_ema=args.v2_slow_ema,
         v2_breakout_lookback=args.v2_breakout_lookback,
     )
-    details.to_csv(trade_details_path, index=False, encoding="utf-8-sig")
+    trade_details.to_csv(trade_details_path, index=False, encoding="utf-8-sig")
     result.equity_curve.to_csv(equity_path, index=False)
-    return summary_path, trade_details_path, details
+    return summary_path, trade_details_path, trade_details
 
 
 def print_result(args, result, file_count, code: str):
@@ -356,25 +396,11 @@ def print_result(args, result, file_count, code: str):
     print(f"거래수: {result.total_trades}")
     print(f"승률: {result.win_rate_pct:.2f}%")
     print(f"Profit Factor: {result.profit_factor:.3f}")
-
-
-def print_diagnostics(args, frame):
-    from src.backtest.strategies import diagnose_one_minute_scalping_proxy
-    diagnostics = diagnose_one_minute_scalping_proxy(
-        frame,
-        rsi_period=args.rsi_period,
-        rsi_buy=args.rsi_buy,
-        rsi_sell=args.rsi_sell,
-        volume_multiplier=args.volume_multiplier,
-        average_window=args.average_window,
-        price_distance_pct=args.price_distance_pct,
+    print(
+        "Risk: "
+        f"ATR={args.atr_period}, stop={args.stop_atr}, "
+        f"trailing={args.trailing_atr}, max_hold={args.max_hold_bars}"
     )
-    print("\n[조건 진단]")
-    print(f"유효 봉 수: {diagnostics['valid_bars']:,}")
-    print(f"RSI >= {args.rsi_buy:g}: {diagnostics['rsi_buy_pass']:,}")
-    print(f"거래량 >= 평균×{args.volume_multiplier:g}: {diagnostics['volume_pass']:,}")
-    print(f"종가 >= 평균 대비 {args.price_distance_pct:g}%: {diagnostics['price_pass']:,}")
-    print(f"세 조건 동시 충족: {diagnostics['all_buy_pass']:,}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -414,7 +440,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--v2-entry-end-minute", type=int, default=1439, help="14:59=899")
     parser.add_argument("--v2-min-ema-spread-pct", type=float, default=0.0)
     parser.add_argument("--v2-min-breakout-distance-pct", type=float, default=0.0)
-    parser.add_argument("--v2-max-volume-ratio", type=float, default=None, help="0 또는 미지정이면 상한 없음")
+    parser.add_argument("--v2-max-volume-ratio", type=float, default=None)
 
     parser.add_argument("--trend-fast-ema", type=int, default=5)
     parser.add_argument("--trend-slow-ema", type=int, default=20)
@@ -426,6 +452,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trend-volume-multiplier", type=float, default=1.5)
     parser.add_argument("--pullback-pct", type=float, default=0.8)
     parser.add_argument("--trend-sell-rsi", type=float, default=45.0)
+
+    parser.add_argument("--atr-period", type=int, default=None, help="ATR period; required for ATR stop/trailing")
+    parser.add_argument("--stop-atr", type=float, default=None, help="stop distance as ATR multiple")
+    parser.add_argument("--trailing-atr", type=float, default=None, help="trailing distance as ATR multiple")
+    parser.add_argument("--max-hold-bars", type=int, default=None, help="maximum holding bars")
+
     parser.add_argument("--diagnostics", action="store_true")
     parser.add_argument("--execution", choices=["next_open", "close"], default="next_open")
     return parser
@@ -443,12 +475,22 @@ def main() -> int:
         parser.error("비용은 0 이상이어야 합니다.")
     if args.max_stocks is not None and args.max_stocks <= 0:
         parser.error("--max-stocks는 1 이상이어야 합니다.")
-    if not (0 <= args.v2_entry_start_minute <= args.v2_entry_end_minute <= 1439):
-        parser.error("v2 entry session must be within 0~1439 minutes")
+    if args.atr_period is not None and args.atr_period < 2:
+        parser.error("--atr-period는 2 이상이어야 합니다.")
+    if (args.stop_atr is not None or args.trailing_atr is not None) and args.atr_period is None:
+        parser.error("--stop-atr/--trailing-atr 사용 시 --atr-period가 필요합니다.")
+    if args.stop_atr is not None and args.stop_atr <= 0:
+        parser.error("--stop-atr는 0보다 커야 합니다.")
+    if args.trailing_atr is not None and args.trailing_atr <= 0:
+        parser.error("--trailing-atr는 0보다 커야 합니다.")
+    if args.max_hold_bars is not None and args.max_hold_bars <= 0:
+        parser.error("--max-hold-bars는 0보다 커야 합니다.")
+    if not 0 <= args.v2_entry_start_minute <= args.v2_entry_end_minute <= 1439:
+        parser.error("V2 진입 시간은 0~1439 범위에서 start <= end여야 합니다.")
     if args.v2_min_ema_spread_pct < 0 or args.v2_min_breakout_distance_pct < 0:
-        parser.error("v2 entry thresholds must be >= 0")
+        parser.error("V2 entry threshold는 0 이상이어야 합니다.")
     if args.v2_max_volume_ratio is not None and args.v2_max_volume_ratio <= 0:
-        args.v2_max_volume_ratio = None
+        parser.error("--v2-max-volume-ratio는 0보다 커야 합니다.")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -462,17 +504,8 @@ def main() -> int:
             print(f"백테스트 실패: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 2
         print_result(args, result, file_count, args.code)
-        if args.diagnostics and args.strategy == "scalping_proxy":
-            print_diagnostics(args, frame)
         if args.strategy == "scalping_proxy_v2":
             print_v2_diagnostics(trade_details)
-            print(
-                "V2 filters: "
-                f"session={args.v2_entry_start_minute}-{args.v2_entry_end_minute}, "
-                f"ema_spread>={args.v2_min_ema_spread_pct:g}%, "
-                f"breakout>={args.v2_min_breakout_distance_pct:g}%, "
-                f"max_volume={args.v2_max_volume_ratio if args.v2_max_volume_ratio is not None else 'none'}"
-            )
         print(f"거래 상세: {trade_details_path}")
         print(f"결과: {summary_path}")
         return 0
@@ -494,7 +527,7 @@ def main() -> int:
         index_name = str(item.index)
         print(f"[{n}/{len(universe)}] {code} {name} | {index_name}")
         try:
-            frame, file_count, result = run_one(args, code)
+            _, file_count, result = run_one(args, code)
         except FileNotFoundError as exc:
             print(f"    ↳ SKIP: {exc}")
             skipped += 1
@@ -508,9 +541,8 @@ def main() -> int:
         rows.append(row)
         print(
             f"    ↳ return={result.equity_return_pct:.2f}% | "
-            f"MDD={result.max_drawdown_pct:.2f}% | "
-            f"trades={result.total_trades} | win={result.win_rate_pct:.2f}% | "
-            f"PF={result.profit_factor:.3f}"
+            f"MDD={result.max_drawdown_pct:.2f}% | trades={result.total_trades} | "
+            f"win={result.win_rate_pct:.2f}% | PF={result.profit_factor:.3f}"
         )
 
     if not rows:
@@ -521,11 +553,11 @@ def main() -> int:
     result_frame = result_frame[
         [
             "code", "name", "index", "files", "initial_cash", "final_cash",
-            "equity_return_pct", "max_drawdown_pct", "total_trades",
-            "winning_trades", "losing_trades", "win_rate_pct", "profit_factor",
+            "equity_return_pct", "max_drawdown_pct", "total_trades", "winning_trades",
+            "losing_trades", "win_rate_pct", "profit_factor",
         ]
     ].sort_values("equity_return_pct", ascending=False)
-    prefix = f"universe_{args.start:%Y%m%d}_{args.end:%Y%m%d}_{args.strategy}"
+    prefix = f"universe_{args.start:%Y%m%d}_{args.end:%Y%m%d}_{args.strategy}{v2_tag(args)}{risk_tag(args)}"
     output_path = args.output_dir / f"{prefix}_summary.csv"
     result_frame.to_csv(output_path, index=False, encoding="utf-8-sig")
     profitable = int((result_frame["equity_return_pct"] > 0).sum())
