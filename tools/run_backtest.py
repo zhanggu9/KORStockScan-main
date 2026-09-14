@@ -38,8 +38,7 @@ def trading_files(data_dir: Path, code: str, start, end):
             path = data_dir / code / f"{day:%Y%m%d}.csv"
             if path.exists():
                 yield path
-        day = day.fromordinal(day.toordinal() + 1
-)
+        day = day.fromordinal(day.toordinal() + 1)
 
 
 def load_code(data_dir: Path, code: str, start, end) -> tuple[pd.DataFrame, int]:
@@ -447,7 +446,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--initial-cash", type=float, default=10_000_000.0)
     parser.add_argument("--fee-bps", type=float, default=15.0)
     parser.add_argument("--slippage-bps", type=float, default=5.0)
-    parser.add_argument("--strategy", choices=["scalping_proxy", "scalping_proxy_v2", "trend_scaling", "ema"], default="scalping_proxy")
+    parser.add_argument("--strategy", choices=["scalping_proxy", "scalping_proxy_v2", "trend_scalping", "ema"], default="scalping_proxy")
     parser.add_argument("--fast", type=int, default=5)
     parser.add_argument("--slow", type=int, default=20)
     parser.add_argument("--rsi-period", type=int, default=14)
