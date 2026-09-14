@@ -12,7 +12,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.backtest.engine import BacktestConfig, run_backtest  # noqa: E402
-from src.backtest.scalping_proxy_v2 import scalping_proxy_v2_strategy  # noqa: E402
+from src.backtest.scalping_proxy_v2 import (  # noqa: E402
+    scalping_proxy_v2_indicators,
+    scalping_proxy_v2_strategy,
+)
 from src.backtest.strategies import (  # noqa: E402
     _rsi,
     ema_cross_strategy,
@@ -126,6 +129,11 @@ def build_trade_details(
     strategy_name: str,
     rsi_period: int,
     average_window: int,
+    v2_rsi_period: int = 14,
+    v2_volume_window: int = 3,
+    v2_fast_ema: int = 9,
+    v2_slow_ema: int = 20,
+    v2_breakout_lookback: int = 2,
 ) -> pd.DataFrame:
     if not result.trades:
         return pd.DataFrame()
@@ -140,6 +148,17 @@ def build_trade_details(
         .drop_duplicates("datetime")
         .reset_index(drop=True)
     )
+
+    v2_indicators = None
+    if strategy_name == "scalping_proxy_v2":
+        v2_indicators = scalping_proxy_v2_indicators(
+            bars,
+            rsi_period=v2_rsi_period,
+            volume_window=v2_volume_window,
+            fast_ema=v2_fast_ema,
+            slow_ema=v2_slow_ema,
+            breakout_lookback=v2_breakout_lookback,
+        )
 
     rows: list[dict] = []
     for trade_no, trade in enumerate(result.trades, start=1):
@@ -164,6 +183,21 @@ def build_trade_details(
         signal_rsi = float("nan")
         volume_ratio = float("nan")
         price_distance_pct = float("nan")
+        v2_ema_fast = float("nan")
+        v2_ema_slow = float("nan")
+        v2_ema_spread_pct = float("nan")
+        v2_ema_slow_slope_pct = float("nan")
+        v2_vwap = float("nan")
+        v2_vwap_distance_pct = float("nan")
+        v2_vwap_slope_pct = float("nan")
+        v2_breakout_distance_pct = float("nan")
+        v2_signal_strength = float("nan")
+        v2_trend_ok = None
+        v2_vwap_ok = None
+        v2_momentum_ok = None
+        v2_volume_ok = None
+        v2_breakout_ok = None
+
         if entry_idx > 0:
             signal_idx = entry_idx - 1
             signal_time = pd.Timestamp(bars.iloc[signal_idx]["datetime"])
@@ -172,7 +206,7 @@ def build_trade_details(
                 history = bars.iloc[: signal_idx + 1]
                 closes = history["close"]
                 volumes = history["volume"]
-                signal_rsi = _rsi(closes, rsi_period)
+                signal_rsi = _rsi(closes, rsi_period).iloc[-1]
                 prior_closes = closes.iloc[-average_window - 1 : -1]
                 prior_volumes = volumes.iloc[-average_window - 1 : -1]
                 if len(prior_closes) == average_window and len(prior_volumes) == average_window:
@@ -182,6 +216,25 @@ def build_trade_details(
                         price_distance_pct = (signal_close / avg_close - 1.0) * 100.0
                     if avg_volume > 0:
                         volume_ratio = float(bars.iloc[signal_idx]["volume"]) / avg_volume
+            elif strategy_name == "scalping_proxy_v2" and v2_indicators is not None:
+                diag = v2_indicators.iloc[signal_idx]
+                signal_rsi = float(diag["v2_rsi"])
+                volume_ratio = float(diag["v2_volume_ratio"])
+                price_distance_pct = float(diag["v2_vwap_distance_pct"])
+                v2_ema_fast = float(diag["v2_ema_fast"])
+                v2_ema_slow = float(diag["v2_ema_slow"])
+                v2_ema_spread_pct = float(diag["v2_ema_spread_pct"])
+                v2_ema_slow_slope_pct = float(diag["v2_ema_slow_slope_pct"])
+                v2_vwap = float(diag["v2_vwap"])
+                v2_vwap_distance_pct = float(diag["v2_vwap_distance_pct"])
+                v2_vwap_slope_pct = float(diag["v2_vwap_slope_pct"])
+                v2_breakout_distance_pct = float(diag["v2_breakout_distance_pct"])
+                v2_signal_strength = float(diag["v2_signal_strength"])
+                v2_trend_ok = bool(diag["v2_trend_ok"])
+                v2_vwap_ok = bool(diag["v2_vwap_ok"])
+                v2_momentum_ok = bool(diag["v2_momentum_ok"])
+                v2_volume_ok = bool(diag["v2_volume_ok"])
+                v2_breakout_ok = bool(diag["v2_breakout_ok"])
 
         rows.append({
             "trade_no": trade_no,
@@ -195,17 +248,84 @@ def build_trade_details(
             "holding_minutes": holding_minutes,
             "gross_pnl": trade.gross_pnl,
             "fees": trade.fees,
+            "slippage_cost": trade.slippage_cost,
             "net_pnl": trade.net_pnl,
             "return_pct": trade.return_pct,
             "signal_close": signal_close,
             "signal_rsi": signal_rsi,
             "signal_volume_ratio": volume_ratio,
             "signal_price_distance_pct": price_distance_pct,
+            "v2_ema_fast": v2_ema_fast,
+            "v2_ema_slow": v2_ema_slow,
+            "v2_ema_spread_pct": v2_ema_spread_pct,
+            "v2_ema_slow_slope_pct": v2_ema_slow_slope_pct,
+            "v2_vwap": v2_vwap,
+            "v2_vwap_distance_pct": v2_vwap_distance_pct,
+            "v2_vwap_slope_pct": v2_vwap_slope_pct,
+            "v2_breakout_distance_pct": v2_breakout_distance_pct,
+            "v2_signal_strength": v2_signal_strength,
+            "v2_trend_ok": v2_trend_ok,
+            "v2_vwap_ok": v2_vwap_ok,
+            "v2_momentum_ok": v2_momentum_ok,
+            "v2_volume_ok": v2_volume_ok,
+            "v2_breakout_ok": v2_breakout_ok,
             "max_favorable_excursion_pct": mfe_pct,
             "max_adverse_excursion_pct": mae_pct,
             "result": "WIN" if trade.net_pnl > 0 else "LOSS" if trade.net_pnl < 0 else "FLAT",
         })
     return pd.DataFrame(rows)
+
+
+def print_v2_diagnostics(trade_details: pd.DataFrame):
+    if trade_details.empty:
+        return
+
+    df = trade_details.copy()
+    print("\n===== scalping_proxy_v2 거래 진입조건 분석 =====")
+    grouped = df.groupby("result", dropna=False)
+    for label in ["WIN", "LOSS"]:
+        if label not in grouped.groups:
+            continue
+        g = grouped.get_group(label)
+        print(
+            f"{label}: n={len(g)} | 평균 net={g['net_pnl'].mean():,.0f} | "
+            f"평균 return={g['return_pct'].mean():.3f}% | "
+            f"평균 MFE={g['max_favorable_excursion_pct'].mean():.3f}% | "
+            f"평균 MAE={g['max_adverse_excursion_pct'].mean():.3f}% | "
+            f"평균 RSI={g['signal_rsi'].mean():.2f} | "
+            f"평균 vol={g['signal_volume_ratio'].mean():.2f}x | "
+            f"평균 EMA spread={g['v2_ema_spread_pct'].mean():.3f}% | "
+            f"평균 VWAP dist={g['v2_vwap_distance_pct'].mean():.3f}% | "
+            f"평균 breakout={g['v2_breakout_distance_pct'].mean():.3f}%"
+        )
+
+    print("\n[진입조건 통과율]")
+    for col, name in [
+        ("v2_trend_ok", "EMA trend"),
+        ("v2_vwap_ok", "VWAP"),
+        ("v2_momentum_ok", "RSI"),
+        ("v2_volume_ok", "Volume"),
+        ("v2_breakout_ok", "Breakout"),
+    ]:
+        rates = df.groupby("result")[col].mean() * 100.0
+        win = rates.get("WIN", float("nan"))
+        loss = rates.get("LOSS", float("nan"))
+        print(f"{name}: WIN {win:.1f}% | LOSS {loss:.1f}%")
+
+    df["entry_hour"] = pd.to_datetime(df["signal_time"]).dt.hour
+    hourly = (
+        df.groupby("entry_hour")
+        .agg(trades=("trade_no", "count"), win_rate=("net_pnl", lambda s: (s > 0).mean() * 100.0), avg_return=("return_pct", "mean"), avg_mae=("max_adverse_excursion_pct", "mean"), avg_mfe=("max_favorable_excursion_pct", "mean"))
+        .sort_index()
+    )
+    print("\n[시간대별]")
+    print(hourly.to_string(float_format=lambda x: f"{x:.3f}"))
+
+    bad_entry = df[(df["max_favorable_excursion_pct"] < 0.5) & (df["return_pct"] < 0)]
+    delayed_exit = df[(df["max_favorable_excursion_pct"] >= 1.0) & (df["return_pct"] < 0)]
+    print("\n[진입/청산 분류]")
+    print(f"진입 자체가 나빴다고 볼 수 있는 거래(MFE < 0.5%, LOSS): {len(bad_entry)}")
+    print(f"진입 후 충분히 올랐지만 손실로 끝난 거래(MFE >= 1.0%, LOSS): {len(delayed_exit)}")
 
 
 def run_one(args, code: str):
@@ -230,10 +350,21 @@ def save_single_outputs(args, frame, result, file_count, code: str):
     equity_path = args.output_dir / f"{prefix}_equity.csv"
     pd.DataFrame([result_row(result)]).to_csv(summary_path, index=False, encoding="utf-8-sig")
     pd.DataFrame([t.__dict__ for t in result.trades]).to_csv(trades_path, index=False, encoding="utf-8-sig")
-    trade_details = build_trade_details(frame, result, strategy_name=args.strategy, rsi_period=args.rsi_period, average_window=args.average_window)
+    trade_details = build_trade_details(
+        frame,
+        result,
+        strategy_name=args.strategy,
+        rsi_period=args.rsi_period,
+        average_window=args.average_window,
+        v2_rsi_period=args.v2_rsi_period,
+        v2_volume_window=args.v2_volume_window,
+        v2_fast_ema=args.v2_fast_ema,
+        v2_slow_ema=args.v2_slow_ema,
+        v2_breakout_lookback=args.v2_breakout_lookback,
+    )
     trade_details.to_csv(trade_details_path, index=False, encoding="utf-8-sig")
     result.equity_curve.to_csv(equity_path, index=False)
-    return summary_path, trade_details_path
+    return summary_path, trade_details_path, trade_details
 
 
 def print_result(args, result, file_count, code: str):
@@ -331,13 +462,15 @@ def main() -> int:
     if not args.universe:
         try:
             frame, file_count, result = run_one(args, args.code)
-            summary_path, trade_details_path = save_single_outputs(args, frame, result, file_count, args.code)
+            summary_path, trade_details_path, trade_details = save_single_outputs(args, frame, result, file_count, args.code)
         except Exception as exc:
             print(f"백테스트 실패: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 2
         print_result(args, result, file_count, args.code)
         if args.diagnostics and args.strategy == "scalping_proxy":
             print_diagnostics(args, frame)
+        if args.strategy == "scalping_proxy_v2":
+            print_v2_diagnostics(trade_details)
         print(f"거래 상세: {trade_details_path}")
         print(f"결과: {summary_path}")
         return 0
