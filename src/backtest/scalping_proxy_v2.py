@@ -6,7 +6,7 @@ from typing import Callable, Literal
 import pandas as pd
 
 Action = Literal["BUY", "SELL", "HOLD"]
-SignalFn = Callable[[pd.Series, pd.DataFrame], Action]
+SignalFn = Callable[[pd.Series, pd.DataFrame | None], Action]
 
 
 def _ema(series: pd.Series, span: int) -> pd.Series:
@@ -43,7 +43,6 @@ def scalping_proxy_v2_indicators(
     breakout_lookback: int = 2,
     require_vwap_rising: bool = True,
 ) -> pd.DataFrame:
-    """Reconstruct v2 signal-time indicators for trade diagnostics."""
     if not (1 <= fast_ema < slow_ema):
         raise ValueError("fast_ema must be smaller than slow_ema")
     if rsi_period < 2 or not (0 <= rsi_min < rsi_max <= 100):
@@ -83,17 +82,11 @@ def scalping_proxy_v2_indicators(
     out["v2_volume_ratio"] = out["volume"] / prior_volume.replace(0.0, float("nan"))
     out["v2_breakout_distance_pct"] = (out["close"] / prior_high - 1.0) * 100.0
     out["v2_trend_ok"] = (out["v2_ema_fast"] > out["v2_ema_slow"]) & (out["v2_ema_slow_slope_pct"] > 0)
-    out["v2_vwap_ok"] = (out["close"] > out["v2_vwap"]) & (
-        ~require_vwap_rising | (out["v2_vwap_slope_pct"] >= 0)
-    )
+    out["v2_vwap_ok"] = (out["close"] > out["v2_vwap"]) & (~require_vwap_rising | (out["v2_vwap_slope_pct"] >= 0))
     out["v2_momentum_ok"] = out["v2_rsi"].between(rsi_min, rsi_max, inclusive="both")
     out["v2_volume_ok"] = out["v2_volume_ratio"] >= volume_multiplier
     out["v2_breakout_ok"] = out["close"] > prior_high
-    out["v2_signal_strength"] = (
-        out[["v2_trend_ok", "v2_vwap_ok", "v2_momentum_ok", "v2_volume_ok", "v2_breakout_ok"]]
-        .astype(int)
-        .sum(axis=1)
-    )
+    out["v2_signal_strength"] = out[["v2_trend_ok", "v2_vwap_ok", "v2_momentum_ok", "v2_volume_ok", "v2_breakout_ok"]].astype(int).sum(axis=1)
     return out
 
 
@@ -113,11 +106,6 @@ def scalping_proxy_v2_strategy(
     min_breakout_distance_pct: float = 0.0,
     max_volume_ratio: float | None = None,
 ) -> SignalFn:
-    """Momentum scalping proxy filtered by EMA trend and session VWAP.
-
-    Indicator values are updated incrementally per bar instead of being
-    recomputed from the full history on every strategy call.
-    """
     if not (1 <= fast_ema < slow_ema):
         raise ValueError("fast_ema must be smaller than slow_ema")
     if rsi_period < 2 or not (0 <= rsi_min < rsi_max <= 100):
@@ -176,21 +164,20 @@ def scalping_proxy_v2_strategy(
         vwap_value = None
         previous_vwap = None
 
-    def strategy(bar: pd.Series, history: pd.DataFrame) -> Action:
+    def strategy(bar: pd.Series, history: pd.DataFrame | None = None) -> Action:
         nonlocal count, previous_datetime, previous_close
         nonlocal fast_value, slow_value, previous_slow
         nonlocal avg_gain, avg_loss, valid_rsi_deltas
         nonlocal cumulative_pv, cumulative_volume, session_date
         nonlocal vwap_value, previous_vwap
 
-        if history.empty:
+        current = bar if bar is not None else (history.iloc[-1] if history is not None and not history.empty else None)
+        if current is None:
             return "HOLD"
 
-        current = history.iloc[-1]
         timestamp = pd.to_datetime(current["datetime"], errors="coerce")
         if pd.isna(timestamp):
             return "HOLD"
-
         if previous_datetime is not None and timestamp <= previous_datetime:
             reset()
 
@@ -200,10 +187,7 @@ def scalping_proxy_v2_strategy(
         volume = pd.to_numeric(current["volume"], errors="coerce")
         if any(pd.isna(v) for v in [close, high, low, volume]):
             return "HOLD"
-        close = float(close)
-        high = float(high)
-        low = float(low)
-        volume = float(volume)
+        close, high, low, volume = map(float, (close, high, low, volume))
 
         if count == 0:
             fast_value = close
@@ -219,8 +203,7 @@ def scalping_proxy_v2_strategy(
             gain = max(delta, 0.0)
             loss = max(-delta, 0.0)
             if valid_rsi_deltas == 0:
-                avg_gain = gain
-                avg_loss = loss
+                avg_gain, avg_loss = gain, loss
             else:
                 avg_gain = alpha_rsi * gain + (1.0 - alpha_rsi) * avg_gain
                 avg_loss = alpha_rsi * loss + (1.0 - alpha_rsi) * avg_loss
@@ -253,12 +236,7 @@ def scalping_proxy_v2_strategy(
         if prior_volume <= 0 or pd.isna(recent_high):
             return "HOLD"
 
-        if avg_loss == 0.0:
-            rv = 100.0
-        else:
-            rs = avg_gain / avg_loss
-            rv = 100.0 - (100.0 / (1.0 + rs))
-
+        rv = 100.0 if avg_loss == 0.0 else 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
         trend_ok = fast_value > slow_value and slow_value > previous_slow
         vwap_ok = close > vwap_value and (not require_vwap_rising or vwap_value >= previous_vwap)
         momentum_ok = rsi_min <= rv <= rsi_max
@@ -272,17 +250,7 @@ def scalping_proxy_v2_strategy(
         breakout_strength_ok = breakout_distance_pct >= min_breakout_distance_pct
         session_ok = _session_minute_ok(timestamp, entry_start_minute, entry_end_minute)
 
-        if (
-            trend_ok
-            and vwap_ok
-            and momentum_ok
-            and volume_ok
-            and volume_cap_ok
-            and breakout_ok
-            and ema_spread_ok
-            and breakout_strength_ok
-            and session_ok
-        ):
+        if trend_ok and vwap_ok and momentum_ok and volume_ok and volume_cap_ok and breakout_ok and ema_spread_ok and breakout_strength_ok and session_ok:
             return "BUY"
         if close < fast_value or close < vwap_value or rv < rsi_min - 10.0:
             return "SELL"
