@@ -145,7 +145,6 @@ def run_backtest(frame: pd.DataFrame, strategy: SignalFn, config: BacktestConfig
 
     pending: Action = "HOLD"
     pending_index: int | None = None
-    pending_reason = "SIGNAL"
 
     def execute(action: Action, index: int, reason: str = "SIGNAL", quantity_override: int | None = None) -> int:
         nonlocal cash, quantity, entry_time, entry_price, entry_fees, entry_slippage_cost
@@ -222,10 +221,10 @@ def run_backtest(frame: pd.DataFrame, strategy: SignalFn, config: BacktestConfig
             return sell_qty
         return 0
 
-    def risk_exit(index: int) -> str | None:
+    def risk_exit(index: int) -> bool:
         nonlocal highest_high, hold_bars, peak_stage
         if quantity <= 0:
-            return None
+            return False
         bar = bars.iloc[index]
         highest_high = max(highest_high, float(bar["high"]))
         hold_bars += 1
@@ -245,88 +244,70 @@ def run_backtest(frame: pd.DataFrame, strategy: SignalFn, config: BacktestConfig
         high = float(bar["high"])
 
         if stop_price is not None and low <= stop_price:
-            return "ATR_STOP"
+            execute("SELL", index, "ATR_STOP")
+            return True
         if target_price is not None and high >= target_price:
-            return "ATR_TARGET"
+            execute("SELL", index, "ATR_TARGET")
+            return True
 
         if config.peak_retrace_2_pct is not None and peak_stage < 2:
             retrace_2 = (highest_high - low) / highest_high * 100.0 if highest_high > 0 else 0.0
             if retrace_2 >= config.peak_retrace_2_pct and peak_stage >= 1:
-                return "PEAK_RETRACE_2"
+                sell_qty = int(round(quantity * config.peak_retrace_2_ratio))
+                if sell_qty <= 0:
+                    sell_qty = quantity
+                execute("SELL", index, "PEAK_RETRACE_2", sell_qty)
+                peak_stage = 2
+                return quantity == 0
 
         if config.peak_retrace_1_pct is not None and peak_stage == 0:
             retrace_1 = (highest_high - low) / highest_high * 100.0 if highest_high > 0 else 0.0
             if retrace_1 >= config.peak_retrace_1_pct and highest_high > entry_price:
-                return "PEAK_RETRACE_1"
+                sell_qty = int(round(quantity * config.peak_retrace_1_ratio))
+                if sell_qty >= quantity:
+                    sell_qty = max(quantity - 1, 0)
+                if sell_qty > 0:
+                    execute("SELL", index, "PEAK_RETRACE_1", sell_qty)
+                    peak_stage = 1
+                    if quantity == 0:
+                        return True
 
         if trail_price is not None and low <= trail_price and highest_high > entry_price:
-            return "ATR_TRAILING"
+            execute("SELL", index, "ATR_TRAILING")
+            return True
         if config.max_hold_bars is not None and hold_bars >= config.max_hold_bars:
-            return "TIME_STOP"
-        return None
-
-    def execute_risk(index: int, reason: str) -> bool:
-        nonlocal peak_stage
-        if reason == "PEAK_RETRACE_2":
-            sell_qty = int(round(quantity * config.peak_retrace_2_ratio))
-            if sell_qty <= 0:
-                sell_qty = quantity
-            execute("SELL", index, reason, sell_qty)
-            peak_stage = 2
-            return quantity == 0
-        if reason == "PEAK_RETRACE_1":
-            sell_qty = int(round(quantity * config.peak_retrace_1_ratio))
-            if sell_qty >= quantity:
-                sell_qty = max(quantity - 1, 0)
-            if sell_qty > 0:
-                execute("SELL", index, reason, sell_qty)
-                peak_stage = 1
-            return quantity == 0
-        execute("SELL", index, reason)
-        return True
+            execute("SELL", index, "TIME_STOP")
+            return True
+        return False
 
     for i in range(len(bars)):
         current_day = bars.iloc[i]["datetime"].date()
         next_day = bars.iloc[i + 1]["datetime"].date() if i + 1 < len(bars) else None
-        is_day_end = next_day != current_day
 
         if pending_index is not None and pending_index == i:
-            execute(pending, i, pending_reason)
+            execute(pending, i)
             pending = "HOLD"
             pending_index = None
-            pending_reason = "SIGNAL"
 
-        risk_reason = risk_exit(i)
-        risk_triggered = False
-        if risk_reason is not None:
-            if config.execution == "next_open" and not is_day_end:
-                pending = "SELL"
-                pending_index = i + 1
-                pending_reason = risk_reason
-                risk_triggered = True
-            else:
-                risk_triggered = execute_risk(i, risk_reason)
-
+        risk_triggered = risk_exit(i)
         history = bars.iloc[: i + 1]
         action = "HOLD" if risk_triggered else strategy(bars.iloc[i], history)
         if action not in {"BUY", "SELL", "HOLD"}:
             raise ValueError(f"Strategy returned invalid action: {action!r}")
 
+        is_day_end = next_day != current_day
         if config.execution == "close":
             execute(action, i)
             if is_day_end and config.force_close_eod and quantity > 0:
                 execute("SELL", i, "EOD")
         elif not is_day_end:
-            if pending is None or pending == "HOLD":
-                pending = action
-                pending_index = i + 1
-                pending_reason = "SIGNAL"
+            pending = action
+            pending_index = i + 1
         elif config.force_close_eod:
             if quantity > 0:
                 execute("SELL", i, "EOD")
             pending = "HOLD"
             pending_index = None
-            pending_reason = "SIGNAL"
 
         mark = cash + quantity * float(bars.iloc[i]["close"])
         equity_rows.append({"datetime": bars.iloc[i]["datetime"], "equity": mark})
