@@ -217,22 +217,6 @@ def build_trade_details(
                         volume_ratio = float(bars.iloc[signal_idx]["volume"]) / avg_volume
             elif strategy_name == "scalping_proxy_v2" and v2_indicators is not None:
                 diag = v2_indicators.iloc[signal_idx]
-                for name, source in [
-                    ("signal_rsi", "v2_rsi"),
-                    ("volume_ratio", "v2_volume_ratio"),
-                    ("price_distance_pct", "v2_vwap_distance_pct"),
-                    ("v2_ema_fast", "v2_ema_fast"),
-                    ("v2_ema_slow", "v2_ema_slow"),
-                    ("v2_ema_spread_pct", "v2_ema_spread_pct"),
-                    ("v2_ema_slow_slope_pct", "v2_ema_slow_slope_pct"),
-                    ("v2_vwap", "v2_vwap"),
-                    ("v2_vwap_distance_pct", "v2_vwap_distance_pct"),
-                    ("v2_vwap_slope_pct", "v2_vwap_slope_pct"),
-                    ("v2_breakout_distance_pct", "v2_breakout_distance_pct"),
-                ]:
-                    value = diag[source]
-                    if pd.notna(value):
-                        locals()[name] = float(value)
                 signal_rsi = float(diag["v2_rsi"])
                 volume_ratio = float(diag["v2_volume_ratio"])
                 price_distance_pct = float(diag["v2_vwap_distance_pct"])
@@ -426,8 +410,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--v2-slow-ema", type=int, default=20)
     parser.add_argument("--v2-breakout-lookback", type=int, default=2)
     parser.add_argument("--v2-require-vwap-rising", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--v2-entry-start-minute", type=int, default=540, help="09:00=540")
-    parser.add_argument("--v2-entry-end-minute", type=int, default=899, help="14:59=899")
+    parser.add_argument("--v2-entry-start-minute", type=int, default=0, help="09:00=540")
+    parser.add_argument("--v2-entry-end-minute", type=int, default=1439, help="14:59=899")
     parser.add_argument("--v2-min-ema-spread-pct", type=float, default=0.0)
     parser.add_argument("--v2-min-breakout-distance-pct", type=float, default=0.0)
     parser.add_argument("--v2-max-volume-ratio", type=float, default=None, help="0 또는 미지정이면 상한 없음")
