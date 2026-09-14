@@ -26,6 +26,11 @@ def _rsi(series: pd.Series, period: int) -> pd.Series:
     return out
 
 
+def _session_minute_ok(timestamp: pd.Timestamp, start_minute: int, end_minute: int) -> bool:
+    minute = timestamp.hour * 60 + timestamp.minute
+    return start_minute <= minute <= end_minute
+
+
 def scalping_proxy_v2_indicators(
     frame: pd.DataFrame,
     rsi_period: int = 14,
@@ -102,6 +107,11 @@ def scalping_proxy_v2_strategy(
     slow_ema: int = 20,
     breakout_lookback: int = 2,
     require_vwap_rising: bool = True,
+    entry_start_minute: int = 540,
+    entry_end_minute: int = 899,
+    min_ema_spread_pct: float = 0.0,
+    min_breakout_distance_pct: float = 0.0,
+    max_volume_ratio: float | None = None,
 ) -> SignalFn:
     """Momentum scalping proxy filtered by EMA trend and session VWAP.
 
@@ -114,6 +124,12 @@ def scalping_proxy_v2_strategy(
         raise ValueError("invalid RSI parameters")
     if volume_multiplier <= 0 or volume_window < 1 or breakout_lookback < 1:
         raise ValueError("invalid volume/breakout parameters")
+    if not (0 <= entry_start_minute <= entry_end_minute <= 1439):
+        raise ValueError("invalid entry session")
+    if min_ema_spread_pct < 0 or min_breakout_distance_pct < 0:
+        raise ValueError("entry quality thresholds must be non-negative")
+    if max_volume_ratio is not None and max_volume_ratio <= 0:
+        raise ValueError("max_volume_ratio must be positive or None")
 
     min_history = max(slow_ema + 2, rsi_period + 2, volume_window + 2, breakout_lookback + 2, 10)
     alpha_rsi = 1.0 / rsi_period
@@ -246,10 +262,27 @@ def scalping_proxy_v2_strategy(
         trend_ok = fast_value > slow_value and slow_value > previous_slow
         vwap_ok = close > vwap_value and (not require_vwap_rising or vwap_value >= previous_vwap)
         momentum_ok = rsi_min <= rv <= rsi_max
-        volume_ok = volume >= prior_volume * volume_multiplier
+        volume_ratio = volume / prior_volume
+        volume_ok = volume_ratio >= volume_multiplier
+        volume_cap_ok = max_volume_ratio is None or volume_ratio <= max_volume_ratio
+        breakout_distance_pct = (close / recent_high - 1.0) * 100.0
         breakout_ok = close > recent_high
+        ema_spread_pct = (fast_value / slow_value - 1.0) * 100.0
+        ema_spread_ok = ema_spread_pct >= min_ema_spread_pct
+        breakout_strength_ok = breakout_distance_pct >= min_breakout_distance_pct
+        session_ok = _session_minute_ok(timestamp, entry_start_minute, entry_end_minute)
 
-        if trend_ok and vwap_ok and momentum_ok and volume_ok and breakout_ok:
+        if (
+            trend_ok
+            and vwap_ok
+            and momentum_ok
+            and volume_ok
+            and volume_cap_ok
+            and breakout_ok
+            and ema_spread_ok
+            and breakout_strength_ok
+            and session_ok
+        ):
             return "BUY"
         if close < fast_value or close < vwap_value or rv < rsi_min - 10.0:
             return "SELL"
