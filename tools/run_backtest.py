@@ -47,10 +47,7 @@ def load_code(data_dir: Path, code: str, start, end) -> tuple[pd.DataFrame, int]
         raise FileNotFoundError(
             f"No minute CSV files found for {code}: {start:%Y%m%d}~{end:%Y%m%d}"
         )
-    frames = [
-        pd.read_csv(path, encoding="utf-8-sig", dtype={"code": str})
-        for path in paths
-    ]
+    frames = [pd.read_csv(path, encoding="utf-8-sig", dtype={"code": str}) for path in paths]
     return pd.concat(frames, ignore_index=True), len(paths)
 
 
@@ -111,6 +108,11 @@ def build_strategy(args):
             slow_ema=args.v2_slow_ema,
             breakout_lookback=args.v2_breakout_lookback,
             require_vwap_rising=args.v2_require_vwap_rising,
+            entry_start_minute=args.v2_entry_start_minute,
+            entry_end_minute=args.v2_entry_end_minute,
+            min_ema_spread_pct=args.v2_min_ema_spread_pct,
+            min_breakout_distance_pct=args.v2_min_breakout_distance_pct,
+            max_volume_ratio=args.v2_max_volume_ratio,
         )
     return one_minute_scalping_proxy_strategy(
         rsi_period=args.rsi_period,
@@ -176,7 +178,9 @@ def build_trade_details(
         min_low = float(trade_bars["low"].min())
         mfe_pct = (max_high / trade.entry_price - 1.0) * 100.0
         mae_pct = (min_low / trade.entry_price - 1.0) * 100.0
-        holding_minutes = (pd.Timestamp(trade.exit_time) - pd.Timestamp(trade.entry_time)).total_seconds() / 60.0
+        holding_minutes = (
+            pd.Timestamp(trade.exit_time) - pd.Timestamp(trade.entry_time)
+        ).total_seconds() / 60.0
 
         signal_time = pd.NaT
         signal_close = float("nan")
@@ -191,12 +195,6 @@ def build_trade_details(
         v2_vwap_distance_pct = float("nan")
         v2_vwap_slope_pct = float("nan")
         v2_breakout_distance_pct = float("nan")
-        v2_signal_strength = float("nan")
-        v2_trend_ok = None
-        v2_vwap_ok = None
-        v2_momentum_ok = None
-        v2_volume_ok = None
-        v2_breakout_ok = None
 
         if entry_idx > 0:
             signal_idx = entry_idx - 1
@@ -206,7 +204,8 @@ def build_trade_details(
                 history = bars.iloc[: signal_idx + 1]
                 closes = history["close"]
                 volumes = history["volume"]
-                signal_rsi = _rsi(closes, rsi_period).iloc[-1]
+                rsi = _rsi(closes, rsi_period).iloc[-1]
+                signal_rsi = float(rsi) if pd.notna(rsi) else float("nan")
                 prior_closes = closes.iloc[-average_window - 1 : -1]
                 prior_volumes = volumes.iloc[-average_window - 1 : -1]
                 if len(prior_closes) == average_window and len(prior_volumes) == average_window:
@@ -218,6 +217,22 @@ def build_trade_details(
                         volume_ratio = float(bars.iloc[signal_idx]["volume"]) / avg_volume
             elif strategy_name == "scalping_proxy_v2" and v2_indicators is not None:
                 diag = v2_indicators.iloc[signal_idx]
+                for name, source in [
+                    ("signal_rsi", "v2_rsi"),
+                    ("volume_ratio", "v2_volume_ratio"),
+                    ("price_distance_pct", "v2_vwap_distance_pct"),
+                    ("v2_ema_fast", "v2_ema_fast"),
+                    ("v2_ema_slow", "v2_ema_slow"),
+                    ("v2_ema_spread_pct", "v2_ema_spread_pct"),
+                    ("v2_ema_slow_slope_pct", "v2_ema_slow_slope_pct"),
+                    ("v2_vwap", "v2_vwap"),
+                    ("v2_vwap_distance_pct", "v2_vwap_distance_pct"),
+                    ("v2_vwap_slope_pct", "v2_vwap_slope_pct"),
+                    ("v2_breakout_distance_pct", "v2_breakout_distance_pct"),
+                ]:
+                    value = diag[source]
+                    if pd.notna(value):
+                        locals()[name] = float(value)
                 signal_rsi = float(diag["v2_rsi"])
                 volume_ratio = float(diag["v2_volume_ratio"])
                 price_distance_pct = float(diag["v2_vwap_distance_pct"])
@@ -229,12 +244,6 @@ def build_trade_details(
                 v2_vwap_distance_pct = float(diag["v2_vwap_distance_pct"])
                 v2_vwap_slope_pct = float(diag["v2_vwap_slope_pct"])
                 v2_breakout_distance_pct = float(diag["v2_breakout_distance_pct"])
-                v2_signal_strength = float(diag["v2_signal_strength"])
-                v2_trend_ok = bool(diag["v2_trend_ok"])
-                v2_vwap_ok = bool(diag["v2_vwap_ok"])
-                v2_momentum_ok = bool(diag["v2_momentum_ok"])
-                v2_volume_ok = bool(diag["v2_volume_ok"])
-                v2_breakout_ok = bool(diag["v2_breakout_ok"])
 
         rows.append({
             "trade_no": trade_no,
@@ -263,12 +272,6 @@ def build_trade_details(
             "v2_vwap_distance_pct": v2_vwap_distance_pct,
             "v2_vwap_slope_pct": v2_vwap_slope_pct,
             "v2_breakout_distance_pct": v2_breakout_distance_pct,
-            "v2_signal_strength": v2_signal_strength,
-            "v2_trend_ok": v2_trend_ok,
-            "v2_vwap_ok": v2_vwap_ok,
-            "v2_momentum_ok": v2_momentum_ok,
-            "v2_volume_ok": v2_volume_ok,
-            "v2_breakout_ok": v2_breakout_ok,
             "max_favorable_excursion_pct": mfe_pct,
             "max_adverse_excursion_pct": mae_pct,
             "result": "WIN" if trade.net_pnl > 0 else "LOSS" if trade.net_pnl < 0 else "FLAT",
@@ -279,9 +282,8 @@ def build_trade_details(
 def print_v2_diagnostics(trade_details: pd.DataFrame):
     if trade_details.empty:
         return
-
     df = trade_details.copy()
-    print("\n===== scalping_proxy_v2 거래 진입조건 분석 =====")
+    print("\n===== scalping_proxy_v2 거래 분석 =====")
     grouped = df.groupby("result", dropna=False)
     for label in ["WIN", "LOSS"]:
         if label not in grouped.groups:
@@ -299,23 +301,16 @@ def print_v2_diagnostics(trade_details: pd.DataFrame):
             f"평균 breakout={g['v2_breakout_distance_pct'].mean():.3f}%"
         )
 
-    print("\n[진입조건 통과율]")
-    for col, name in [
-        ("v2_trend_ok", "EMA trend"),
-        ("v2_vwap_ok", "VWAP"),
-        ("v2_momentum_ok", "RSI"),
-        ("v2_volume_ok", "Volume"),
-        ("v2_breakout_ok", "Breakout"),
-    ]:
-        rates = df.groupby("result")[col].mean() * 100.0
-        win = rates.get("WIN", float("nan"))
-        loss = rates.get("LOSS", float("nan"))
-        print(f"{name}: WIN {win:.1f}% | LOSS {loss:.1f}%")
-
     df["entry_hour"] = pd.to_datetime(df["signal_time"]).dt.hour
     hourly = (
         df.groupby("entry_hour")
-        .agg(trades=("trade_no", "count"), win_rate=("net_pnl", lambda s: (s > 0).mean() * 100.0), avg_return=("return_pct", "mean"), avg_mae=("max_adverse_excursion_pct", "mean"), avg_mfe=("max_favorable_excursion_pct", "mean"))
+        .agg(
+            trades=("trade_no", "count"),
+            win_rate=("net_pnl", lambda s: (s > 0).mean() * 100.0),
+            avg_return=("return_pct", "mean"),
+            avg_mae=("max_adverse_excursion_pct", "mean"),
+            avg_mfe=("max_favorable_excursion_pct", "mean"),
+        )
         .sort_index()
     )
     print("\n[시간대별]")
@@ -350,7 +345,7 @@ def save_single_outputs(args, frame, result, file_count, code: str):
     equity_path = args.output_dir / f"{prefix}_equity.csv"
     pd.DataFrame([result_row(result)]).to_csv(summary_path, index=False, encoding="utf-8-sig")
     pd.DataFrame([t.__dict__ for t in result.trades]).to_csv(trades_path, index=False, encoding="utf-8-sig")
-    trade_details = build_trade_details(
+    details = build_trade_details(
         frame,
         result,
         strategy_name=args.strategy,
@@ -362,9 +357,9 @@ def save_single_outputs(args, frame, result, file_count, code: str):
         v2_slow_ema=args.v2_slow_ema,
         v2_breakout_lookback=args.v2_breakout_lookback,
     )
-    trade_details.to_csv(trade_details_path, index=False, encoding="utf-8-sig")
+    details.to_csv(trade_details_path, index=False, encoding="utf-8-sig")
     result.equity_curve.to_csv(equity_path, index=False)
-    return summary_path, trade_details_path, trade_details
+    return summary_path, trade_details_path, details
 
 
 def print_result(args, result, file_count, code: str):
@@ -396,18 +391,14 @@ def print_diagnostics(args, frame):
     print(f"거래량 >= 평균×{args.volume_multiplier:g}: {diagnostics['volume_pass']:,}")
     print(f"종가 >= 평균 대비 {args.price_distance_pct:g}%: {diagnostics['price_pass']:,}")
     print(f"세 조건 동시 충족: {diagnostics['all_buy_pass']:,}")
-    print(f"RSI <= {args.rsi_sell:g}: {diagnostics['rsi_sell_pass']:,}")
-    print(f"최대 RSI: {diagnostics['max_rsi']:.2f}")
-    print(f"최대 거래량 배수: {diagnostics['max_volume_ratio']:.2f}x")
-    print(f"최대 평균종가 대비 상승률: {diagnostics['max_price_distance_pct']:.2f}%")
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="KORStockScan 1분봉 CSV 백테스트 실행기")
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--code", help="단일 종목코드 예: 005930")
     target.add_argument("--universe", action="store_true", help="data/universe/all.csv 전체를 일괄 백테스트")
-    parser.add_argument("--max-stocks", type=int, help="--universe에서 앞에서부터 최대 N종목만 실행")
+    parser.add_argument("--max-stocks", type=int)
     parser.add_argument("--universe-file", type=Path, default=PROJECT_ROOT / "data" / "universe" / "all.csv")
     parser.add_argument("--start", required=True, type=parse_date)
     parser.add_argument("--end", required=True, type=parse_date)
@@ -425,6 +416,7 @@ def main() -> int:
     parser.add_argument("--volume-multiplier", type=float, default=2.5)
     parser.add_argument("--average-window", type=int, default=3)
     parser.add_argument("--price-distance-pct", type=float, default=2.0)
+
     parser.add_argument("--v2-rsi-period", type=int, default=14)
     parser.add_argument("--v2-rsi-min", type=float, default=70.0)
     parser.add_argument("--v2-rsi-max", type=float, default=85.0)
@@ -434,6 +426,12 @@ def main() -> int:
     parser.add_argument("--v2-slow-ema", type=int, default=20)
     parser.add_argument("--v2-breakout-lookback", type=int, default=2)
     parser.add_argument("--v2-require-vwap-rising", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--v2-entry-start-minute", type=int, default=540, help="09:00=540")
+    parser.add_argument("--v2-entry-end-minute", type=int, default=899, help="14:59=899")
+    parser.add_argument("--v2-min-ema-spread-pct", type=float, default=0.0)
+    parser.add_argument("--v2-min-breakout-distance-pct", type=float, default=0.0)
+    parser.add_argument("--v2-max-volume-ratio", type=float, default=None, help="0 또는 미지정이면 상한 없음")
+
     parser.add_argument("--trend-fast-ema", type=int, default=5)
     parser.add_argument("--trend-slow-ema", type=int, default=20)
     parser.add_argument("--trend-ema", type=int, default=60)
@@ -446,6 +444,11 @@ def main() -> int:
     parser.add_argument("--trend-sell-rsi", type=float, default=45.0)
     parser.add_argument("--diagnostics", action="store_true")
     parser.add_argument("--execution", choices=["next_open", "close"], default="next_open")
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.end < args.start:
@@ -456,13 +459,21 @@ def main() -> int:
         parser.error("비용은 0 이상이어야 합니다.")
     if args.max_stocks is not None and args.max_stocks <= 0:
         parser.error("--max-stocks는 1 이상이어야 합니다.")
+    if not (0 <= args.v2_entry_start_minute <= args.v2_entry_end_minute <= 1439):
+        parser.error("v2 entry session must be within 0~1439 minutes")
+    if args.v2_min_ema_spread_pct < 0 or args.v2_min_breakout_distance_pct < 0:
+        parser.error("v2 entry thresholds must be >= 0")
+    if args.v2_max_volume_ratio is not None and args.v2_max_volume_ratio <= 0:
+        args.v2_max_volume_ratio = None
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     if not args.universe:
         try:
             frame, file_count, result = run_one(args, args.code)
-            summary_path, trade_details_path, trade_details = save_single_outputs(args, frame, result, file_count, args.code)
+            summary_path, trade_details_path, trade_details = save_single_outputs(
+                args, frame, result, file_count, args.code
+            )
         except Exception as exc:
             print(f"백테스트 실패: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 2
@@ -471,6 +482,13 @@ def main() -> int:
             print_diagnostics(args, frame)
         if args.strategy == "scalping_proxy_v2":
             print_v2_diagnostics(trade_details)
+            print(
+                "V2 filters: "
+                f"session={args.v2_entry_start_minute}-{args.v2_entry_end_minute}, "
+                f"ema_spread>={args.v2_min_ema_spread_pct:g}%, "
+                f"breakout>={args.v2_min_breakout_distance_pct:g}%, "
+                f"max_volume={args.v2_max_volume_ratio if args.v2_max_volume_ratio is not None else 'none'}"
+            )
         print(f"거래 상세: {trade_details_path}")
         print(f"결과: {summary_path}")
         return 0
@@ -504,14 +522,25 @@ def main() -> int:
         row = result_row(result)
         row.update({"name": name, "index": index_name, "files": file_count})
         rows.append(row)
-        print(f"    ↳ return={result.equity_return_pct:.2f}% | MDD={result.max_drawdown_pct:.2f}% | trades={result.total_trades} | win={result.win_rate_pct:.2f}% | PF={result.profit_factor:.3f}")
+        print(
+            f"    ↳ return={result.equity_return_pct:.2f}% | "
+            f"MDD={result.max_drawdown_pct:.2f}% | "
+            f"trades={result.total_trades} | win={result.win_rate_pct:.2f}% | "
+            f"PF={result.profit_factor:.3f}"
+        )
 
     if not rows:
         print("일괄 백테스트 결과가 없습니다.", file=sys.stderr)
         return 2
 
     result_frame = pd.DataFrame(rows)
-    result_frame = result_frame[["code", "name", "index", "files", "initial_cash", "final_cash", "equity_return_pct", "max_drawdown_pct", "total_trades", "winning_trades", "losing_trades", "win_rate_pct", "profit_factor"]].sort_values("equity_return_pct", ascending=False)
+    result_frame = result_frame[
+        [
+            "code", "name", "index", "files", "initial_cash", "final_cash",
+            "equity_return_pct", "max_drawdown_pct", "total_trades",
+            "winning_trades", "losing_trades", "win_rate_pct", "profit_factor",
+        ]
+    ].sort_values("equity_return_pct", ascending=False)
     prefix = f"universe_{args.start:%Y%m%d}_{args.end:%Y%m%d}_{args.strategy}"
     output_path = args.output_dir / f"{prefix}_summary.csv"
     result_frame.to_csv(output_path, index=False, encoding="utf-8-sig")
@@ -525,7 +554,11 @@ def main() -> int:
     print(f"중앙값 수익률: {result_frame['equity_return_pct'].median():.2f}%")
     print(f"결과: {output_path}")
     print("\n[수익률 상위 10]")
-    print(result_frame[["code", "name", "index", "equity_return_pct", "max_drawdown_pct", "total_trades", "win_rate_pct", "profit_factor"]].head(10).to_string(index=False))
+    print(
+        result_frame[
+            ["code", "name", "index", "equity_return_pct", "max_drawdown_pct", "total_trades", "win_rate_pct", "profit_factor"]
+        ].head(10).to_string(index=False)
+    )
     return 0
 
 
