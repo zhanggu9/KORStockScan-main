@@ -1202,11 +1202,11 @@ class TradingConfig:
     # ==========================================
     # 🎯 AI 엔진 제어값 (OpenAI)
     # ==========================================
-    GPT_FAST_MODEL = "gpt-5-nano"
-    GPT_DEEP_MODEL = "gpt-5.4"
+    GPT_FAST_MODEL = "gpt-5.6-luna"
+    GPT_DEEP_MODEL = "gpt-5.6-luna"
     GPT_REPORT_MODEL = "gpt-5.4-mini"
-    GPT_THRESHOLD_CORRECTION_MODEL: str = "gpt-5.5"
-    GPT_THRESHOLD_CORRECTION_FALLBACK_MODELS: tuple = ("gpt-5.4", "gpt-5.4-mini")
+    GPT_THRESHOLD_CORRECTION_MODEL: str = "gpt-5.6-luna"
+    GPT_THRESHOLD_CORRECTION_FALLBACK_MODELS: tuple = ("gpt-5.6-luna", "gpt-5.4-mini")
     GPT_ENABLE_SCALPING_DEEP_RECHECK: bool = False
     GPT_ENGINE_MIN_INTERVAL: float = (
         0.5  # OpenAI 서버에 쏘는 최소 간격 (초 단위, 0.5초 = 500ms)
@@ -1227,7 +1227,7 @@ class TradingConfig:
     OPENAI_ANALYZE_TARGET_TIMEOUT_MS: int = (
         3000  # entry/analyze_target live decision timeout
     )
-    OPENAI_SCALPING_ENTRY_MODEL: str = "gpt-5.4-nano"
+    OPENAI_SCALPING_ENTRY_MODEL: str = "gpt-5.6-luna"
     OPENAI_SCALPING_ENTRY_TRANSPORT_MODE: str = "http"
     OPENAI_SCALPING_ENTRY_TIMEOUT_MS: int = (
         5000  # complete structured entry response budget on the HTTP primary path
@@ -1238,7 +1238,7 @@ class TradingConfig:
     OPENAI_HOLDING_SCORE_TIMEOUT_MS: int = (
         7000  # holding_score_v2 position-state score timeout
     )
-    OPENAI_HOLDING_SCORE_MODEL: str = "gpt-5.4-nano"
+    OPENAI_HOLDING_SCORE_MODEL: str = "gpt-5.6-luna"
     OPENAI_HOLDING_FLOW_TIMEOUT_MS: int = (
         15000  # holding_flow OpenAI primary plus Bedrock fallback total deadline
     )
