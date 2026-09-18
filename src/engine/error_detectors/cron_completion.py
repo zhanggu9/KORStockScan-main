@@ -68,7 +68,7 @@ CRON_JOB_REGISTRY: list[dict[str, Any]] = [
         "id": "final_ensemble_scanner",
         "log": "logs/ensemble_scanner.log",
         "window_start": (7, 20),
-        "window_end": (8, 0),
+        "window_end": (15, 0),
         "mode": "once",
         "critical": True,
         "trading_day_only": True,
