@@ -523,14 +523,14 @@ def resolve_condition_profile(cnd_name):
         "use_debounce": True,
     }
 
-    if "scalp_candid_aggressive_01" in cnd_name or "scalp_candid_normal_01" in cnd_name:
+    if "scalp_candid_aggressive_01" in cnd_name or "scalp_candid_normal_01" in cnd_name or "sto 아침용" in cnd_name:
         profile["start"], profile["end"] = dt_time(9, 0), dt_time(9, 30)
     elif "scalp_open_reclaim_01" in cnd_name:
         profile["start"], profile["end"] = dt_time(9, 3), dt_time(9, 20)
         profile["position_tag"] = "OPEN_RECLAIM"
         profile["use_debounce"] = False
-    elif "scalp_vwap_reclaim_01" in cnd_name:
-        profile["start"], profile["end"] = dt_time(10, 0), dt_time(14, 0)
+    elif "scalp_vwap_reclaim_01" in cnd_name or "sto 9시반" in cnd_name:
+        profile["start"], profile["end"] = dt_time(10, 0), dt_time(15, 0)
         profile["position_tag"] = "VWAP_RECLAIM"
         profile["use_debounce"] = False
     elif "scalp_dryup_squeeze_01" in cnd_name:

@@ -1230,7 +1230,7 @@ class TradingConfig:
     OPENAI_SCALPING_ENTRY_MODEL: str = "gpt-5.4-nano"
     OPENAI_SCALPING_ENTRY_TRANSPORT_MODE: str = "http"
     OPENAI_SCALPING_ENTRY_TIMEOUT_MS: int = (
-        5000  # complete structured entry response budget on the HTTP primary path
+        10000  # complete structured entry response budget on the HTTP primary path
     )
     OPENAI_ENTRY_PRICE_TIMEOUT_MS: int = (
         7000  # entry_price OpenAI route timeout; Bedrock has provider timeout
