@@ -10,9 +10,9 @@ cron, systemd timers, widget machines, or episode machines.
    URL-safe password. Keep `.env` private. The password is used for both the
    PostgreSQL service and `DATABASE_URL` inside the Python services.
 2. Run `mkdir -p logs` as your normal host user. Place the existing runtime
-   data and models under `data/`. For live bot use,
-   provide `data/config_prod.json`, the required credentials in `.env`, and the
-   reviewed, target-date PREOPEN runtime env in
+   data and models under `data/`, including `data/config_prod.json` for the
+   Python services. For live bot use, also provide the required credentials in
+   `.env` and the reviewed, target-date PREOPEN runtime env in
    `data/threshold_cycle/runtime_env/`. These are mounted from the host rather
    than copied into the image.
 3. Run `docker compose config -q` to validate interpolation, then
@@ -22,7 +22,9 @@ cron, systemd timers, widget machines, or episode machines.
 The dashboard binds to localhost. PostgreSQL is reachable only on the Compose
 network. The host `data/` and `logs/` folders are bind-mounted, while the DB
 uses the `postgres_data` named volume. The schema service runs the existing
-`DBManager.init_db()` against that volume before web or bot starts. The image runs as UID/GID `1000:1000`,
+`DBManager.init_db()` against that volume before web or bot starts. The Python
+services select the installed `psycopg2` driver explicitly and use a writable
+Numba cache under `/tmp`. The image runs as UID/GID `1000:1000`,
 so those host folders must be writable by that identity. Create `logs/`
 before Compose starts so Docker does not create a root-owned bind source.
 
@@ -44,5 +46,7 @@ profile does not install the repository's separate cron and systemd services.
 `DATABASE_URL` in Compose targets the new PostgreSQL volume. It starts empty;
 the stack does not migrate an existing host database automatically. Back up or
 restore data explicitly before using an existing trading account. The image
-declares the repository's `requirements.txt` plus `python-dotenv` and
-`gunicorn`, which its bot and web entry points import or execute.
+uses Python 3.12 because the available `pandas-ta` release requires it.
+It installs the repository's `requirements.txt` with container-only bounds
+`pandas>=2.3.2,<3` and `pandas-ta==0.4.71b0`, plus `python-dotenv` and
+`gunicorn` for the bot and web entry points.

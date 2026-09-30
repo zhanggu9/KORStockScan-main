@@ -19,8 +19,9 @@ services:
     build: .
     command: ["python", "-c", "from src.database.db_manager import DBManager; DBManager().init_db()"]
     environment:
-      DATABASE_URL: postgresql://korstockscan:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/korstockscan
+      DATABASE_URL: postgresql+psycopg2://korstockscan:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/korstockscan
       PYTHONPATH: /app
+      NUMBA_CACHE_DIR: /tmp/numba-cache
     depends_on:
       db:
         condition: service_healthy
@@ -30,8 +31,9 @@ services:
     build: .
     command: ["gunicorn", "--workers", "2", "--bind", "0.0.0.0:5000", "src.web.app:app"]
     environment:
-      DATABASE_URL: postgresql://korstockscan:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/korstockscan
+      DATABASE_URL: postgresql+psycopg2://korstockscan:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/korstockscan
       PYTHONPATH: /app
+      NUMBA_CACHE_DIR: /tmp/numba-cache
       TZ: Asia/Seoul
       KORSTOCKSCAN_WEB_DEBUG: "false"
     volumes:
@@ -53,8 +55,9 @@ services:
       - path: .env
         required: true
     environment:
-      DATABASE_URL: postgresql://korstockscan:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/korstockscan
+      DATABASE_URL: postgresql+psycopg2://korstockscan:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/korstockscan
       PYTHONPATH: /app
+      NUMBA_CACHE_DIR: /tmp/numba-cache
       TZ: Asia/Seoul
     volumes:
       - ./data:/app/data
