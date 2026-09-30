@@ -1,0 +1,71 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: korstockscan
+      POSTGRES_USER: korstockscan
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      TZ: Asia/Seoul
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U korstockscan -d korstockscan"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  schema:
+    build: .
+    command: ["python", "-c", "from src.database.db_manager import DBManager; DBManager().init_db()"]
+    environment:
+      DATABASE_URL: postgresql://korstockscan:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/korstockscan
+      PYTHONPATH: /app
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  web:
+    build: .
+    command: ["gunicorn", "--workers", "2", "--bind", "0.0.0.0:5000", "src.web.app:app"]
+    environment:
+      DATABASE_URL: postgresql://korstockscan:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/korstockscan
+      PYTHONPATH: /app
+      TZ: Asia/Seoul
+      KORSTOCKSCAN_WEB_DEBUG: "false"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    ports:
+      - "127.0.0.1:${WEB_PORT:-5000}:5000"
+    depends_on:
+      schema:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  bot:
+    profiles: ["live"]
+    build: .
+    working_dir: /app/src
+    command: ["bash", "run_bot.sh"]
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      DATABASE_URL: postgresql://korstockscan:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/korstockscan
+      PYTHONPATH: /app
+      TZ: Asia/Seoul
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./.git:/app/.git:ro
+    depends_on:
+      schema:
+        condition: service_completed_successfully
+    init: true
+    stop_grace_period: 45s
+    restart: "no"
+
+volumes:
+  postgres_data:

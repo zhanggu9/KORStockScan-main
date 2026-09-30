@@ -15,8 +15,9 @@ UTILS_DIR = PROJECT_ROOT / "src" / "utils"
 ENGINE_DIR = PROJECT_ROOT / "src" / "engine"
 MODEL_DIR = PROJECT_ROOT / "src" / "model"
 NOTIFY_DIR = PROJECT_ROOT / "src" / "notify"
-POSTGRES_URL = (
-    "postgresql://quant_admin:quant_password_123!@localhost:5432/korstockscan"
+POSTGRES_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://quant_admin:quant_password_123!@localhost:5432/korstockscan",
 )
 # Runtime migration boundary for stale SCALPING rows. This is intentionally
 # separate from the clean-tuning policy, which has no live DB mutation authority.
