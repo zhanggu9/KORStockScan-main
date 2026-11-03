@@ -70,7 +70,7 @@ flowchart LR
 | --- | --- | --- |
 | [Kiwoom RSI Auto Trader](docs/portfolio/kiwoom-rsi-trader-case-study.md) | KORStockScan 이전에 만든 키움 OpenAPI+ 멀티 전략 엔진. 실시간 틱 집계, 전략 10종 교체 구조, 주문 직렬화와 호출 제한 (실계좌 코드라 설계 기록만 공개) | Python · PyQt5 · pytest |
 | [LIMSON](https://github.com/zhanggu9/limson) | 한국투자증권 공식 전략 빌더·LEAN 백테스터 확장. 자체 PostgreSQL OHLCV 공급자, EC2 단일 포트 배포, 웹은 클라우드·백테스트는 로컬 PC로 나눈 하이브리드 구조 | FastAPI · Next.js · LEAN · PostgreSQL · AWS |
-| [lumina](https://github.com/zhanggu9/lumina-backup) | 금융 AI 에이전트 웹앱 풀스택 구현. ReAct 챗봇, LightGBM/MLP 퀀트 신호·백테스트, Qdrant RAG | FastAPI · JavaScript · Qdrant · Docker · AWS |
+| [lumina-invest](https://github.com/zhanggu9/lumina-invest) | 금융 AI 에이전트 웹앱 (AI퀀트 과정 프로젝트, 풀스택). ReAct 챗봇, LightGBM/MLP 퀀트 신호·백테스트, Qdrant RAG | FastAPI · JavaScript · Qdrant · Docker · AWS |
 
 ---
 
