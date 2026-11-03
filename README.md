@@ -64,6 +64,14 @@ flowchart LR
 - **과최적화 방지:** 단일 날짜 승률이나 단순 수익률 합으로 실거래 권한을 넓히지 않고, 표본 하한·source-quality gate·rolling EV를 통과한 한 축만 다음 장전에 bounded 적용합니다.
 - **재현 가능한 운영:** raw 값·smoothed 값·policy version·최종 action을 함께 기록해 모든 실매매 판단을 사후 replay할 수 있습니다.
 
+## 관련 프로젝트
+
+| 프로젝트 | 내용 | 기술 |
+| --- | --- | --- |
+| [Kiwoom RSI Auto Trader](docs/portfolio/kiwoom-rsi-trader-case-study.md) | KORStockScan 이전에 만든 키움 OpenAPI+ 멀티 전략 엔진. 실시간 틱 집계, 전략 10종 교체 구조, 주문 직렬화와 호출 제한 (실계좌 코드라 설계 기록만 공개) | Python · PyQt5 · pytest |
+| [open-trading-api (fork)](https://github.com/zhanggu9/open-trading-api) | 한국투자증권 공식 전략 빌더·LEAN 백테스터 확장. 자체 PostgreSQL OHLCV 공급자, EC2 단일 포트 배포, 웹은 클라우드·백테스트는 로컬 PC로 나눈 하이브리드 구조 | FastAPI · Next.js · LEAN · PostgreSQL · AWS |
+| [lumina](https://github.com/zhanggu9/lumina-backup) | 금융 AI 에이전트 웹앱 풀스택 구현. ReAct 챗봇, LightGBM/MLP 퀀트 신호·백테스트, Qdrant RAG | FastAPI · JavaScript · Qdrant · Docker · AWS |
+
 ---
 
 ## 시스템 상세
