@@ -1,5 +1,73 @@
 # KORStockScan
 
+![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
+![Kiwoom](https://img.shields.io/badge/Broker-Kiwoom%20REST%2FWebSocket-0A5BD8)
+![LightGBM](https://img.shields.io/badge/ML-LightGBM%20%7C%20XGBoost%20%7C%20CatBoost-2E7D32)
+![LLM](https://img.shields.io/badge/LLM-OpenAI%20%7C%20AWS%20Bedrock%20%7C%20Gemini-6E40C9)
+![Tests](https://img.shields.io/badge/tests-9%2C000%2B%20cases-brightgreen)
+![Code style](https://img.shields.io/badge/code%20style-black-000000)
+![License](https://img.shields.io/badge/license-GPL--3.0-blue)
+
+> **국내 주식 실계좌 스캘핑 자동매매 시스템** — 시장 스캔 → AI 판단 → 주문 가드 → 분할 진입·청산 → 장후 자동 튜닝까지
+> 하나의 lifecycle로 연결해, 매일 데이터로 스스로 보정되는 매매 엔진을 1인 설계·개발·운영합니다.
+
+## 한눈에 보기
+
+| 항목 | 내용 |
+| --- | --- |
+| 역할 | 1인 개발 — 전략 설계, 엔진 구현, ML/LLM 판단 계층, 리스크 가드, 배포·운영 자동화 |
+| 규모 | Python 모듈 800+개, 테스트 9,000+개, systemd 서비스·타이머 120+개 |
+| 매매 구조 | 서로 주문·수량을 공유하지 않는 **독립 주문 owner 3종** (메인 봇 / 위젯 / 에피소드) |
+| 판단 계층 | 규칙 기반 baseline + LightGBM·XGBoost 스윙 모델 + LLM(OpenAI·Bedrock) 진입가·보유 판단, provider failback |
+| 리스크 관리 | stale quote·가격 freshness·주문/수량/cooldown 가드를 hard safety로 분리, 튜닝이 우회 불가 |
+| 튜닝 방식 | 승률이 아닌 **비용 반영 기대값(EV)** 기준, clean baseline 이후 rolling/cumulative 표본만 사용, bounded 변경 + rollback |
+| 운영 | 장전 정책 적용 → 장중 실매매 → 장후 리포트·반사실 분석 → 다음 장전 후보 생성의 일일 자동화 체인 |
+
+## 아키텍처
+
+```mermaid
+flowchart LR
+    subgraph Market["시장 데이터"]
+        WS["Kiwoom WebSocket<br/>체결·호가·OFI"]
+        REST["Kiwoom REST<br/>분봉·계좌·주문"]
+    end
+
+    subgraph Engine["실시간 매매 엔진"]
+        SC["Scanner<br/>거래대금·수급"]
+        AI["AI 판단<br/>LLM + ML score"]
+        G["Hard Safety Guard<br/>freshness·BBO·수량·cooldown"]
+        LC["Lifecycle<br/>probe → multi-leg → scale-in<br/>→ 부분익절 / trailing / exit"]
+    end
+
+    subgraph Owners["독립 주문 owner"]
+        MB["메인 봇"]
+        WG["위젯 매매기계"]
+        EP["에피소드 매매기계"]
+    end
+
+    subgraph Post["장후 자동화"]
+        SQ["Source-quality audit"]
+        EV["EV·반사실 calibration"]
+        PO["PREOPEN bounded policy<br/>+ rollback"]
+    end
+
+    WS --> SC --> AI --> G --> LC
+    REST --> G
+    LC --> MB & WG & EP
+    MB & WG & EP -->|"broker receipt / event log"| SQ --> EV --> PO -->|"다음 세션 runtime env"| Engine
+```
+
+## 기술적으로 집중한 문제
+
+- **주문 귀속 분리:** 같은 종목을 여러 매매기계가 다뤄도 owner·episode ID·주문번호 단위로 보유수량과 청산을 분리해, 다른 기계의 수량을 매도하거나 중복 진입하지 않도록 설계했습니다.
+- **AI를 쓰되 AI에 권한을 주지 않기:** LLM 응답은 판단 입력일 뿐이며, 파싱 실패·timeout·비정상 응답은 fail-closed로 처리하고 broker guard를 우회할 수 없습니다.
+- **과최적화 방지:** 단일 날짜 승률이나 단순 수익률 합으로 실거래 권한을 넓히지 않고, 표본 하한·source-quality gate·rolling EV를 통과한 한 축만 다음 장전에 bounded 적용합니다.
+- **재현 가능한 운영:** raw 값·smoothed 값·policy version·최종 action을 함께 기록해 모든 실매매 판단을 사후 replay할 수 있습니다.
+
+---
+
+## 시스템 상세
+
 KORStockScan은 키움증권 REST/WebSocket과 연동하는 개인용 스캘핑 매매 엔진입니다. 넓은 시장을 탐색하는 메인 봇, 종목별 신호를 집행하는 위젯 매매기계, 정해진 종목·시간대의 반복 패턴을 거래하는 에피소드 매매기계를 서로 독립된 주문 owner로 운영합니다.
 
 목표는 위험을 모두 피하는 것이 아닙니다. 감당 가능한 위험 안에서 더 많은 유효 기회를 탐색하고, probe·분할 진입·동적 수량·부분익절·trailing·hard/protect/emergency guard 같은 후단 보호장치로 기대값과 누적 순이익을 높이는 것입니다.

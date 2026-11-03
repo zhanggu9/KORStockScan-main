@@ -1,9 +1,20 @@
+"""Kiwoom REST OAuth token smoke test.
+
+Credentials are read from environment variables; never hard-code them here.
+    export KIWOOM_APP_KEY="..."
+    export KIWOOM_SECRET_KEY="..."
+"""
+
+import os
+
 import requests
-import json
 
 url = "https://api.kiwoom.com/oauth2/token"
-app_key = "fkNM-w9TA-dlgHO1R3uF9PwTgTz1zusP3DljaAPeY7o"
-secret_key = "vCAHfFLJ6wkgXgaGQPjesiAKueT6054eCBCAW_KAfD0"
+app_key = os.environ.get("KIWOOM_APP_KEY")
+secret_key = os.environ.get("KIWOOM_SECRET_KEY")
+
+if not app_key or not secret_key:
+    raise SystemExit("Set KIWOOM_APP_KEY and KIWOOM_SECRET_KEY environment variables.")
 
 params = {
     "grant_type": "client_credentials",
